@@ -50,6 +50,13 @@ class LoginRequest(BaseModel):
     password: str
 
 
+class ChangePasswordRequest(BaseModel):
+    """Signed-in user changing their own password (must know the current one)."""
+
+    current_password: str = Field(min_length=1, max_length=128)
+    new_password: str = Field(min_length=6, max_length=128)
+
+
 class UserOut(BaseModel):
     id: int
     username: str

@@ -12,7 +12,13 @@ from app.deps import get_current_user
 from app.models import User
 from app.realtime.events import user_out
 from app.realtime.hub import hub
-from app.schemas import AuthResponse, LoginRequest, RegisterRequest, UserOut
+from app.schemas import (
+    AuthResponse,
+    ChangePasswordRequest,
+    LoginRequest,
+    RegisterRequest,
+    UserOut,
+)
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
@@ -53,3 +59,30 @@ def login(body: LoginRequest, db: Session = Depends(get_db)) -> AuthResponse:
 @router.get("/me", response_model=UserOut)
 def me(current: User = Depends(get_current_user)) -> UserOut:
     return user_out(current, is_online=hub.is_online(current.id))
+
+
+@router.post("/change-password")
+def change_password(
+    body: ChangePasswordRequest,
+    db: Session = Depends(get_db),
+    current: User = Depends(get_current_user),
+) -> dict[str, bool]:
+    """Let a signed-in user replace their password (requires the current one).
+
+    Forgotten passwords cannot use this route — an admin must run
+    ``reset_password.py`` on the server instead.
+    """
+    if not verify_password(body.current_password, current.password_hash):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Current password is incorrect.",
+        )
+    if body.current_password == body.new_password:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Pick a new password that is different from the current one.",
+        )
+    current.password_hash = hash_password(body.new_password)
+    db.add(current)
+    db.commit()
+    return {"ok": True}

@@ -32,7 +32,7 @@ class ChatScreen extends StatefulWidget {
   State<ChatScreen> createState() => _ChatScreenState();
 }
 
-class _ChatScreenState extends State<ChatScreen> {
+class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   final _text = TextEditingController();
   final _searchQuery = TextEditingController();
   final _scroll = ScrollController();
@@ -58,13 +58,57 @@ class _ChatScreenState extends State<ChatScreen> {
   /// Tracks transcript growth so new messages can follow the bottom.
   int _knownMessageCount = 0;
 
+  /// Keyboard height last seen, so the transcript can shift by the difference.
+  double _lastBottomInset = 0;
+
+  /// True when the keyboard opened while the newest message was in view.
+  bool _keyboardShouldHoldBottom = false;
+
   @override
   void initState() {
     super.initState();
     _appState = context.read<AppState>();
     _appState.setActiveConversation(widget.conversation.id);
     _scroll.addListener(_onScroll);
+    WidgetsBinding.instance.addObserver(this);
     _openAtLatestMessage();
+  }
+
+  /// Keeps the messages above the keyboard instead of behind it.
+  ///
+  /// The transcript is anchored at the top, so shrinking the viewport hides
+  /// whatever sat at the bottom. Adding the height the keyboard just claimed to
+  /// the scroll offset slides the same messages back into view, the way every
+  /// other chat app behaves.
+  @override
+  void didChangeMetrics() {
+    super.didChangeMetrics();
+    // MediaQuery is only updated once the new metrics have been laid out.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      final inset = MediaQuery.viewInsetsOf(context).bottom;
+      final delta = inset - _lastBottomInset;
+      if (delta == 0) return;
+
+      if (_lastBottomInset == 0 && delta > 0) {
+        // Only snap to the newest message when it was already the one on
+        // screen; mid-history reading keeps its exact place instead.
+        _keyboardShouldHoldBottom = !_scroll.hasClients ||
+            _scroll.position.maxScrollExtent - _scroll.position.pixels < 48;
+      }
+      _lastBottomInset = inset;
+      if (inset == 0) {
+        _keyboardShouldHoldBottom = false;
+        return;
+      }
+      if (delta < 0 || !_scroll.hasClients) return;
+
+      final position = _scroll.position;
+      final target = _keyboardShouldHoldBottom
+          ? position.maxScrollExtent
+          : (position.pixels + delta).clamp(0.0, position.maxScrollExtent);
+      if (target != position.pixels) _scroll.jumpTo(target);
+    });
   }
 
   Future<void> _openAtLatestMessage() async {
@@ -93,6 +137,7 @@ class _ChatScreenState extends State<ChatScreen> {
     _appState.setActiveConversation(null);
     _appState.setTyping(widget.conversation.id, false);
     VoicePlayer.instance.stop();
+    WidgetsBinding.instance.removeObserver(this);
     _text.dispose();
     _searchQuery.dispose();
     _scroll.removeListener(_onScroll);

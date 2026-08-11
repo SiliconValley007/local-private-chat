@@ -242,6 +242,23 @@ class ApiClient {
     return user;
   }
 
+  /// Replace the signed-in user's password. Requires the current one.
+  Future<void> changePassword({
+    required String currentPassword,
+    required String newPassword,
+  }) async {
+    await _send(
+      () => http.post(
+        _uri('/api/auth/change-password'),
+        headers: _headers(),
+        body: jsonEncode({
+          'current_password': currentPassword,
+          'new_password': newPassword,
+        }),
+      ),
+    );
+  }
+
   Future<List<ChatUser>> listUsers({String? q}) async {
     final query = (q != null && q.trim().isNotEmpty) ? {'q': q.trim()} : null;
     final res = await _send(

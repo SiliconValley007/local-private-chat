@@ -272,6 +272,17 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     notifyListeners();
   }
 
+  /// Change the signed-in account password (requires the current password).
+  Future<void> changePassword({
+    required String currentPassword,
+    required String newPassword,
+  }) async {
+    await api.changePassword(
+      currentPassword: currentPassword,
+      newPassword: newPassword,
+    );
+  }
+
   Future<void> logout() async {
     final token = await NotificationService.instance.fcmToken();
     if (token != null) {

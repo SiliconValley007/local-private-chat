@@ -6,7 +6,8 @@ Build (from the server/ directory, with the project venv active)::
     pip install -r requirements.txt pyinstaller
     pyinstaller localchat.spec
 
-Output: ``dist/LocalChatServer/LocalChatServer.exe``
+Output: ``dist/LocalChatServer/LocalChatServer.exe`` plus ``ResetPassword.exe``
+for admin password resets on hosts without Python installed.
 """
 
 from PyInstaller.utils.hooks import collect_all, collect_submodules
@@ -16,6 +17,8 @@ starlette_datas, starlette_binaries, starlette_hidden = collect_all("starlette")
 uvicorn_datas, uvicorn_binaries, uvicorn_hidden = collect_all("uvicorn")
 pydantic_datas, pydantic_binaries, pydantic_hidden = collect_all("pydantic")
 jose_hidden = collect_submodules("jose")
+# passlib resolves its bcrypt backend lazily, so the handlers need naming.
+passlib_hidden = collect_submodules("passlib")
 
 hiddenimports = sorted(
     set(
@@ -82,10 +85,59 @@ exe = EXE(
     entitlements_file=None,
 )
 
+# Second entry point in the same folder: admin password reset without Python.
+reset = Analysis(
+    ["reset_password.py"],
+    pathex=["."],
+    binaries=[],
+    datas=[],
+    hiddenimports=sorted(
+        set(
+            passlib_hidden
+            + [
+                "app",
+                "app.auth",
+                "app.db",
+                "app.models",
+                "bcrypt",
+                "passlib.handlers.bcrypt",
+            ]
+        )
+    ),
+    hookspath=[],
+    hooksconfig={},
+    runtime_hooks=[],
+    excludes=["tkinter", "matplotlib", "numpy", "pandas"],
+    noarchive=False,
+    optimize=0,
+)
+reset_pyz = PYZ(reset.pure)
+
+reset_exe = EXE(
+    reset_pyz,
+    reset.scripts,
+    [],
+    exclude_binaries=True,
+    name="ResetPassword",
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=True,
+    console=True,
+    disable_windowed_traceback=False,
+    argv_emulation=False,
+    target_arch=None,
+    codesign_identity=None,
+    entitlements_file=None,
+)
+
 coll = COLLECT(
     exe,
     a.binaries,
     a.datas,
+    reset_exe,
+    reset.binaries,
+    reset.datas,
     strip=False,
     upx=True,
     upx_exclude=[],

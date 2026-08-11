@@ -7,6 +7,7 @@ import '../services/theme_store.dart';
 import '../theme.dart';
 import '../time_format.dart';
 import '../widgets/avatar.dart';
+import '../widgets/change_password_dialog.dart';
 import '../widgets/rename_dialog.dart';
 import '../widgets/error_banner.dart';
 import 'backup_screen.dart';
@@ -195,6 +196,9 @@ class _InboxScreenState extends State<InboxScreen> {
         await navigator.push(
           MaterialPageRoute(builder: (_) => const BackupScreen()),
         );
+      case 'password':
+        if (!mounted) return;
+        await showChangePasswordDialog(context);
       case 'settings':
         await navigator.push(
           MaterialPageRoute(builder: (_) => const ServerSetupScreen()),
@@ -327,6 +331,15 @@ class _InboxScreenState extends State<InboxScreen> {
                   contentPadding: EdgeInsets.zero,
                   leading: Icon(Icons.cloud_upload_outlined),
                   title: Text('Backup & restore'),
+                ),
+              ),
+              PopupMenuItem(
+                value: 'password',
+                child: ListTile(
+                  dense: true,
+                  contentPadding: EdgeInsets.zero,
+                  leading: Icon(Icons.lock_outline_rounded),
+                  title: Text('Change password'),
                 ),
               ),
               PopupMenuItem(

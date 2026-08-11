@@ -27,6 +27,7 @@ Inspired by the deployment model of [local-drive](https://github.com/SiliconVall
 - **Notifications** — local alerts when a chat is not open; optional FCM data-only wake-ups (no message body)
 - **Encrypted backup / restore** — AES-GCM on-device, ciphertext on private server + optional Firestore mirror
 - **Appearance** — system / light / dark, remembered on the phone
+- **Change password** in the app; admin can reset forgotten logins with `reset_password.py`
 
 ## What this is / is not
 
@@ -365,6 +366,23 @@ This writes the legacy launcher icons, the adaptive icon layers (foreground + An
 
 **App FCM setup (optional):** create a Firebase project → download `google-services.json` into `flutter_app/android/app/`. The Gradle plugin applies only when that file exists.
 
+### Forgotten login password
+
+Login passwords are bcrypt hashes — they **cannot be recovered**, only replaced.
+
+**If the user still knows their current password:** Inbox ⋮ → **Change password**.
+
+**If they forgot it:** you (the server admin) reset it on the Termux/PC that
+holds `data/chat.db`. From the `server/` folder with the venv active:
+
+```bash
+python reset_password.py              # list usernames
+python reset_password.py alice        # type a new password privately
+```
+
+They can sign in with the new password immediately — no server restart needed.
+Chat history is unchanged.
+
 ### Encrypted backup / restore
 
 1. Inbox ⋮ → **Backup & restore**
@@ -394,6 +412,7 @@ flutter test
 |--------|------|--------|
 | POST | `/api/auth/register` | `{username, password, display_name?}` |
 | POST | `/api/auth/login` | `{username, password}` |
+| POST | `/api/auth/change-password` | `{current_password, new_password}` (signed in) |
 | GET | `/api/auth/me` | Current user |
 | GET | `/api/users?q=` | Search users |
 | GET | `/api/users/by-username/{username}` | Lookup |

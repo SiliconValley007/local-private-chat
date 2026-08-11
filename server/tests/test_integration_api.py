@@ -28,6 +28,32 @@ def test_register_login_me(client):
     assert me.json()["username"] == "alice"
 
 
+def test_change_password_requires_current_and_updates_login(client):
+    data = register(client, "alice")
+    headers = auth_header(data["token"])
+
+    wrong = client.post(
+        "/api/auth/change-password",
+        headers=headers,
+        json={"current_password": "wrongpass", "new_password": "newsecret"},
+    )
+    assert wrong.status_code == 400
+
+    ok = client.post(
+        "/api/auth/change-password",
+        headers=headers,
+        json={"current_password": "secret12", "new_password": "newsecret"},
+    )
+    assert ok.status_code == 200
+    assert ok.json()["ok"] is True
+
+    old = client.post("/api/auth/login", json={"username": "alice", "password": "secret12"})
+    assert old.status_code == 401
+
+    fresh = client.post("/api/auth/login", json={"username": "alice", "password": "newsecret"})
+    assert fresh.status_code == 200
+
+
 def test_duplicate_username_rejected(client):
     register(client, "alice")
     res = client.post(
