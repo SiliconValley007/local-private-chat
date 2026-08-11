@@ -13,12 +13,20 @@ Inspired by the deployment model of [local-drive](https://github.com/SiliconVall
 - Register / login (username + password), persistent sessions
 - 1:1 DMs and group chats
 - Text, images, files, and voice notes
+- **Reply / quote**, **edit**, and **delete** (tombstone) for messages
 - Delivery and read receipts, typing, online presence
+- **Search** people, last-message text in the inbox, and messages inside a chat
+- **Pin** chats and **mute** notifications per conversation (device-local)
+- **Export chat** as a shareable plain-text file
+- **Clickable links** in messages (opens in the browser; no silent preview fetch)
+- **Unread badge** on the app icon (where the launcher supports it)
+- **Reconnecting** banner in the inbox when the WebSocket drops
 - **Tailscale gate** — app waits if the private server is unreachable
 - **Add people** — username search, local contacts (device-only), QR invite (`localchat://user/...`)
 - **Rename people** — give anyone a name only you see; saved on the phone and inside the encrypted backup
 - **Notifications** — local alerts when a chat is not open; optional FCM data-only wake-ups (no message body)
 - **Encrypted backup / restore** — AES-GCM on-device, ciphertext on private server + optional Firestore mirror
+- **Appearance** — system / light / dark, remembered on the phone
 
 ## What this is / is not
 
@@ -68,6 +76,67 @@ chmod +x start_termux.sh
 `python-cryptography`, falls back to `requirements-termux.txt` when a Rust build fails, and runs
 the server inside `tmux` so an SSH drop does not kill it (`tmux attach -t localchat` to return).
 
+### Keeping the server alive with tmux (recommended)
+
+**What is tmux?** A tiny program that runs a "session" inside Termux. You can disconnect SSH
+or close the Termux UI and the session (and your chat server) keeps running. Without it,
+closing the SSH window stops `python run.py`.
+
+Install once:
+
+```bash
+pkg install tmux
+```
+
+#### First time — create the session
+
+```bash
+cd ~/downloads/local-drive/uploads/Dev/server   # your real server path
+source .venv/bin/activate
+tmux new -s localchat
+```
+
+You are now *inside* a tmux window. Start the server:
+
+```bash
+python run.py
+```
+
+**Detach** (leave the server running, return to a normal shell):
+
+- Press `Ctrl+b`, then release both keys, then press `d`
+
+You should see something like `[detached (from session localchat)]`.
+SSH can disconnect now; the server keeps running.
+
+#### Later — come back to the same session
+
+```bash
+tmux attach -t localchat
+```
+
+You see the live server logs again. Detach with `Ctrl+b` then `d` whenever you want.
+
+#### Useful tmux commands
+
+| Goal | Command |
+|------|---------|
+| List sessions | `tmux ls` |
+| Attach to `localchat` | `tmux attach -t localchat` |
+| Create if missing | `tmux new -s localchat` |
+| Stop the server | Attach, then `Ctrl+C` |
+| Kill the whole session | `tmux kill-session -t localchat` |
+| Scroll up in logs | `Ctrl+b` then `[`, arrow keys / PageUp, `q` to quit scroll |
+
+#### Optional: wake lock so Android does not sleep the phone
+
+```bash
+pkg install termux-api
+termux-wake-lock
+```
+
+Run that before starting tmux when you want the server phone to stay awake.
+
 Or manually:
 
 ```bash
@@ -78,6 +147,53 @@ source .venv/bin/activate
 python -m pip install --prefer-binary -r requirements.txt
 python run.py
 ```
+
+### Updating the server on Termux
+
+The venv, the database, and your secrets all live outside the code, so an update
+never means reinstalling dependencies. Only `app/`, `run.py`, and the
+requirements files change.
+
+**Option 1 — `git pull` (recommended once set up).** One command per update:
+
+```bash
+pkg install git                       # once
+cd ~/localchat && git pull            # your clone of this repo
+cd server && source .venv/bin/activate
+python run.py
+```
+
+To move an existing hand-copied server onto git without losing anything:
+
+```bash
+cd ~
+git clone https://github.com/SiliconValley007/local-private-chat.git localchat
+OLD=~/downloads/local-drive/uploads/Dev/server   # your current server folder
+cp -r $OLD/.venv        ~/localchat/server/      # keep the installed packages
+cp    $OLD/jwt_secret.txt ~/localchat/server/ 2>/dev/null
+cp    $OLD/firebase-service-account.json ~/localchat/server/ 2>/dev/null
+cp -r $OLD/data         ~/localchat/server/      # chat.db — your history
+cp -r $OLD/media        ~/localchat/server/      # uploaded photos / voice notes
+```
+
+Keep the old folder until the new one has served a full chat, then delete it.
+Nothing you copied is tracked by git, so `git pull` will never overwrite it.
+
+**Option 2 — update zip.** Unzip *into the server folder*, not next to it. A
+`run.py` appearing beside `server/` means it landed one level too high:
+
+```bash
+cd ~/downloads/local-drive/uploads/Dev/server
+unzip -o ~/storage/downloads/server-update.zip
+find . -name __pycache__ -type d -prune -exec rm -rf {} +
+```
+
+Either way, restart the server so the new code loads: attach with
+`tmux attach -t localchat`, press `Ctrl+C`, run `python run.py`, then detach with
+`Ctrl+b` `d`. New database columns are added automatically on startup.
+
+**App-only updates need none of this.** When a release changes only the Flutter
+app, install the new APK and leave the server running.
 
 #### Termux troubleshooting
 
@@ -323,17 +439,59 @@ That writes:
 | File | Who it's for |
 |------|----------------|
 | `releases/LocalChat-android-arm64.apk` | Almost all modern Android phones |
+| `releases/LocalChat-android-arm32.apk` | Older / budget phones (armeabi-v7a) |
+| `releases/LocalChat-android-universal.apk` | When you don't know the phone — bigger, runs anywhere |
 | `releases/LocalChatServer-windows-x64.zip` | Windows PC host — unzip and run `LocalChatServer.exe` |
+
+The script builds the split APKs and the Windows zip. Add the universal one with
+`flutter build apk --release` when you want a single file that fits every phone.
 
 Then publish:
 
 ```powershell
-gh release create v1.0.0 `
+gh release create v1.1.0 `
   releases/LocalChat-android-arm64.apk `
+  releases/LocalChat-android-arm32.apk `
+  releases/LocalChat-android-universal.apk `
   releases/LocalChatServer-windows-x64.zip `
-  --title "v1.0.0" `
-  --notes "First public build. Install Tailscale on every device, run the server, point the APK at http://<tailscale-ip>:8000."
+  --title "v1.1.0" `
+  --notes "Install Tailscale on every device, run the server, point the APK at http://<tailscale-ip>:8000."
 ```
+
+No `gh`? Open **Releases → Draft a new release** on GitHub, pick the tag you
+pushed, and drag the files from `releases/` into the attachment box.
+
+### Release signing
+
+Release builds are signed with a real upload key, not the Android debug key.
+`android/app/build.gradle.kts` reads `android/key.properties`; when that file is
+absent (a fresh clone, a different machine) the build silently falls back to the
+debug key so `flutter build apk --release` still works for anyone.
+
+Create your own key once:
+
+```powershell
+keytool -genkeypair -v -keystore C:/Users/<you>/keys/localchat-release.jks `
+  -keyalg RSA -keysize 2048 -validity 10000 -alias localchat
+```
+
+Then copy `android/key.properties.example` to `android/key.properties` and fill
+it in. Keep the keystore **outside** the repo. Neither file is committed.
+
+Verify which certificate an APK actually carries:
+
+```powershell
+& "$env:LOCALAPPDATA\Android\sdk\build-tools\36.0.0\apksigner.bat" verify --print-certs releases\LocalChat-android-arm64.apk
+```
+
+`CN=Local Chat` is the release key; `CN=Android Debug` means `key.properties` was
+missing when you built.
+
+**Back up the keystore and its password.** Android identifies an app by its
+signature, so losing the key means every future build looks like a different app:
+users would have to uninstall first, which wipes that phone's local nicknames and
+cached media. For the same reason, the first build after switching from the debug
+key needs a one-time uninstall on phones that already had the app.
 
 **Important:** a Windows `.exe` does **not** run inside Termux. For an always-on Android server phone, keep using the Python sources + `start_termux.sh`. The zip is for a Windows (or later Linux) host on the same Tailscale network.
 

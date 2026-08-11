@@ -1,0 +1,12 @@
+# Copy to key.properties (same folder) and fill in your own values.
+# key.properties and the keystore itself are gitignored — never commit either.
+#
+# Create a keystore once:
+#   keytool -genkeypair -v -keystore C:/path/outside/repo/localchat-release.jks \
+#     -keyalg RSA -keysize 2048 -validity 10000 -alias localchat
+#
+# Use forward slashes in storeFile, even on Windows.
+storePassword=your-keystore-password
+keyPassword=your-key-password
+keyAlias=localchat
+storeFile=C:/path/outside/repo/localchat-release.jks

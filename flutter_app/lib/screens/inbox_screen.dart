@@ -49,9 +49,18 @@ class _InboxScreenState extends State<InboxScreen> {
       final shown = state.titleFor(c).toLowerCase();
       final real = c.peer?.displayName.toLowerCase() ?? '';
       final username = c.peer?.username.toLowerCase() ?? '';
+      var preview = '';
+      if (c.lastMessage != null) {
+        final summary = AppState.messagePreview(c.lastMessage!);
+        preview = c.lastMessage!.senderId == state.me?.id
+            ? 'you: $summary'
+            : summary;
+        preview = preview.toLowerCase();
+      }
       return shown.contains(query) ||
           real.contains(query) ||
-          username.contains(query);
+          username.contains(query) ||
+          preview.contains(query);
     }).toList();
   }
 
@@ -63,6 +72,55 @@ class _InboxScreenState extends State<InboxScreen> {
       username: peer.username,
       serverName: peer.displayName,
     );
+  }
+
+  Future<void> _showConversationActions(Conversation conv) async {
+    final state = context.read<AppState>();
+    final pinned = state.isPinned(conv.id);
+    final muted = state.isMuted(conv.id);
+    final action = await showModalBottomSheet<String>(
+      context: context,
+      showDragHandle: true,
+      builder: (sheetContext) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              leading: Icon(
+                pinned ? Icons.push_pin_outlined : Icons.push_pin_rounded,
+              ),
+              title: Text(pinned ? 'Unpin' : 'Pin'),
+              onTap: () => Navigator.pop(sheetContext, 'pin'),
+            ),
+            ListTile(
+              leading: Icon(
+                muted
+                    ? Icons.notifications_active_outlined
+                    : Icons.notifications_off_outlined,
+              ),
+              title: Text(muted ? 'Unmute' : 'Mute'),
+              onTap: () => Navigator.pop(sheetContext, 'mute'),
+            ),
+            if (conv.type == 'dm')
+              ListTile(
+                leading: const Icon(Icons.drive_file_rename_outline_rounded),
+                title: const Text('Rename'),
+                onTap: () => Navigator.pop(sheetContext, 'rename'),
+              ),
+            const SizedBox(height: 8),
+          ],
+        ),
+      ),
+    );
+    if (!mounted || action == null) return;
+    switch (action) {
+      case 'pin':
+        await state.togglePin(conv.id);
+      case 'mute':
+        await state.toggleMute(conv.id);
+      case 'rename':
+        await _rename(conv);
+    }
   }
 
   Future<void> _chooseAppearance() async {
@@ -312,6 +370,30 @@ class _InboxScreenState extends State<InboxScreen> {
                 },
               ),
             ),
+          if (state.showReconnecting)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+              child: Center(
+                child: Chip(
+                  avatar: Icon(
+                    Icons.sync_rounded,
+                    size: 16,
+                    color: Colors.amber.shade900,
+                  ),
+                  label: Text(
+                    'Reconnecting to server…',
+                    style: theme.textTheme.labelMedium?.copyWith(
+                      color: Colors.amber.shade900,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  backgroundColor: Colors.amber.withValues(alpha: 0.14),
+                  side: BorderSide(color: Colors.amber.shade700),
+                  visualDensity: VisualDensity.compact,
+                  materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                ),
+              ),
+            ),
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
             child: TextField(
@@ -371,14 +453,14 @@ class _InboxScreenState extends State<InboxScreen> {
                                     conv.peer!.isOnline)
                               : null,
                           fromMe: conv.lastMessage?.senderId == state.me?.id,
+                          pinned: state.isPinned(conv.id),
+                          muted: state.isMuted(conv.id),
                           onTap: () => Navigator.of(context).push(
                             MaterialPageRoute(
                               builder: (_) => ChatScreen(conversation: conv),
                             ),
                           ),
-                          onLongPress: conv.type == 'dm'
-                              ? () => _rename(conv)
-                              : null,
+                          onLongPress: () => _showConversationActions(conv),
                         );
                       },
                     ),
@@ -397,8 +479,10 @@ class _ConversationTile extends StatelessWidget {
     required this.timeLabel,
     required this.online,
     required this.fromMe,
+    required this.pinned,
+    required this.muted,
     required this.onTap,
-    this.onLongPress,
+    required this.onLongPress,
   });
 
   final Conversation conversation;
@@ -406,8 +490,10 @@ class _ConversationTile extends StatelessWidget {
   final String timeLabel;
   final bool? online;
   final bool fromMe;
+  final bool pinned;
+  final bool muted;
   final VoidCallback onTap;
-  final VoidCallback? onLongPress;
+  final VoidCallback onLongPress;
 
   /// Small glyph shown before the preview for anything that isn't plain text.
   IconData? get _previewIcon {
@@ -462,14 +548,36 @@ class _ConversationTile extends StatelessWidget {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Text(
-                      title,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: theme.textTheme.titleMedium?.copyWith(
-                        fontWeight: FontWeight.w700,
-                        fontSize: 15.5,
-                      ),
+                    Row(
+                      children: [
+                        if (pinned) ...[
+                          Icon(
+                            Icons.push_pin_rounded,
+                            size: 14,
+                            color: scheme.primary,
+                          ),
+                          const SizedBox(width: 4),
+                        ],
+                        if (muted) ...[
+                          Icon(
+                            Icons.notifications_off_rounded,
+                            size: 14,
+                            color: scheme.onSurfaceVariant,
+                          ),
+                          const SizedBox(width: 4),
+                        ],
+                        Expanded(
+                          child: Text(
+                            title,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: theme.textTheme.titleMedium?.copyWith(
+                              fontWeight: FontWeight.w700,
+                              fontSize: 15.5,
+                            ),
+                          ),
+                        ),
+                      ],
                     ),
                     const SizedBox(height: 3),
                     Row(

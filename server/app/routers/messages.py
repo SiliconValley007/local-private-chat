@@ -10,14 +10,17 @@ from app.db import get_db
 from app.deps import get_current_user
 from app.models import Message, MessageReceipt, User, utcnow
 from app.realtime import events
+from app.realtime.events import message_out
 from app.realtime.hub import hub
-from app.schemas import MessageOut, SendMessageRequest
+from app.schemas import EditMessageRequest, MessageOut, SendMessageRequest
 from app.services import (
     create_and_broadcast_message,
+    edit_message,
     load_message,
     require_membership,
+    search_messages,
+    soft_delete_message,
 )
-from app.realtime.events import message_out
 
 router = APIRouter(tags=["messages"])
 
@@ -42,6 +45,24 @@ def list_messages(
         q = q.where(Message.id < before_id)
     rows = list(db.scalars(q).all())
     rows.reverse()  # oldest -> newest within page
+    return [message_out(m) for m in rows]
+
+
+@router.get("/api/messages/search", response_model=list[MessageOut])
+def search_all_messages(
+    q: str = Query(min_length=1, max_length=200),
+    conversation_id: int | None = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=100),
+    db: Session = Depends(get_db),
+    current: User = Depends(get_current_user),
+) -> list[MessageOut]:
+    rows = search_messages(
+        db,
+        conversation_id=conversation_id,
+        user_id=current.id,
+        query=q,
+        limit=limit,
+    )
     return [message_out(m) for m in rows]
 
 
@@ -73,6 +94,29 @@ async def send_message(
     return message_out(message)
 
 
+@router.patch("/api/messages/{message_id}", response_model=MessageOut)
+async def patch_message(
+    message_id: int,
+    body: EditMessageRequest,
+    db: Session = Depends(get_db),
+    current: User = Depends(get_current_user),
+) -> MessageOut:
+    message = await edit_message(
+        db, message_id=message_id, editor=current, new_body=body.body
+    )
+    return message_out(message)
+
+
+@router.delete("/api/messages/{message_id}", response_model=MessageOut)
+async def delete_message(
+    message_id: int,
+    db: Session = Depends(get_db),
+    current: User = Depends(get_current_user),
+) -> MessageOut:
+    message = await soft_delete_message(db, message_id=message_id, actor=current)
+    return message_out(message)
+
+
 @router.post("/api/conversations/{conversation_id}/read")
 async def mark_read(
     conversation_id: int,
@@ -92,12 +136,10 @@ async def mark_read(
         .options(selectinload(MessageReceipt.message))
     ).all()
 
-    sender_ids: set[int] = set()
     for r in receipts:
         if r.delivered_at is None:
             r.delivered_at = now
         r.read_at = now
-        sender_ids.add(r.message.sender_id)
         await hub.send_to_user(
             r.message.sender_id,
             events.event_receipt("read", r.message_id, conversation_id, current.id, now),

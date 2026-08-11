@@ -5,6 +5,8 @@ from __future__ import annotations
 from app.models import Message, User
 from app.schemas import MessageOut, QuotedMessage, ReceiptOut, UserOut, to_utc_iso
 
+DELETED_BODY = "This message was deleted"
+
 
 def user_out(user: User, is_online: bool = False) -> UserOut:
     return UserOut(
@@ -19,12 +21,14 @@ def user_out(user: User, is_online: bool = False) -> UserOut:
 def quoted_message(message: Message | None) -> QuotedMessage | None:
     if message is None:
         return None
+    deleted = message.deleted_at is not None
     return QuotedMessage(
         id=message.id,
         sender_id=message.sender_id,
-        type=message.type,
-        body=message.body,
-        media_name=message.media_name,
+        type=message.type if not deleted else "text",
+        body=DELETED_BODY if deleted else message.body,
+        media_name=None if deleted else message.media_name,
+        deleted=deleted,
     )
 
 
@@ -33,17 +37,20 @@ def message_out(message: Message) -> MessageOut:
         ReceiptOut(user_id=r.user_id, delivered_at=r.delivered_at, read_at=r.read_at)
         for r in (message.receipts or [])
     ]
+    deleted = message.deleted_at is not None
     return MessageOut(
         id=message.id,
         conversation_id=message.conversation_id,
         sender_id=message.sender_id,
-        type=message.type,
-        body=message.body,
-        media_name=message.media_name,
-        media_size=message.media_size,
-        media_mime=message.media_mime,
+        type=message.type if not deleted else "text",
+        body=DELETED_BODY if deleted else message.body,
+        media_name=None if deleted else message.media_name,
+        media_size=None if deleted else message.media_size,
+        media_mime=None if deleted else message.media_mime,
         client_id=message.client_id,
         created_at=message.created_at,
+        edited_at=None if deleted else message.edited_at,
+        deleted_at=message.deleted_at,
         reply_to=quoted_message(message.reply_to),
         receipts=receipts,
     )
@@ -51,6 +58,13 @@ def message_out(message: Message) -> MessageOut:
 
 def event_message_new(message: Message) -> dict:
     return {"type": "message.new", "message": message_out(message).model_dump(mode="json")}
+
+
+def event_message_updated(message: Message) -> dict:
+    return {
+        "type": "message.updated",
+        "message": message_out(message).model_dump(mode="json"),
+    }
 
 
 def event_receipt(kind: str, message_id: int, conversation_id: int, user_id: int, at) -> dict:

@@ -71,6 +71,7 @@ class QuotedMessage {
     required this.type,
     this.body,
     this.mediaName,
+    this.deleted = false,
   });
 
   final int id;
@@ -78,6 +79,7 @@ class QuotedMessage {
   final String type;
   final String? body;
   final String? mediaName;
+  final bool deleted;
 
   factory QuotedMessage.fromJson(Map<String, dynamic> json) => QuotedMessage(
     id: json['id'] as int,
@@ -85,6 +87,7 @@ class QuotedMessage {
     type: json['type'] as String,
     body: json['body'] as String?,
     mediaName: json['media_name'] as String?,
+    deleted: json['deleted'] as bool? ?? false,
   );
 
   factory QuotedMessage.fromMessage(ChatMessage message) => QuotedMessage(
@@ -93,6 +96,7 @@ class QuotedMessage {
     type: message.type,
     body: message.body,
     mediaName: message.mediaName,
+    deleted: message.deletedAt != null,
   );
 }
 
@@ -108,6 +112,8 @@ class ChatMessage {
     this.mediaMime,
     this.clientId,
     required this.createdAt,
+    this.editedAt,
+    this.deletedAt,
     this.replyTo,
     this.receipts = const [],
     this.pending = false,
@@ -123,11 +129,15 @@ class ChatMessage {
   final String? mediaMime;
   final String? clientId;
   final DateTime createdAt;
+  final DateTime? editedAt;
+  final DateTime? deletedAt;
 
   /// The message this one replies to, or null for a normal message.
   final QuotedMessage? replyTo;
   final List<Receipt> receipts;
   final bool pending;
+
+  bool get isDeleted => deletedAt != null;
 
   factory ChatMessage.fromJson(Map<String, dynamic> json) {
     final receiptsJson = json['receipts'] as List<dynamic>? ?? [];
@@ -143,6 +153,8 @@ class ChatMessage {
       mediaMime: json['media_mime'] as String?,
       clientId: json['client_id'] as String?,
       createdAt: parseServerTime(json['created_at'] as String),
+      editedAt: tryParseServerTime(json['edited_at'] as String?),
+      deletedAt: tryParseServerTime(json['deleted_at'] as String?),
       replyTo: reply == null ? null : QuotedMessage.fromJson(reply),
       receipts: receiptsJson
           .map((e) => Receipt.fromJson(e as Map<String, dynamic>))
@@ -150,18 +162,33 @@ class ChatMessage {
     );
   }
 
-  ChatMessage copyWith({int? id, List<Receipt>? receipts, bool? pending}) {
+  ChatMessage copyWith({
+    int? id,
+    String? body,
+    String? type,
+    String? mediaName,
+    int? mediaSize,
+    String? mediaMime,
+    DateTime? editedAt,
+    DateTime? deletedAt,
+    List<Receipt>? receipts,
+    bool? pending,
+    bool clearEditedAt = false,
+    bool clearDeletedAt = false,
+  }) {
     return ChatMessage(
       id: id ?? this.id,
       conversationId: conversationId,
       senderId: senderId,
-      type: type,
-      body: body,
-      mediaName: mediaName,
-      mediaSize: mediaSize,
-      mediaMime: mediaMime,
+      type: type ?? this.type,
+      body: body ?? this.body,
+      mediaName: mediaName ?? this.mediaName,
+      mediaSize: mediaSize ?? this.mediaSize,
+      mediaMime: mediaMime ?? this.mediaMime,
       clientId: clientId,
       createdAt: createdAt,
+      editedAt: clearEditedAt ? null : (editedAt ?? this.editedAt),
+      deletedAt: clearDeletedAt ? null : (deletedAt ?? this.deletedAt),
       replyTo: replyTo,
       receipts: receipts ?? this.receipts,
       pending: pending ?? this.pending,

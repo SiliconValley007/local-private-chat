@@ -5,6 +5,7 @@ import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 
 import '../navigation.dart';
 import 'contacts_store.dart';
+import 'conversation_prefs_store.dart';
 
 const _channelId = 'local_chat_messages';
 const _channelName = 'Messages';
@@ -169,6 +170,8 @@ class NotificationService {
   Future<void> showFromPushData(Map<String, dynamic> data) async {
     final cid = _conversationIdFrom(data);
     if (cid == null) return;
+    final prefs = await ConversationPrefsStore.load();
+    if (prefs[cid]?.muted ?? false) return;
     final sender = await notificationTitleFromData(data);
     await showIncomingMessage(
       conversationId: cid,
@@ -189,5 +192,44 @@ class NotificationService {
       sender = aliases[username] ?? serverName;
     }
     return sender.isEmpty ? 'Local Chat' : sender;
+  }
+
+  /// Updates the launcher unread hint via a silent summary notification.
+  ///
+  /// Many Android launchers (Samsung, Xiaomi, etc.) show a badge from the
+  /// notification count / number. Unsupported launchers simply show nothing.
+  Future<void> setAppBadgeCount(int count) async {
+    try {
+      await _ensureLocalNotifications();
+      const summaryId = 0;
+      if (count <= 0) {
+        await _plugin.cancel(summaryId);
+        return;
+      }
+      await _plugin.show(
+        summaryId,
+        'Local Chat',
+        count == 1 ? '1 unread message' : '$count unread messages',
+        NotificationDetails(
+          android: AndroidNotificationDetails(
+            _channelId,
+            _channelName,
+            channelDescription: _channelDescription,
+            importance: Importance.low,
+            priority: Priority.low,
+            number: count,
+            onlyAlertOnce: true,
+            playSound: false,
+            enableVibration: false,
+            category: AndroidNotificationCategory.message,
+            groupKey: 'local_chat_badge',
+            // Keep it as a quiet indicator, not a loud alert.
+            silent: true,
+          ),
+        ),
+      );
+    } catch (e) {
+      debugPrint('Badge update skipped: $e');
+    }
   }
 }

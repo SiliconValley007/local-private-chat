@@ -53,6 +53,8 @@ def init_db() -> None:
 # tables, so an existing database on a phone needs them added explicitly.
 _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("messages", "reply_to_message_id", "INTEGER"),
+    ("messages", "edited_at", "DATETIME"),
+    ("messages", "deleted_at", "DATETIME"),
 )
 
 

@@ -399,6 +399,52 @@ class ApiClient {
     return ChatMessage.fromJson(data);
   }
 
+  Future<ChatMessage> editMessage(int messageId, String body) async {
+    final res = await _send(
+      () => http.patch(
+        _uri('/api/messages/$messageId'),
+        headers: _headers(),
+        body: jsonEncode({'body': body}),
+      ),
+    );
+    final data = await _decode(res);
+    return ChatMessage.fromJson(data);
+  }
+
+  Future<ChatMessage> deleteMessage(int messageId) async {
+    final res = await _send(
+      () => http.delete(
+        _uri('/api/messages/$messageId'),
+        headers: _headers(jsonBody: false),
+      ),
+    );
+    final data = await _decode(res);
+    return ChatMessage.fromJson(data);
+  }
+
+  Future<List<ChatMessage>> searchMessages(
+    String query, {
+    int? conversationId,
+    int limit = 50,
+  }) async {
+    final params = <String, String>{
+      'q': query,
+      'limit': '$limit',
+    };
+    if (conversationId != null) {
+      params['conversation_id'] = '$conversationId';
+    }
+    final res = await _send(
+      () => http.get(
+        _uri('/api/messages/search', params),
+        headers: _headers(jsonBody: false),
+      ),
+    );
+    return _decodeList(
+      res,
+    ).map((e) => ChatMessage.fromJson(e as Map<String, dynamic>)).toList();
+  }
+
   /// Receipts are housekeeping: a failure here must never surface to the user.
   Future<void> markRead(int conversationId) async {
     try {

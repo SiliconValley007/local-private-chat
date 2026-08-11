@@ -29,6 +29,8 @@ def test_missing_reply_column_is_added(tmp_path, monkeypatch):
     with engine.connect() as conn:
         columns = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(messages)")}
         assert "reply_to_message_id" in columns
+        assert "edited_at" in columns
+        assert "deleted_at" in columns
         # Existing rows are preserved and default the new column to NULL.
         row = conn.execute(
             text("SELECT body, reply_to_message_id FROM messages WHERE id = 1")
@@ -44,7 +46,9 @@ def test_migration_is_idempotent(tmp_path, monkeypatch):
     engine = create_engine(f"sqlite:///{db_file.as_posix()}")
     with engine.begin() as conn:
         conn.exec_driver_sql(
-            "CREATE TABLE messages (id INTEGER PRIMARY KEY, reply_to_message_id INTEGER)"
+            "CREATE TABLE messages ("
+            "id INTEGER PRIMARY KEY, reply_to_message_id INTEGER, "
+            "edited_at DATETIME, deleted_at DATETIME)"
         )
 
     monkeypatch.setattr(db_module, "engine", engine)
@@ -55,4 +59,6 @@ def test_migration_is_idempotent(tmp_path, monkeypatch):
     with engine.connect() as conn:
         columns = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(messages)")}
         assert "reply_to_message_id" in columns
+        assert "edited_at" in columns
+        assert "deleted_at" in columns
     engine.dispose()

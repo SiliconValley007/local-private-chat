@@ -23,8 +23,15 @@ class RealtimeService {
   /// A socket is open or being opened. Guards against stacking connections when
   /// several code paths (login, resume, health check) all ask to connect.
   bool _active = false;
+  bool _connected = false;
   int _attempt = 0;
   final _handlers = <RealtimeHandler>[];
+
+  /// True once the WebSocket is open and delivering events.
+  bool get isConnected => _connected;
+
+  /// Fired whenever [isConnected] flips (connect, drop, reconnect).
+  void Function(bool connected)? onConnectionChanged;
 
   /// Called when the server rejects our token, so the app can ask for a sign-in
   /// instead of reconnecting forever.
@@ -49,6 +56,7 @@ class RealtimeService {
     _sub = null;
     _channel?.sink.close();
     _channel = null;
+    _setConnected(false);
   }
 
   void send(Map<String, dynamic> event) {
@@ -67,6 +75,12 @@ class RealtimeService {
     send({'type': 'ack.delivered', 'message_id': messageId});
   }
 
+  void _setConnected(bool value) {
+    if (_connected == value) return;
+    _connected = value;
+    onConnectionChanged?.call(value);
+  }
+
   void _open() {
     final url = api.wsUrl;
     if (url == null) return;
@@ -74,10 +88,26 @@ class RealtimeService {
     _sub = null;
     _active = true;
     try {
-      _channel = WebSocketChannel.connect(Uri.parse(url));
-      _sub = _channel!.stream.listen(
+      final channel = WebSocketChannel.connect(Uri.parse(url));
+      _channel = channel;
+      // The handshake, not the first inbound event, is what proves we are
+      // online. Waiting for traffic left the UI claiming "reconnecting" for as
+      // long as the server had nothing to say.
+      channel.ready.then(
+        (_) {
+          if (_channel != channel) return; // A newer socket already replaced us.
+          _attempt = 0;
+          _setConnected(true);
+        },
+        onError: (_) {
+          if (_channel != channel) return;
+          _scheduleReconnect();
+        },
+      );
+      _sub = channel.stream.listen(
         (data) {
           _attempt = 0; // A live connection resets the backoff.
+          _setConnected(true);
           try {
             final event = jsonDecode(data as String) as Map<String, dynamic>;
             for (final h in List.of(_handlers)) {
@@ -100,6 +130,7 @@ class RealtimeService {
   void _scheduleReconnect() {
     _ping?.cancel();
     _active = false;
+    _setConnected(false);
     final closeCode = _channel?.closeCode;
     _channel = null;
     if (_manualClose) return;

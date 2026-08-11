@@ -13,6 +13,7 @@ import 'screens/chat_screen.dart';
 import 'services/backup_service.dart';
 import 'services/connectivity_service.dart';
 import 'services/contacts_store.dart';
+import 'services/conversation_prefs_store.dart';
 import 'services/media_store.dart';
 import 'services/notification_service.dart';
 import 'services/theme_store.dart';
@@ -26,6 +27,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       media = MediaStore(api) {
     realtime.addHandler(_onEvent);
     realtime.onAuthFailure = _onSessionRejected;
+    realtime.onConnectionChanged = _onRealtimeConnectionChanged;
     WidgetsBinding.instance.addObserver(this);
   }
 
@@ -44,6 +46,17 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   bool ready = false;
   bool serverReachable = false;
   bool checkingConnectivity = false;
+
+  /// Live WebSocket link to the server (false while reconnecting).
+  bool realtimeConnected = false;
+
+  /// Whether the inbox should warn about the dropped socket.
+  ///
+  /// Separate from [realtimeConnected] so a routine reconnect — including the
+  /// one on every cold start and resume — never flashes a warning at someone
+  /// whose chat is working fine.
+  bool showReconnecting = false;
+  Timer? _reconnectNotice;
   ServerCheck? serverCheck;
   String? error;
   List<Conversation> conversations = [];
@@ -52,6 +65,9 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
 
   /// username -> the name you gave that person on this phone.
   Map<String, String> contactAliases = {};
+
+  /// conversationId -> pin/mute prefs for this phone only.
+  Map<int, ConversationPrefs> conversationPrefs = {};
   final Map<int, List<ChatMessage>> messagesByConv = {};
   final Map<int, Set<int>> typingUsers = {};
   final Map<int, bool> onlineByUser = {};
@@ -66,6 +82,33 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   bool get isLoggedIn => api.token != null && api.currentUser != null;
   bool get hasServer => api.baseUrl != null && api.baseUrl!.isNotEmpty;
 
+  int get totalUnread =>
+      conversations.fold(0, (sum, c) => sum + c.unreadCount);
+
+  /// How long the socket may be down before the inbox says anything about it.
+  static const _reconnectGrace = Duration(seconds: 6);
+
+  void _onRealtimeConnectionChanged(bool connected) {
+    realtimeConnected = connected;
+    _reconnectNotice?.cancel();
+    if (connected) {
+      showReconnecting = false;
+    } else {
+      _reconnectNotice = Timer(_reconnectGrace, () {
+        if (realtimeConnected || !isLoggedIn) return;
+        showReconnecting = true;
+        notifyListeners();
+      });
+    }
+    notifyListeners();
+  }
+
+  bool isPinned(int conversationId) =>
+      conversationPrefs[conversationId]?.pinned ?? false;
+
+  bool isMuted(int conversationId) =>
+      conversationPrefs[conversationId]?.muted ?? false;
+
   /// Applies an appearance choice and remembers it for future launches.
   Future<void> setThemeMode(ThemeMode mode) async {
     if (mode == themeMode) return;
@@ -78,6 +121,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     error = null;
     await api.loadPersisted();
     contactAliases = await contactsStore.aliases();
+    conversationPrefs = await ConversationPrefsStore.load();
     NotificationService.instance.onTokenRefresh = _onFcmTokenRefreshed;
     await NotificationService.instance.init(
       onOpenConversation: (id) => openConversationById(id),
@@ -159,6 +203,10 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
         // means it skips the push notification — so nothing would be shown.
         _healthTimer?.cancel();
         realtime.disconnect();
+        // This drop is deliberate, so it must not leave a warning waiting to
+        // appear on the next resume.
+        _reconnectNotice?.cancel();
+        showReconnecting = false;
       case AppLifecycleState.inactive:
       case AppLifecycleState.hidden:
         break;
@@ -232,6 +280,8 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       } catch (_) {}
     }
     realtime.disconnect();
+    _reconnectNotice?.cancel();
+    showReconnecting = false;
     await api.logout();
     conversations = [];
     messagesByConv.clear();
@@ -240,7 +290,14 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   }
 
   Future<void> refreshInbox() async {
-    conversations = await api.listConversations();
+    final list = await api.listConversations();
+    list.sort((a, b) {
+      final ap = isPinned(a.id) ? 1 : 0;
+      final bp = isPinned(b.id) ? 1 : 0;
+      if (ap != bp) return bp.compareTo(ap);
+      return b.updatedAt.compareTo(a.updatedAt);
+    });
+    conversations = list;
     for (final c in conversations) {
       if (c.peer != null) {
         onlineByUser[c.peer!.id] = c.peer!.isOnline;
@@ -249,6 +306,27 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
         onlineByUser[m.userId] = m.isOnline;
       }
     }
+    notifyListeners();
+    await NotificationService.instance.setAppBadgeCount(totalUnread);
+  }
+
+  Future<void> togglePin(int conversationId) async {
+    final current = conversationPrefs[conversationId] ?? const ConversationPrefs();
+    conversationPrefs = {
+      ...conversationPrefs,
+      conversationId: current.copyWith(pinned: !current.pinned),
+    };
+    await ConversationPrefsStore.save(conversationPrefs);
+    await refreshInbox();
+  }
+
+  Future<void> toggleMute(int conversationId) async {
+    final current = conversationPrefs[conversationId] ?? const ConversationPrefs();
+    conversationPrefs = {
+      ...conversationPrefs,
+      conversationId: current.copyWith(muted: !current.muted),
+    };
+    await ConversationPrefsStore.save(conversationPrefs);
     notifyListeners();
   }
 
@@ -352,6 +430,25 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     if (older.isEmpty) return;
     messagesByConv[conversationId] = [...older, ...current];
     notifyListeners();
+  }
+
+  Future<List<ChatMessage>> searchMessages(
+    String query, {
+    int? conversationId,
+  }) async {
+    return api.searchMessages(query, conversationId: conversationId);
+  }
+
+  Future<void> editMessage(int conversationId, ChatMessage message, String body) async {
+    final updated = await api.editMessage(message.id, body);
+    _upsertMessage(updated);
+    await refreshInbox();
+  }
+
+  Future<void> deleteMessage(int conversationId, ChatMessage message) async {
+    final updated = await api.deleteMessage(message.id);
+    _upsertMessage(updated);
+    await refreshInbox();
   }
 
   /// Sends a text message, optionally quoting [replyTo].
@@ -578,7 +675,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
           api.markDelivered(msg.id);
           if (activeConversationId == msg.conversationId) {
             api.markRead(msg.conversationId);
-          } else {
+          } else if (!isMuted(msg.conversationId)) {
             final title =
                 _titleForConversation(msg.conversationId) ?? 'New message';
             NotificationService.instance.showIncomingMessage(
@@ -588,6 +685,13 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
             );
           }
         }
+        refreshInbox();
+        break;
+      case 'message.updated':
+        final updated = ChatMessage.fromJson(
+          event['message'] as Map<String, dynamic>,
+        );
+        _upsertMessage(updated);
         refreshInbox();
         break;
       case 'receipt.delivered':
@@ -621,6 +725,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
 
   /// One-line summary of a message, for the inbox and local notifications.
   static String messagePreview(ChatMessage msg) {
+    if (msg.isDeleted) return 'This message was deleted';
     switch (msg.type) {
       case 'image':
         final caption = msg.body?.trim() ?? '';
@@ -676,6 +781,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   @override
   void dispose() {
     _healthTimer?.cancel();
+    _reconnectNotice?.cancel();
     WidgetsBinding.instance.removeObserver(this);
     realtime.disconnect();
     super.dispose();

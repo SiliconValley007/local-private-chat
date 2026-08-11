@@ -114,6 +114,10 @@ class SendMessageRequest(BaseModel):
     reply_to_message_id: int | None = None
 
 
+class EditMessageRequest(BaseModel):
+    body: str = Field(min_length=1, max_length=8000)
+
+
 class QuotedMessage(BaseModel):
     """Enough of a quoted message to draw the reply header on any client.
 
@@ -126,6 +130,7 @@ class QuotedMessage(BaseModel):
     type: str
     body: str | None = None
     media_name: str | None = None
+    deleted: bool = False
 
     model_config = {"from_attributes": True}
 
@@ -147,6 +152,8 @@ class MessageOut(BaseModel):
     media_mime: str | None = None
     client_id: str | None = None
     created_at: UtcDatetime
+    edited_at: UtcDatetime | None = None
+    deleted_at: UtcDatetime | None = None
     reply_to: QuotedMessage | None = None
     receipts: list[ReceiptOut] = Field(default_factory=list)
 

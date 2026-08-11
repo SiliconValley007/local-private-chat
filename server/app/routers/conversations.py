@@ -57,11 +57,15 @@ def _conversation_out(db: Session, conv: Conversation, viewer: User) -> Conversa
     if last:
         last_preview = MessagePreview(
             id=last.id,
-            type=last.type,
-            body=last.body,
+            type="text" if last.deleted_at is not None else last.type,
+            body=(
+                "This message was deleted"
+                if last.deleted_at is not None
+                else last.body
+            ),
             sender_id=last.sender_id,
             created_at=last.created_at,
-            media_name=last.media_name,
+            media_name=None if last.deleted_at is not None else last.media_name,
         )
         updated_at = last.created_at
 

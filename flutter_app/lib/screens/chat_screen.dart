@@ -8,15 +8,18 @@ import 'package:provider/provider.dart';
 import 'package:record/record.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:file_picker/file_picker.dart';
+import 'package:share_plus/share_plus.dart';
 
 import '../app_state.dart';
 import '../errors.dart';
 import '../models.dart';
+import '../services/export_service.dart';
 import '../services/voice_player.dart';
 import '../theme.dart';
 import '../time_format.dart';
 import '../widgets/attachments.dart';
 import '../widgets/avatar.dart';
+import '../widgets/linkified_text.dart';
 import '../widgets/quoted_message.dart';
 import '../widgets/rename_dialog.dart';
 
@@ -31,12 +34,14 @@ class ChatScreen extends StatefulWidget {
 
 class _ChatScreenState extends State<ChatScreen> {
   final _text = TextEditingController();
+  final _searchQuery = TextEditingController();
   final _scroll = ScrollController();
   final _recorder = AudioRecorder();
 
   Timer? _typingStop;
   Timer? _recordTicker;
   bool _recording = false;
+  bool _searching = false;
   Duration _recorded = Duration.zero;
   String? _recordingPath;
   bool _showJumpToLatest = false;
@@ -89,6 +94,7 @@ class _ChatScreenState extends State<ChatScreen> {
     _appState.setTyping(widget.conversation.id, false);
     VoicePlayer.instance.stop();
     _text.dispose();
+    _searchQuery.dispose();
     _scroll.removeListener(_onScroll);
     _scroll.dispose();
     _recorder.dispose();
@@ -442,6 +448,165 @@ class _ChatScreenState extends State<ChatScreen> {
     );
   }
 
+  Future<void> _searchInChat(Conversation conv, String query) async {
+    final trimmed = query.trim();
+    if (trimmed.isEmpty) return;
+    try {
+      final results = await _appState.searchMessages(
+        trimmed,
+        conversationId: conv.id,
+      );
+      if (!mounted) return;
+      if (results.isEmpty) {
+        _showMessage('No messages match that search.');
+        return;
+      }
+      await showModalBottomSheet<void>(
+        context: context,
+        showDragHandle: true,
+        isScrollControlled: true,
+        builder: (sheetContext) => SafeArea(
+          child: ListView.builder(
+            shrinkWrap: true,
+            padding: const EdgeInsets.only(bottom: 16),
+            itemCount: results.length,
+            itemBuilder: (_, index) {
+              final msg = results[index];
+              return ListTile(
+                title: Text(
+                  AppState.messagePreview(msg),
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                ),
+                subtitle: Text(formatClockTime(context, msg.createdAt)),
+                onTap: () {
+                  Navigator.pop(sheetContext);
+                  setState(() {
+                    _searching = false;
+                    _searchQuery.clear();
+                  });
+                  _goToMessage(msg.id);
+                },
+              );
+            },
+          ),
+        ),
+      );
+    } catch (e) {
+      _showMessage(friendlyMessage(e));
+    }
+  }
+
+  Future<void> _exportChat(Conversation conv) async {
+    try {
+      for (var i = 0; i < 5; i++) {
+        final before = (_appState.messagesByConv[conv.id] ?? []).length;
+        await _appState.loadOlder(conv.id);
+        final after = (_appState.messagesByConv[conv.id] ?? []).length;
+        if (after == before) break;
+      }
+      if (!mounted) return;
+      final state = context.read<AppState>();
+      final messages = state.messagesByConv[conv.id] ?? const <ChatMessage>[];
+      final text = formatChatAsText(
+        conversation: conv,
+        messages: messages,
+        nameFor: (id) => _senderName(state, conv, id),
+        chatTitle: state.titleFor(conv),
+      );
+      final dir = await getTemporaryDirectory();
+      final file = File(
+        '${dir.path}/chat_export_${conv.id}_${DateTime.now().millisecondsSinceEpoch}.txt',
+      );
+      await file.writeAsString(text);
+      await Share.shareXFiles([XFile(file.path)], text: 'Chat export');
+    } catch (e) {
+      _showMessage(friendlyMessage(e));
+    }
+  }
+
+  Future<void> _onChatMenuSelected(String value, Conversation conv) async {
+    final state = context.read<AppState>();
+    switch (value) {
+      case 'search':
+        setState(() => _searching = true);
+      case 'export':
+        await _exportChat(conv);
+      case 'pin':
+        await state.togglePin(conv.id);
+      case 'mute':
+        await state.toggleMute(conv.id);
+      case 'rename':
+        await _renamePeer(conv);
+    }
+  }
+
+  List<PopupMenuEntry<String>> _chatMenuItems(AppState state, Conversation conv) {
+    final pinned = state.isPinned(conv.id);
+    final muted = state.isMuted(conv.id);
+    return [
+      const PopupMenuItem(
+        value: 'search',
+        child: ListTile(
+          dense: true,
+          contentPadding: EdgeInsets.zero,
+          leading: Icon(Icons.search_rounded),
+          title: Text('Search in chat'),
+        ),
+      ),
+      const PopupMenuItem(
+        value: 'export',
+        child: ListTile(
+          dense: true,
+          contentPadding: EdgeInsets.zero,
+          leading: Icon(Icons.ios_share_rounded),
+          title: Text('Export chat'),
+        ),
+      ),
+      PopupMenuItem(
+        value: 'pin',
+        child: ListTile(
+          dense: true,
+          contentPadding: EdgeInsets.zero,
+          leading: Icon(
+            pinned ? Icons.push_pin_outlined : Icons.push_pin_rounded,
+          ),
+          title: Text(pinned ? 'Unpin chat' : 'Pin chat'),
+        ),
+      ),
+      PopupMenuItem(
+        value: 'mute',
+        child: ListTile(
+          dense: true,
+          contentPadding: EdgeInsets.zero,
+          leading: Icon(
+            muted
+                ? Icons.notifications_active_outlined
+                : Icons.notifications_off_outlined,
+          ),
+          title: Text(muted ? 'Unmute' : 'Mute'),
+        ),
+      ),
+      if (conv.type == 'dm')
+        PopupMenuItem(
+          value: 'rename',
+          child: ListTile(
+            dense: true,
+            contentPadding: EdgeInsets.zero,
+            leading: const Icon(Icons.drive_file_rename_outline_rounded),
+            title: Text(
+              state.hasCustomName(conv.peer?.username)
+                  ? 'Change name'
+                  : 'Rename this person',
+            ),
+            subtitle: conv.peer == null
+                ? null
+                : Text('Really ${conv.peer!.displayName}'),
+          ),
+        ),
+    ];
+  }
+
   @override
   Widget build(BuildContext context) {
     final state = context.watch<AppState>();
@@ -461,85 +626,97 @@ class _ChatScreenState extends State<ChatScreen> {
     return Scaffold(
       backgroundColor: AppColors.chatCanvasFor(context),
       appBar: AppBar(
-        titleSpacing: 0,
-        title: InkWell(
-          onTap: conv.type == 'group'
-              ? () => _showGroupMembers(conv)
-              : () => _renamePeer(conv),
-          child: Row(
-            children: [
-              Avatar(
-                name: title,
-                seed: conv.type == 'dm' ? (conv.peer?.id ?? conv.id) : conv.id,
-                radius: 19,
-                online: online,
-                badge: conv.type == 'group' ? Icons.group_rounded : null,
-              ),
-              const SizedBox(width: 12),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
+        leading: _searching
+            ? IconButton(
+                tooltip: 'Cancel search',
+                icon: const Icon(Icons.arrow_back_rounded),
+                onPressed: () => setState(() {
+                  _searching = false;
+                  _searchQuery.clear();
+                }),
+              )
+            : null,
+        titleSpacing: _searching ? 0 : null,
+        title: _searching
+            ? TextField(
+                controller: _searchQuery,
+                autofocus: true,
+                textInputAction: TextInputAction.search,
+                decoration: const InputDecoration(
+                  hintText: 'Search in chat',
+                  border: InputBorder.none,
+                  isDense: true,
+                ),
+                onSubmitted: (value) => _searchInChat(conv, value),
+              )
+            : InkWell(
+                onTap: conv.type == 'group'
+                    ? () => _showGroupMembers(conv)
+                    : () => _renamePeer(conv),
+                child: Row(
                   children: [
-                    Text(
-                      title,
-                      style: const TextStyle(
-                        fontSize: 16.5,
-                        fontWeight: FontWeight.w700,
-                      ),
-                      overflow: TextOverflow.ellipsis,
+                    Avatar(
+                      name: title,
+                      seed: conv.type == 'dm'
+                          ? (conv.peer?.id ?? conv.id)
+                          : conv.id,
+                      radius: 19,
+                      online: online,
+                      badge: conv.type == 'group' ? Icons.group_rounded : null,
                     ),
-                    Text(
-                      _subtitleFor(conv, state, typing),
-                      style: TextStyle(
-                        fontSize: 12,
-                        fontWeight: FontWeight.w500,
-                        color: typing
-                            ? scheme.primary
-                            : (online == true
-                                  ? AppColors.online
-                                  : scheme.onSurfaceVariant),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            title,
+                            style: const TextStyle(
+                              fontSize: 16.5,
+                              fontWeight: FontWeight.w700,
+                            ),
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                          Text(
+                            _subtitleFor(conv, state, typing),
+                            style: TextStyle(
+                              fontSize: 12,
+                              fontWeight: FontWeight.w500,
+                              color: typing
+                                  ? scheme.primary
+                                  : (online == true
+                                        ? AppColors.online
+                                        : scheme.onSurfaceVariant),
+                            ),
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ],
                       ),
-                      overflow: TextOverflow.ellipsis,
                     ),
                   ],
                 ),
               ),
-            ],
-          ),
-        ),
         actions: [
-          if (conv.type == 'group')
+          if (_searching)
             IconButton(
-              tooltip: 'Members',
-              onPressed: () => _showGroupMembers(conv),
-              icon: const Icon(Icons.info_outline_rounded),
+              tooltip: 'Search',
+              icon: const Icon(Icons.search_rounded),
+              onPressed: () => _searchInChat(conv, _searchQuery.text),
             )
-          else
+          else ...[
+            if (conv.type == 'group')
+              IconButton(
+                tooltip: 'Members',
+                onPressed: () => _showGroupMembers(conv),
+                icon: const Icon(Icons.info_outline_rounded),
+              ),
             PopupMenuButton<String>(
               tooltip: 'More',
               position: PopupMenuPosition.under,
-              onSelected: (value) {
-                if (value == 'rename') _renamePeer(conv);
-              },
-              itemBuilder: (_) => [
-                PopupMenuItem(
-                  value: 'rename',
-                  child: ListTile(
-                    dense: true,
-                    contentPadding: EdgeInsets.zero,
-                    leading: const Icon(Icons.drive_file_rename_outline_rounded),
-                    title: Text(
-                      state.hasCustomName(conv.peer?.username)
-                          ? 'Change name'
-                          : 'Rename this person',
-                    ),
-                    subtitle: conv.peer == null
-                        ? null
-                        : Text('Really ${conv.peer!.displayName}'),
-                  ),
-                ),
-              ],
+              onSelected: (value) => _onChatMenuSelected(value, conv),
+              itemBuilder: (_) => _chatMenuItems(state, conv),
             ),
+          ],
         ],
       ),
       body: Column(
@@ -658,13 +835,14 @@ class _MessageList extends StatelessWidget {
             Padding(
               key: keyFor(msg.id),
               padding: EdgeInsets.only(top: firstOfRun ? 8 : 2),
-              child: SwipeToReply(
+              child:               SwipeToReply(
                 // Pending messages have no server id yet, so there is nothing
                 // for the other side to quote.
-                enabled: !msg.pending && msg.id > 0,
+                enabled: !msg.pending && msg.id > 0 && !msg.isDeleted,
                 onReply: () => onReply(msg),
                 child: _MessageRow(
                   message: msg,
+                  conversationId: conversation.id,
                   mine: mine,
                   firstOfRun: firstOfRun,
                   lastOfRun: lastOfRun,
@@ -679,7 +857,7 @@ class _MessageList extends StatelessWidget {
                   onQuoteTap: msg.replyTo == null
                       ? null
                       : () => onQuoteTap(msg.replyTo!.id),
-                  onReply: msg.pending || msg.id <= 0
+                  onReply: msg.pending || msg.id <= 0 || msg.isDeleted
                       ? null
                       : () => onReply(msg),
                 ),
@@ -695,6 +873,7 @@ class _MessageList extends StatelessWidget {
 class _MessageRow extends StatelessWidget {
   const _MessageRow({
     required this.message,
+    required this.conversationId,
     required this.mine,
     required this.firstOfRun,
     required this.lastOfRun,
@@ -708,6 +887,7 @@ class _MessageRow extends StatelessWidget {
   });
 
   final ChatMessage message;
+  final int conversationId;
   final bool mine;
   final bool firstOfRun;
   final bool lastOfRun;
@@ -720,7 +900,13 @@ class _MessageRow extends StatelessWidget {
   final VoidCallback? onReply;
 
   Future<void> _showActions(BuildContext context) async {
-    final canCopy = (message.body ?? '').trim().isNotEmpty;
+    if (message.isDeleted) return;
+
+    final isText = message.type == 'text';
+    final canCopy = isText && (message.body ?? '').trim().isNotEmpty;
+    final canEdit = mine && isText;
+    final canDelete = mine && isText;
+
     final action = await showModalBottomSheet<String>(
       context: context,
       showDragHandle: true,
@@ -740,19 +926,114 @@ class _MessageRow extends StatelessWidget {
                 title: const Text('Copy text'),
                 onTap: () => Navigator.pop(sheetContext, 'copy'),
               ),
+            if (canEdit)
+              ListTile(
+                leading: const Icon(Icons.edit_outlined),
+                title: const Text('Edit'),
+                onTap: () => Navigator.pop(sheetContext, 'edit'),
+              ),
+            if (canDelete)
+              ListTile(
+                leading: const Icon(Icons.delete_outline_rounded),
+                title: const Text('Delete'),
+                onTap: () => Navigator.pop(sheetContext, 'delete'),
+              ),
             const SizedBox(height: 8),
           ],
         ),
       ),
     );
-    if (action == 'reply') {
-      onReply?.call();
-    } else if (action == 'copy') {
-      await Clipboard.setData(ClipboardData(text: message.body ?? ''));
+
+    if (!context.mounted) return;
+
+    switch (action) {
+      case 'reply':
+        onReply?.call();
+      case 'copy':
+        await Clipboard.setData(ClipboardData(text: message.body ?? ''));
+        if (context.mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Copied')),
+          );
+        }
+      case 'edit':
+        await _editMessage(context);
+      case 'delete':
+        await _deleteMessage(context);
+    }
+  }
+
+  Future<void> _editMessage(BuildContext context) async {
+    final controller = TextEditingController(text: message.body ?? '');
+    final result = await showDialog<String>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Edit message'),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          maxLines: 4,
+          minLines: 1,
+          textCapitalization: TextCapitalization.sentences,
+          decoration: const InputDecoration(hintText: 'Message'),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, controller.text),
+            child: const Text('Save'),
+          ),
+        ],
+      ),
+    );
+    controller.dispose();
+    final trimmed = result?.trim() ?? '';
+    if (trimmed.isEmpty || trimmed == (message.body ?? '').trim()) return;
+    if (!context.mounted) return;
+    try {
+      await context.read<AppState>().editMessage(
+        conversationId,
+        message,
+        trimmed,
+      );
+    } catch (e) {
       if (context.mounted) {
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(const SnackBar(content: Text('Copied')));
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(friendlyMessage(e))),
+        );
+      }
+    }
+  }
+
+  Future<void> _deleteMessage(BuildContext context) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Delete message?'),
+        content: const Text('This message will be removed for everyone.'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: const Text('Delete'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !context.mounted) return;
+    try {
+      await context.read<AppState>().deleteMessage(conversationId, message);
+    } catch (e) {
+      if (context.mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(friendlyMessage(e))),
+        );
       }
     }
   }
@@ -761,7 +1042,7 @@ class _MessageRow extends StatelessWidget {
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
     final maxWidth = MediaQuery.of(context).size.width * 0.76;
-    final isPhoto = message.type == 'image';
+    final isPhoto = message.type == 'image' && !message.isDeleted;
 
     final footer = Row(
       mainAxisSize: MainAxisSize.min,
@@ -790,7 +1071,7 @@ class _MessageRow extends StatelessWidget {
       child: ConstrainedBox(
         constraints: BoxConstraints(maxWidth: maxWidth),
         child: GestureDetector(
-          onLongPress: () => _showActions(context),
+          onLongPress: message.isDeleted ? null : () => _showActions(context),
           child: AnimatedContainer(
             duration: const Duration(milliseconds: 220),
             padding: isPhoto
@@ -893,6 +1174,19 @@ class _MessageContent extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    if (message.isDeleted) {
+      final scheme = Theme.of(context).colorScheme;
+      return Text(
+        'This message was deleted',
+        style: TextStyle(
+          height: 1.35,
+          fontSize: 15,
+          fontStyle: FontStyle.italic,
+          color: scheme.onSurfaceVariant,
+        ),
+      );
+    }
+
     switch (message.type) {
       case 'image':
         return ImageAttachment(
@@ -908,9 +1202,27 @@ class _MessageContent extends StatelessWidget {
       case 'file':
         return FileAttachment(message: message, maxWidth: maxWidth);
       default:
-        return Text(
-          message.body ?? '',
-          style: const TextStyle(height: 1.35, fontSize: 15),
+        final scheme = Theme.of(context).colorScheme;
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            LinkifiedText(
+              message.body ?? '',
+              style: const TextStyle(height: 1.35, fontSize: 15),
+            ),
+            if (message.editedAt != null)
+              Padding(
+                padding: const EdgeInsets.only(top: 2),
+                child: Text(
+                  'edited',
+                  style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                    fontSize: 10,
+                    color: scheme.outline,
+                    fontStyle: FontStyle.italic,
+                  ),
+                ),
+              ),
+          ],
         );
     }
   }

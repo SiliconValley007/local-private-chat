@@ -89,6 +89,13 @@ class Message(Base):
     reply_to_message_id: Mapped[int | None] = mapped_column(
         ForeignKey("messages.id", ondelete="SET NULL"), nullable=True
     )
+    edited_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # Soft delete — body is cleared, but the row stays so replies keep their place.
+    deleted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     conversation: Mapped[Conversation] = relationship(back_populates="messages")
     sender: Mapped[User] = relationship(back_populates="messages")

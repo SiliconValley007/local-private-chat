@@ -211,3 +211,140 @@ def _push_to_offline_members(
     if result.invalid_tokens:
         db.execute(delete(DeviceToken).where(DeviceToken.token.in_(result.invalid_tokens)))
         db.commit()
+
+
+async def edit_message(
+    db: Session,
+    *,
+    message_id: int,
+    editor: User,
+    new_body: str,
+) -> Message:
+    """Edit a text message you sent. Soft-deleted messages cannot be edited."""
+    message = load_message(db, message_id)
+    if message is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="That message is no longer available.",
+        )
+    require_membership(db, message.conversation_id, editor.id)
+    if message.sender_id != editor.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only edit messages you sent.",
+        )
+    if message.deleted_at is not None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Deleted messages cannot be edited.",
+        )
+    if message.type != "text":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Only text messages can be edited.",
+        )
+    text = new_body.strip()
+    if not text:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Type a message before saving.",
+        )
+    message.body = text
+    message.edited_at = utcnow()
+    db.commit()
+    message = load_message(db, message.id)
+    assert message is not None
+    members = member_user_ids(db, message.conversation_id)
+    await hub.broadcast_to_users(members, events.event_message_updated(message))
+    await hub.broadcast_to_users(
+        members, events.event_conversation_updated(message.conversation_id)
+    )
+    return message
+
+
+async def soft_delete_message(
+    db: Session,
+    *,
+    message_id: int,
+    actor: User,
+) -> Message:
+    """Replace a message with a tombstone visible to everyone in the chat."""
+    message = load_message(db, message_id)
+    if message is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="That message is no longer available.",
+        )
+    membership = require_membership(db, message.conversation_id, actor.id)
+    is_sender = message.sender_id == actor.id
+    is_admin = membership.role == "admin"
+    if not is_sender and not is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only delete messages you sent.",
+        )
+    if message.deleted_at is not None:
+        return message
+
+    message.deleted_at = utcnow()
+    message.body = None
+    message.media_path = None
+    message.media_name = None
+    message.media_size = None
+    message.media_mime = None
+    message.edited_at = None
+    db.commit()
+    message = load_message(db, message.id)
+    assert message is not None
+    members = member_user_ids(db, message.conversation_id)
+    await hub.broadcast_to_users(members, events.event_message_updated(message))
+    await hub.broadcast_to_users(
+        members, events.event_conversation_updated(message.conversation_id)
+    )
+    return message
+
+
+def search_messages(
+    db: Session,
+    *,
+    conversation_id: int | None,
+    user_id: int,
+    query: str,
+    limit: int = 50,
+) -> list[Message]:
+    """Find text messages whose body contains ``query`` (case-insensitive)."""
+    needle = query.strip()
+    if not needle:
+        return []
+    memberships = db.scalars(
+        select(ConversationMember.conversation_id).where(
+            ConversationMember.user_id == user_id
+        )
+    ).all()
+    allowed = set(memberships)
+    if conversation_id is not None:
+        if conversation_id not in allowed:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You're not part of this chat anymore.",
+            )
+        allowed = {conversation_id}
+    if not allowed:
+        return []
+
+    like = f"%{needle}%"
+    rows = list(
+        db.scalars(
+            select(Message)
+            .where(
+                Message.conversation_id.in_(allowed),
+                Message.deleted_at.is_(None),
+                Message.type == "text",
+                Message.body.ilike(like),
+            )
+            .options(selectinload(Message.receipts))
+            .order_by(Message.id.desc())
+            .limit(limit)
+        ).all()
+    )
+    return rows
