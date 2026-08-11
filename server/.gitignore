@@ -1,0 +1,16 @@
+# Local overrides — keep secrets and machine paths here.
+jwt_secret.txt
+firebase-service-account.json
+data/
+media/
+*.db
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+dist/
+build/
+*.spec
+!localchat.spec
+.DS_Store

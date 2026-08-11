@@ -1,0 +1,71 @@
+# --- Secrets (never commit) ---
+server/jwt_secret.txt
+server/firebase-service-account.json
+**/firebase-service-account*.json
+!**/firebase-service-account.json.example
+flutter_app/android/app/google-services.json
+**/*.jks
+**/*.keystore
+**/key.properties
+.env
+.env.*
+!.env.example
+
+# --- Runtime data ---
+server/data/*
+!server/data/.gitkeep
+server/media/*
+!server/media/.gitkeep
+server/**/*.db
+*.db
+
+# --- Python ---
+server/.venv/
+server/venv/
+**/.venv/
+**/venv/
+**/__pycache__/
+**/*.py[cod]
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+server/dist/
+server/build/
+server/*.spec
+!server/localchat.spec
+
+# --- Flutter / Android ---
+flutter_app/.dart_tool/
+flutter_app/.flutter-plugins-dependencies
+flutter_app/.packages
+flutter_app/build/
+flutter_app/build_log.txt
+flutter_app/.idea/
+flutter_app/*.iml
+flutter_app/android/local.properties
+flutter_app/android/.gradle/
+flutter_app/android/app/debug/
+flutter_app/android/app/profile/
+flutter_app/android/app/release/
+flutter_app/**/*.apk
+flutter_app/**/*.aab
+flutter_app/**/*.ap_
+flutter_app/**/*.dex
+flutter_app/**/Captured*.png
+
+# --- Local transfer / one-off update packs ---
+server-update*.zip
+*.apk
+*.aab
+dist/
+releases/*
+!releases/.gitkeep
+
+# --- OS / IDE ---
+.DS_Store
+Thumbs.db
+Desktop.ini
+.vscode/
+.idea/
+*.swp
+*~

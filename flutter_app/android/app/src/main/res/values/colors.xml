@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Adaptive launcher icon backdrop. -->
+    <color name="ic_launcher_background">#FFFFFF</color>
+    <!-- Tint Android applies to the status bar notification icon. -->
+    <color name="notification_color">#0E7C66</color>
+</resources>

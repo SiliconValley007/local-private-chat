@@ -1,0 +1,21 @@
+[MAIN]
+# Optional dependency: keep pylint quiet when firebase-admin is not installed.
+ignored-modules=firebase_admin
+
+[FORMAT]
+max-line-length=100
+
+[BASIC]
+# SQLAlchemy / FastAPI conventions.
+good-names=db,id,ip,qs,ws,SessionLocal
+
+[MESSAGES CONTROL]
+# FastAPI routers, Pydantic schemas and SQLAlchemy models are declarative:
+# per-function/class docstrings and "public method" counts add noise, not clarity.
+disable=missing-function-docstring,
+        missing-class-docstring,
+        too-few-public-methods,
+        too-many-arguments,
+        too-many-positional-arguments,
+        too-many-locals,
+        duplicate-code

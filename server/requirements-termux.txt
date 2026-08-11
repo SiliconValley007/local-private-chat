@@ -1,0 +1,15 @@
+# Termux / Android fallback: drops FCM push support.
+# Chat, media, receipts and WebSockets all work with this set.
+# app/fcm.py degrades gracefully when firebase_admin is missing.
+#
+# NOTE: pydantic-core still compiles via Rust here (FastAPI requires pydantic),
+# so `export ANDROID_API_LEVEL=24` is required before installing.
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+sqlalchemy>=2.0.36
+pydantic>=2.10.0
+python-jose>=3.3.0
+passlib[bcrypt]>=1.7.4
+bcrypt>=4.0.1,<4.1
+python-multipart>=0.0.17
+aiofiles>=24.1.0
