@@ -63,6 +63,21 @@ String formatDayLabel(DateTime when) {
   return DateFormat('d MMMM y').format(local);
 }
 
+/// Gallery section heading: "MAY", or "MAY 2025" when not this year.
+String formatMonthHeading(DateTime when) {
+  final local = when.toLocal();
+  final now = DateTime.now();
+  if (local.year == now.year) {
+    return DateFormat.MMMM().format(local).toUpperCase();
+  }
+  return DateFormat.yMMMM().format(local).toUpperCase();
+}
+
+/// Compact gallery date stamp: 14/05/26
+String formatShortDate(DateTime when) {
+  return DateFormat('dd/MM/yy').format(when.toLocal());
+}
+
 /// Right-hand timestamp in the chat list.
 String formatListTimestamp(BuildContext context, DateTime when) {
   final local = when.toLocal();

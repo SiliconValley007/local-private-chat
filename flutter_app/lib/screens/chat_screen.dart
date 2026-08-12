@@ -11,6 +11,7 @@ import 'package:file_picker/file_picker.dart';
 import 'package:share_plus/share_plus.dart';
 
 import '../app_state.dart';
+import '../emoji.dart';
 import '../errors.dart';
 import '../models.dart';
 import '../services/export_service.dart';
@@ -22,6 +23,7 @@ import '../widgets/avatar.dart';
 import '../widgets/linkified_text.dart';
 import '../widgets/quoted_message.dart';
 import '../widgets/rename_dialog.dart';
+import 'shared_media_screen.dart';
 
 class ChatScreen extends StatefulWidget {
   const ChatScreen({super.key, required this.conversation});
@@ -260,10 +262,20 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   /// its position in the list, then lets [Scrollable.ensureVisible] settle it
   /// once the row has actually been built.
   Future<void> _goToMessage(int messageId) async {
+    final loaded = await _appState.ensureMessageLoaded(
+      widget.conversation.id,
+      messageId,
+    );
+    if (!mounted) return;
+    if (!loaded) {
+      _showMessage('That message is no longer available.');
+      return;
+    }
+
     final messages = _appState.messagesByConv[widget.conversation.id] ?? [];
     final index = messages.indexWhere((m) => m.id == messageId);
     if (index < 0) {
-      _showMessage('That message is not loaded on this phone anymore.');
+      _showMessage('That message is no longer available.');
       return;
     }
 
@@ -277,6 +289,16 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         await _ensureVisible(messageId);
       }
     }
+  }
+
+  Future<void> _openSharedMedia(Conversation conv) async {
+    final messageId = await Navigator.of(context).push<int>(
+      MaterialPageRoute(
+        builder: (_) => SharedMediaScreen(conversation: conv),
+      ),
+    );
+    if (!mounted || messageId == null) return;
+    await _goToMessage(messageId);
   }
 
   Future<bool> _ensureVisible(int messageId) async {
@@ -575,6 +597,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     switch (value) {
       case 'search':
         setState(() => _searching = true);
+      case 'media':
+        await _openSharedMedia(conv);
       case 'export':
         await _exportChat(conv);
       case 'pin':
@@ -597,6 +621,15 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           contentPadding: EdgeInsets.zero,
           leading: Icon(Icons.search_rounded),
           title: Text('Search in chat'),
+        ),
+      ),
+      const PopupMenuItem(
+        value: 'media',
+        child: ListTile(
+          dense: true,
+          contentPadding: EdgeInsets.zero,
+          leading: Icon(Icons.perm_media_outlined),
+          title: Text('Media, links, and docs'),
         ),
       ),
       const PopupMenuItem(
@@ -1111,6 +1144,18 @@ class _MessageRow extends StatelessWidget {
 
     final quote = message.replyTo;
 
+    // Emoji-only messages read as pictures, not text: draw them big, and for
+    // short ones drop the bubble so nothing competes with the glyphs.
+    final emojiCount = message.type == 'text' && !message.isDeleted
+        ? emojiOnlyCount(message.body)
+        : 0;
+    final emojiSize = emojiOnlyFontSize(emojiCount);
+    final bare =
+        emojiSize != null &&
+        emojiWithoutBubble(emojiCount) &&
+        quote == null &&
+        !showSenderName;
+
     return Align(
       alignment: mine ? Alignment.centerRight : Alignment.centerLeft,
       child: ConstrainedBox(
@@ -1119,11 +1164,17 @@ class _MessageRow extends StatelessWidget {
           onLongPress: message.isDeleted ? null : () => _showActions(context),
           child: AnimatedContainer(
             duration: const Duration(milliseconds: 220),
-            padding: isPhoto
+            padding: bare
+                ? const EdgeInsets.fromLTRB(2, 2, 2, 0)
+                : isPhoto
                 ? const EdgeInsets.all(4)
                 : const EdgeInsets.fromLTRB(12, 8, 12, 7),
             decoration: BoxDecoration(
-              color: highlighted
+              color: bare
+                  ? (highlighted
+                        ? scheme.primary.withValues(alpha: 0.18)
+                        : Colors.transparent)
+                  : highlighted
                   ? Color.alphaBlend(
                       scheme.primary.withValues(alpha: 0.22),
                       mine
@@ -1134,11 +1185,13 @@ class _MessageRow extends StatelessWidget {
                   ? AppColors.bubbleMineFor(context)
                   : AppColors.bubblePeerFor(context),
               borderRadius: _bubbleRadius(),
-              boxShadow: softShadow(
-                opacity: 0.045,
-                blur: 8,
-                offset: const Offset(0, 2),
-              ),
+              boxShadow: bare
+                  ? null
+                  : softShadow(
+                      opacity: 0.045,
+                      blur: 8,
+                      offset: const Offset(0, 2),
+                    ),
             ),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
@@ -1174,6 +1227,7 @@ class _MessageRow extends StatelessWidget {
                   maxWidth: maxWidth,
                   mine: mine,
                   footer: isPhoto ? footer : null,
+                  emojiSize: emojiSize,
                 ),
                 if (!isPhoto)
                   Padding(
@@ -1210,12 +1264,16 @@ class _MessageContent extends StatelessWidget {
     required this.maxWidth,
     required this.mine,
     this.footer,
+    this.emojiSize,
   });
 
   final ChatMessage message;
   final double maxWidth;
   final bool mine;
   final Widget? footer;
+
+  /// Set when the body is nothing but emoji, which are drawn oversized.
+  final double? emojiSize;
 
   @override
   Widget build(BuildContext context) {
@@ -1248,13 +1306,22 @@ class _MessageContent extends StatelessWidget {
         return FileAttachment(message: message, maxWidth: maxWidth);
       default:
         final scheme = Theme.of(context).colorScheme;
+        final size = emojiSize;
         return Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            LinkifiedText(
-              message.body ?? '',
-              style: const TextStyle(height: 1.35, fontSize: 15),
-            ),
+            if (size != null)
+              Text(
+                message.body ?? '',
+                // Emoji carry no links, so plain Text keeps the glyph metrics
+                // clean at this size.
+                style: TextStyle(height: 1.18, fontSize: size),
+              )
+            else
+              LinkifiedText(
+                message.body ?? '',
+                style: const TextStyle(height: 1.35, fontSize: 15),
+              ),
             if (message.editedAt != null)
               Padding(
                 padding: const EdgeInsets.only(top: 2),

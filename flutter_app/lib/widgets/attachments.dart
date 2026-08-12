@@ -385,9 +385,16 @@ class _ImageFailed extends StatelessWidget {
 
 /// Full-screen photo with save and share, like tapping a photo in WhatsApp.
 class ImageViewerScreen extends StatelessWidget {
-  const ImageViewerScreen({super.key, required this.message});
+  const ImageViewerScreen({
+    super.key,
+    required this.message,
+    this.onShowInChat,
+  });
 
   final ChatMessage message;
+
+  /// Optional "jump back to the chat bubble" action (gallery use).
+  final VoidCallback? onShowInChat;
 
   @override
   Widget build(BuildContext context) {
@@ -406,6 +413,12 @@ class ImageViewerScreen extends StatelessWidget {
           overflow: TextOverflow.ellipsis,
         ),
         actions: [
+          if (onShowInChat != null)
+            IconButton(
+              tooltip: 'Show in chat',
+              onPressed: onShowInChat,
+              icon: const Icon(Icons.chat_bubble_outline_rounded),
+            ),
           IconButton(
             tooltip: 'Save to phone',
             onPressed: () => _save(context),

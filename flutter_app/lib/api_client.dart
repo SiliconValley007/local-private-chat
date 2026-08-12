@@ -394,6 +394,25 @@ class ApiClient {
     ).map((e) => ChatMessage.fromJson(e as Map<String, dynamic>)).toList();
   }
 
+  /// Lightweight Media / Docs / Links index for one conversation.
+  Future<List<SharedItem>> listShared(
+    int conversationId, {
+    int? beforeId,
+    int limit = 100,
+  }) async {
+    final query = <String, String>{'limit': '$limit'};
+    if (beforeId != null) query['before_id'] = '$beforeId';
+    final res = await _send(
+      () => http.get(
+        _uri('/api/conversations/$conversationId/shared', query),
+        headers: _headers(jsonBody: false),
+      ),
+    );
+    return _decodeList(
+      res,
+    ).map((e) => SharedItem.fromJson(e as Map<String, dynamic>)).toList();
+  }
+
   Future<ChatMessage> sendText(
     int conversationId,
     String body, {

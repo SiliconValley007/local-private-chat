@@ -46,10 +46,14 @@ void main() {
 
   group('linkify', () {
     test('detects urls', () {
-      expect(containsUrl('see https://example.com/path'), isTrue);
-      expect(containsUrl('no links here'), isFalse);
-    });
+    expect(containsUrl('see https://example.com/path'), isTrue);
+    expect(containsUrl('no links here'), isFalse);
+    expect(
+      extractUrls('see https://example.com/a and https://example.com/b.'),
+      ['https://example.com/a', 'https://example.com/b'],
+    );
   });
+});
 
   group('export', () {
     test('formats a short transcript', () {

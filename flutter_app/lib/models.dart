@@ -205,6 +205,48 @@ class ChatMessage {
   }
 }
 
+/// One row in the WhatsApp-style Media / Docs / Links gallery.
+class SharedItem {
+  SharedItem({
+    required this.messageId,
+    required this.kind,
+    required this.type,
+    required this.createdAt,
+    required this.senderId,
+    this.mediaName,
+    this.mediaSize,
+    this.mediaMime,
+    this.body,
+    this.url,
+  });
+
+  final int messageId;
+
+  /// `media` | `docs` | `links`
+  final String kind;
+  final String type;
+  final String? mediaName;
+  final int? mediaSize;
+  final String? mediaMime;
+  final String? body;
+  final String? url;
+  final DateTime createdAt;
+  final int senderId;
+
+  factory SharedItem.fromJson(Map<String, dynamic> json) => SharedItem(
+    messageId: json['message_id'] as int,
+    kind: json['kind'] as String,
+    type: json['type'] as String,
+    mediaName: json['media_name'] as String?,
+    mediaSize: json['media_size'] as int?,
+    mediaMime: json['media_mime'] as String?,
+    body: json['body'] as String?,
+    url: json['url'] as String?,
+    createdAt: parseServerTime(json['created_at'] as String),
+    senderId: json['sender_id'] as int,
+  );
+}
+
 class ConversationMember {
   ConversationMember({
     required this.userId,

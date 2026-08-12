@@ -68,3 +68,12 @@ bool containsUrl(String? text) {
   if (text == null || text.isEmpty) return false;
   return _urlPattern.hasMatch(text);
 }
+
+/// Every http(s) URL found in [text], in order of appearance.
+List<String> extractUrls(String? text) {
+  if (text == null || text.isEmpty) return const [];
+  return [
+    for (final match in _urlPattern.allMatches(text))
+      match.group(0)!.replaceFirst(RegExp(r'[.,);!\]]+$'), ''),
+  ];
+}

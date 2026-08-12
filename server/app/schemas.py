@@ -169,3 +169,22 @@ class MessageOut(BaseModel):
 
 class DeliveredRequest(BaseModel):
     message_id: int
+
+
+class SharedItemOut(BaseModel):
+    """One row in the conversation Media / Docs / Links gallery.
+
+    Lightweight on purpose — the gallery never needs receipts or reply quotes.
+    ``kind`` is the tab the row belongs to; ``url`` is set only for links.
+    """
+
+    message_id: int
+    kind: str  # media | docs | links
+    type: str
+    media_name: str | None = None
+    media_size: int | None = None
+    media_mime: str | None = None
+    body: str | None = None
+    url: str | None = None
+    created_at: UtcDatetime
+    sender_id: int

@@ -13,6 +13,7 @@ Inspired by the deployment model of [local-drive](https://github.com/SiliconVall
 - Register / login (username + password), persistent sessions
 - 1:1 DMs and group chats
 - Text, images, files, and voice notes
+- **Big emoji** — an emoji-only message is drawn large and bubble-free, like WhatsApp
 - **Reply / quote**, **edit**, and **delete** (tombstone) for messages
 - Delivery and read receipts, typing, online presence
 - **Search** people, last-message text in the inbox, and messages inside a chat
@@ -28,6 +29,7 @@ Inspired by the deployment model of [local-drive](https://github.com/SiliconVall
 - **Encrypted backup / restore** — AES-GCM on-device, ciphertext on private server + optional Firestore mirror
 - **Appearance** — system / light / dark, remembered on the phone
 - **Change password** in the app; admin can reset forgotten logins with `reset_password.py`
+- **Media, links, and docs** gallery per chat (WhatsApp-style) with jump back to the message
 
 ## What this is / is not
 
@@ -324,6 +326,7 @@ A server-rendered FCM `notification` block cannot read private storage on the re
 - Voice notes play inline with a scrubbable progress bar; only one plays at a time.
 - **Long-press any attachment** for Open / Save to phone / Share. Saving uses the Android system save dialog, so no storage permission is ever requested.
 - Downloads are cached under the app's support directory, so a photo is fetched from the server only once.
+- Chat ⋮ → **Media, links, and docs** opens a WhatsApp-style gallery (Media / Docs / Links tabs, grouped by month). Items load from the server index — whether or not you saved them locally. **Show in chat** (long-press, or the chat icon) jumps back to the exact bubble.
 
 ### Appearance and chat position
 
@@ -331,6 +334,19 @@ A server-rendered FCM `notification` block cannot read private storage on the re
 - Chat surfaces, cards, fields, sheets, dialogs, bubbles, and the composer use theme-aware colours
 - Opening a conversation waits for its messages, then pins the transcript to the newest message
 - Swipe a bubble right (or long-press → Reply) to quote and reply, WhatsApp-style; tap a quote to jump back
+- Opening the keyboard shifts the transcript up with it, so the newest bubbles never hide behind it
+
+### Emoji-only messages
+
+A message that is nothing but emoji reads as a picture, not as text, so it is
+drawn the way WhatsApp draws it: **1–3 emoji lose the bubble entirely and grow to
+46 / 38 / 32 px**, 4–6 stay in a bubble at 24 px, and anything longer falls back
+to normal 15 px text. Mixing in a single letter (`ok 👍`) keeps it a text
+message, and a reply quote keeps its bubble so the quote still reads clearly.
+
+Skin tones, joined sequences (`👨‍👩‍👧‍👦`), flags, and keycaps count as **one**
+emoji each — the same as what the eye sees. The detection lives in
+`flutter_app/lib/emoji.dart` and is covered by `test/emoji_test.dart`.
 
 ### Renaming people
 
@@ -380,6 +396,11 @@ python reset_password.py              # list usernames
 python reset_password.py alice        # type a new password privately
 ```
 
+**On a Windows host using the release zip, no Python needed
+
+.\ResetPassword.exe
+.\ResetPassword.exe THEIR_USERNAME
+
 They can sign in with the new password immediately — no server restart needed.
 Chat history is unchanged.
 
@@ -420,6 +441,7 @@ flutter test
 | POST | `/api/conversations/dm` | `{user_id}` |
 | POST | `/api/conversations/groups` | `{title, member_ids}` |
 | GET | `/api/conversations/{id}/messages` | History |
+| GET | `/api/conversations/{id}/shared` | Media / Docs / Links index |
 | POST | `/api/conversations/{id}/messages` | Send text |
 | POST | `/api/conversations/{id}/media` | Multipart upload |
 | GET | `/api/media/{message_id}` | Download media |
@@ -461,19 +483,32 @@ That writes:
 | `releases/LocalChat-android-arm32.apk` | Older / budget phones (armeabi-v7a) |
 | `releases/LocalChat-android-universal.apk` | When you don't know the phone — bigger, runs anywhere |
 | `releases/LocalChatServer-windows-x64.zip` | Windows PC host — unzip and run `LocalChatServer.exe` |
+| `server-update.zip` (repo root) | Your own running Termux/Linux server — code only, no dependencies |
 
-The script builds the split APKs and the Windows zip. Add the universal one with
-`flutter build apk --release` when you want a single file that fits every phone.
+Skip parts of it with `-SkipApk`, `-SkipServer`, or `-SkipUpdateZip`. The Windows
+zip needs `server\.venv` (PyInstaller runs inside it); everything else needs only
+Flutter.
+
+Between releases, drop the regenerable build output with:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\clean_workspace.ps1
+```
+
+It deletes `flutter_app\build`, `server\build`, `server\dist`, pytest caches and
+`__pycache__` folders — never the venv, `server\data\chat.db`, `server\media`,
+your secrets, or `releases\`. Close other builds first, or a Gradle daemon will
+hold a jar and the script will say so.
 
 Then publish:
 
 ```powershell
-gh release create v1.1.0 `
+gh release create v1.2.0 `
   releases/LocalChat-android-arm64.apk `
   releases/LocalChat-android-arm32.apk `
   releases/LocalChat-android-universal.apk `
   releases/LocalChatServer-windows-x64.zip `
-  --title "v1.1.0" `
+  --title "v1.2.0" `
   --notes "Install Tailscale on every device, run the server, point the APK at http://<tailscale-ip>:8000."
 ```
 
@@ -539,11 +574,15 @@ Chat/
     run.py                       Banner + Tailscale/LAN IP discovery
     start_termux.sh              Termux helper
     start.bat                    Windows helper
+    reset_password.py            Admin password reset (on the server host)
   flutter_app/                   Flutter Android client
     android/app/google-services.json.example
+    lib/emoji.dart               Emoji-only detection for big-emoji bubbles
+    lib/screens/shared_media_screen.dart   Media / Docs / Links gallery
   tools/
     generate_icons.py
-    build_release.ps1            APK + Windows server zip
+    build_release.ps1            APKs + Windows server zip + server-update.zip
+    clean_workspace.ps1          Delete regenerable build output and caches
   releases/                      Local build output (gitignored except .gitkeep)
   README.md
 ```

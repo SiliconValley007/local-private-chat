@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import re
+
 from fastapi import HTTPException, status
-from sqlalchemy import delete, select
+from sqlalchemy import and_, delete, or_, select
 from sqlalchemy.orm import Session, selectinload
 
 from app.fcm import send_message_push
@@ -17,7 +19,10 @@ from app.models import (
 )
 from app.realtime import events
 from app.realtime.hub import hub
+from app.schemas import SharedItemOut
 
+# Same shape as the Flutter linkifier — keep the two in sync.
+_URL_PATTERN = re.compile(r'https?://[^\s<>"{}|\\^`\[\]]+', re.IGNORECASE)
 
 def get_membership(db: Session, conversation_id: int, user_id: int) -> ConversationMember | None:
     return db.scalar(
@@ -348,3 +353,88 @@ def search_messages(
         ).all()
     )
     return rows
+
+
+def list_shared_items(
+    db: Session,
+    *,
+    conversation_id: int,
+    user_id: int,
+    before_id: int | None = None,
+    limit: int = 100,
+) -> list[SharedItemOut]:
+    """Build the Media / Docs / Links index for one conversation.
+
+    Pulls only attachment and link-bearing rows (not the full transcript), so a
+    long chat stays cheap to open. Text messages may expand into several link
+    rows — one per URL.
+    """
+    require_membership(db, conversation_id, user_id)
+
+    # Over-fetch so multi-URL texts still fill ``limit`` after expansion.
+    fetch = min(max(limit * 3, limit), 300)
+    conditions = [
+        Message.conversation_id == conversation_id,
+        Message.deleted_at.is_(None),
+            or_(
+                Message.type.in_(("image", "file")),
+                and_(Message.type == "text", Message.body.ilike("%http%")),
+            ),
+        ]
+    if before_id is not None:
+        conditions.append(Message.id < before_id)
+
+    rows = list(
+        db.scalars(
+            select(Message).where(*conditions).order_by(Message.id.desc()).limit(fetch)
+        ).all()
+    )
+
+    items: list[SharedItemOut] = []
+    for message in rows:
+        if message.type == "image":
+            items.append(
+                SharedItemOut(
+                    message_id=message.id,
+                    kind="media",
+                    type=message.type,
+                    media_name=message.media_name,
+                    media_size=message.media_size,
+                    media_mime=message.media_mime,
+                    body=message.body,
+                    created_at=message.created_at,
+                    sender_id=message.sender_id,
+                )
+            )
+        elif message.type == "file":
+            items.append(
+                SharedItemOut(
+                    message_id=message.id,
+                    kind="docs",
+                    type=message.type,
+                    media_name=message.media_name,
+                    media_size=message.media_size,
+                    media_mime=message.media_mime,
+                    body=message.body,
+                    created_at=message.created_at,
+                    sender_id=message.sender_id,
+                )
+            )
+        elif message.type == "text" and message.body:
+            for match in _URL_PATTERN.finditer(message.body):
+                url = match.group(0).rstrip(".,);]!?")
+                items.append(
+                    SharedItemOut(
+                        message_id=message.id,
+                        kind="links",
+                        type=message.type,
+                        body=message.body,
+                        url=url,
+                        created_at=message.created_at,
+                        sender_id=message.sender_id,
+                    )
+                )
+        if len(items) >= limit:
+            break
+
+    return items[:limit]

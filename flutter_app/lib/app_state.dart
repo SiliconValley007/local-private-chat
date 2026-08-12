@@ -443,6 +443,30 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     notifyListeners();
   }
 
+  /// Paginate until [messageId] is in the local transcript, or history ends.
+  Future<bool> ensureMessageLoaded(int conversationId, int messageId) async {
+    for (var attempt = 0; attempt < 40; attempt++) {
+      final messages = messagesByConv[conversationId] ?? const <ChatMessage>[];
+      if (messages.any((m) => m.id == messageId)) return true;
+      if (messages.isEmpty) {
+        await loadMessages(conversationId, initial: true);
+        continue;
+      }
+      final before = messages.length;
+      await loadOlder(conversationId);
+      final after = (messagesByConv[conversationId] ?? const []).length;
+      if (after == before) return false;
+    }
+    return false;
+  }
+
+  Future<List<SharedItem>> listShared(
+    int conversationId, {
+    int? beforeId,
+  }) async {
+    return api.listShared(conversationId, beforeId: beforeId);
+  }
+
   Future<List<ChatMessage>> searchMessages(
     String query, {
     int? conversationId,

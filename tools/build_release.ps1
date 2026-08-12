@@ -6,7 +6,8 @@
 
 param(
     [switch]$SkipApk,
-    [switch]$SkipServer
+    [switch]$SkipServer,
+    [switch]$SkipUpdateZip
 )
 
 $ErrorActionPreference = "Stop"
@@ -15,14 +16,23 @@ $Out = Join-Path $Root "releases"
 New-Item -ItemType Directory -Force -Path $Out | Out-Null
 
 if (-not $SkipApk) {
-    Write-Host "==> Building arm64 APK (phones)..." -ForegroundColor Cyan
+    Write-Host "==> Building split + universal release APKs..." -ForegroundColor Cyan
     Push-Location (Join-Path $Root "flutter_app")
     flutter build apk --release --split-per-abi
+    flutter build apk --release
     Pop-Location
-    $apk = Join-Path $Root "flutter_app\build\app\outputs\flutter-apk\app-arm64-v8a-release.apk"
-    if (-not (Test-Path $apk)) { throw "APK not found at $apk" }
-    Copy-Item $apk (Join-Path $Out "LocalChat-android-arm64.apk") -Force
-    Write-Host "    -> releases\LocalChat-android-arm64.apk"
+    $apkDir = Join-Path $Root "flutter_app\build\app\outputs\flutter-apk"
+    $apks = @{
+        "app-arm64-v8a-release.apk"   = "LocalChat-android-arm64.apk"
+        "app-armeabi-v7a-release.apk" = "LocalChat-android-arm32.apk"
+        "app-release.apk"             = "LocalChat-android-universal.apk"
+    }
+    foreach ($src in $apks.Keys) {
+        $path = Join-Path $apkDir $src
+        if (-not (Test-Path $path)) { throw "APK not found at $path" }
+        Copy-Item $path (Join-Path $Out $apks[$src]) -Force
+        Write-Host "    -> releases\$($apks[$src])"
+    }
 }
 
 if (-not $SkipServer) {
@@ -44,6 +54,34 @@ if (-not $SkipServer) {
     tar -a -cf $zip -C $built .
     Write-Host "    -> releases\LocalChatServer-windows-x64.zip"
     Write-Host "    Run LocalChatServer.exe from the unzipped folder. Data stays next to the exe."
+}
+
+if (-not $SkipUpdateZip) {
+    # Code-only pack for a running Termux/Linux server: unzip inside server/ and
+    # restart. Nothing here touches .venv, data/, media/, or the secrets.
+    Write-Host "==> Packing server-update.zip for an existing server..." -ForegroundColor Cyan
+    $server = Join-Path $Root "server"
+    $stage = Join-Path $env:TEMP ("localchat-update-" + [guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Force -Path $stage | Out-Null
+    try {
+        Copy-Item (Join-Path $server "app") $stage -Recurse -Force
+        Copy-Item (Join-Path $server "tests") $stage -Recurse -Force
+        foreach ($f in @("run.py", "reset_password.py", "requirements.txt",
+                         "requirements-termux.txt", "requirements-dev.txt",
+                         "start_termux.sh", "start.bat")) {
+            Copy-Item (Join-Path $server $f) $stage -Force
+        }
+        Get-ChildItem $stage -Recurse -Force -Directory |
+            Where-Object Name -eq "__pycache__" |
+            Remove-Item -Recurse -Force
+        $zip = Join-Path $Root "server-update.zip"
+        if (Test-Path $zip) { Remove-Item $zip -Force }
+        tar -a -cf $zip -C $stage .
+        Write-Host "    -> server-update.zip (unzip inside the server folder)"
+    }
+    finally {
+        Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }
 
 Write-Host "==> Done. Upload the files under releases\ to a GitHub Release." -ForegroundColor Green

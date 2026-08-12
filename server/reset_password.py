@@ -19,6 +19,9 @@ import sys
 from pathlib import Path
 
 # Allow `python reset_password.py` from server/ without installing the package.
+# The app imports therefore have to come after this line, and `app.db` is loaded
+# inside the commands so importing this file never opens the database.
+# pylint: disable=wrong-import-position,import-outside-toplevel
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from sqlalchemy import select  # noqa: E402

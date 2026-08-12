@@ -12,10 +12,11 @@ from app.models import Message, MessageReceipt, User, utcnow
 from app.realtime import events
 from app.realtime.events import message_out
 from app.realtime.hub import hub
-from app.schemas import EditMessageRequest, MessageOut, SendMessageRequest
+from app.schemas import EditMessageRequest, MessageOut, SendMessageRequest, SharedItemOut
 from app.services import (
     create_and_broadcast_message,
     edit_message,
+    list_shared_items,
     load_message,
     require_membership,
     search_messages,
@@ -64,6 +65,27 @@ def search_all_messages(
         limit=limit,
     )
     return [message_out(m) for m in rows]
+
+
+@router.get(
+    "/api/conversations/{conversation_id}/shared",
+    response_model=list[SharedItemOut],
+)
+def shared_in_conversation(
+    conversation_id: int,
+    before_id: int | None = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=200),
+    db: Session = Depends(get_db),
+    current: User = Depends(get_current_user),
+) -> list[SharedItemOut]:
+    """Media, documents, and links shared in this chat (WhatsApp-style index)."""
+    return list_shared_items(
+        db,
+        conversation_id=conversation_id,
+        user_id=current.id,
+        before_id=before_id,
+        limit=limit,
+    )
 
 
 @router.post("/api/conversations/{conversation_id}/messages", response_model=MessageOut)
