@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import shutil
 import uuid
 from pathlib import Path
 
@@ -12,7 +13,12 @@ from fastapi.responses import FileResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.config import MEDIA_ROOT
+from app.config import (
+    MAX_MEDIA_BYTES,
+    MEDIA_DISK_FLOOR_BYTES,
+    MEDIA_ROOT,
+    UPLOAD_CHUNK_BYTES,
+)
 from app.db import get_db
 from app.deps import get_current_user
 from app.models import Conversation, ConversationMember, Message, User
@@ -24,6 +30,7 @@ from app.schemas import (
     OwnedMediaOut,
 )
 from app.doodle_media import MAX_DOODLE_BYTES, validate_doodle_upload
+from app.upload_limits import UploadAllowance, too_large_detail, upload_allowance
 from app.services import (
     create_and_broadcast_message,
     load_message,
@@ -38,6 +45,15 @@ SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._\-]+")
 ALLOWED_TYPES = {"image", "file", "voice", "video", "doodle"}
 ATTACHMENT_GONE = "This attachment is no longer available on the server."
 MAX_THUMBNAIL_BYTES = 512 * 1024
+
+
+def media_allowance() -> UploadAllowance:
+    """The largest attachment acceptable right now, cap and free space together."""
+    return upload_allowance(
+        max_bytes=MAX_MEDIA_BYTES,
+        free_bytes=shutil.disk_usage(MEDIA_ROOT).free,
+        floor_bytes=MEDIA_DISK_FLOOR_BYTES,
+    )
 
 
 def secure_filename(name: str) -> str:
@@ -80,22 +96,37 @@ async def upload_media(
 
     size = 0
     header = b""
-    max_bytes = MAX_DOODLE_BYTES if msg_type == "doodle" else None
+    is_doodle = msg_type == "doodle"
+    allowance = media_allowance()
+    if allowance.out_of_space:
+        raise HTTPException(
+            status_code=507,
+            detail=too_large_detail(allowance),
+        )
+    max_bytes = MAX_DOODLE_BYTES if is_doodle else allowance.limit_bytes
+    over_limit = False
     async with aiofiles.open(dest_path, "wb") as out:
         while True:
-            chunk = await file.read(1024 * 1024)
+            chunk = await file.read(UPLOAD_CHUNK_BYTES)
             if not chunk:
                 break
             size += len(chunk)
-            if max_bytes is not None and size > max_bytes:
-                dest_path.unlink(missing_ok=True)
-                raise HTTPException(
-                    status_code=413,
-                    detail="Drawings must be 2 MB or smaller.",
-                )
+            if size > max_bytes:
+                # Deleting is left until the handle is closed below: Windows
+                # refuses to unlink an open file, which turned an honest "too
+                # large" into a 500 with no explanation for the sender.
+                over_limit = True
+                break
             if len(header) < 24:
                 header += chunk[: 24 - len(header)]
             await out.write(chunk)
+
+    if over_limit:
+        dest_path.unlink(missing_ok=True)
+        raise HTTPException(
+            status_code=413,
+            detail=too_large_detail(allowance, is_doodle=is_doodle),
+        )
 
     if msg_type == "doodle":
         validate_doodle_upload(
@@ -117,7 +148,7 @@ async def upload_media(
     rel_path = f"{conversation_id}/{dest_path.name}"
     body = (caption or "").strip() or None
 
-    if thumbnail is not None and msg_type == "video":
+    if thumbnail is not None and msg_type in {"image", "video"}:
         thumb_bytes = await thumbnail.read(MAX_THUMBNAIL_BYTES + 1)
         if len(thumb_bytes) > MAX_THUMBNAIL_BYTES:
             dest_path.unlink(missing_ok=True)
@@ -272,26 +303,36 @@ async def download_media(
 
 
 @router.get("/api/media/{message_id}/thumbnail")
-async def download_video_thumbnail(
+async def download_media_thumbnail(
     message_id: int,
     db: Session = Depends(get_db),
     current: User = Depends(get_current_user),
 ):
-    """Serve the small upload-time preview without touching the full video."""
+    """Serve a small upload-time preview, with legacy-image fallback."""
 
     message = load_message(db, message_id)
-    if message is None or not message.media_thumb_path:
+    if message is None:
         raise HTTPException(status_code=404, detail=ATTACHMENT_GONE)
     require_membership(db, message.conversation_id, current.id)
 
-    full = (MEDIA_ROOT / message.media_thumb_path).resolve()
+    # Older image messages predate upload-time previews. Keep them visible by
+    # serving the original through this endpoint; new images use the small JPEG.
+    relative = message.media_thumb_path
+    media_type = "image/jpeg"
+    if not relative and message.type in {"image", "doodle"}:
+        relative = message.media_path
+        media_type = message.media_mime or "application/octet-stream"
+    if not relative:
+        raise HTTPException(status_code=404, detail=ATTACHMENT_GONE)
+
+    full = (MEDIA_ROOT / relative).resolve()
     if not str(full).startswith(str(MEDIA_ROOT.resolve())):
         raise HTTPException(status_code=400, detail=ATTACHMENT_GONE)
     if not full.is_file():
         raise HTTPException(status_code=404, detail=ATTACHMENT_GONE)
     return FileResponse(
         path=full,
-        media_type="image/jpeg",
+        media_type=media_type,
         content_disposition_type="inline",
         headers={"Cache-Control": "private, max-age=31536000, immutable"},
     )

@@ -86,6 +86,41 @@ List<BoxShadow> softShadow({
   ];
 }
 
+/// Minimum wallpaper dim so busy photos cannot wash out bubble text.
+const double wallpaperDimFloor = 0.38;
+
+/// Default dim when the conversation has not stored a preference.
+const double wallpaperDimDefault = 0.42;
+
+/// Opaque-enough bubble fill when a wallpaper is active.
+Color bubbleFillFor({
+  required BuildContext context,
+  required bool mine,
+  required bool hasWallpaper,
+}) {
+  final base = mine
+      ? AppColors.bubbleMineFor(context)
+      : AppColors.bubblePeerFor(context);
+  if (!hasWallpaper) return base;
+  final dark = Theme.of(context).brightness == Brightness.dark;
+  // Blend toward a solid surface so the wallpaper cannot show through the
+  // bubble body (dark bubbles on roses read as translucent otherwise).
+  final solid = dark
+      ? (mine ? const Color(0xFF1F5C4D) : const Color(0xFF24302C))
+      : (mine ? const Color(0xFFE7F8F0) : const Color(0xFFF7FAF9));
+  return Color.alphaBlend(solid.withValues(alpha: 0.92), base);
+}
+
+/// The colour Android paints before Flutter's first frame.
+///
+/// Kept identical to `@color/splash_background` in the Android resources. The
+/// Dart launch surface starts on exactly this colour, so a cold start is one
+/// continuous background instead of black, then a spinner, then the app.
+Color splashBackgroundFor(Brightness brightness) =>
+    brightness == Brightness.dark
+    ? const Color(0xFF0D1513)
+    : const Color(0xFFF6F9F8);
+
 /// Page background used by the auth, gate and onboarding-style screens.
 LinearGradient appBackgroundGradient(ColorScheme scheme) {
   final dark = scheme.brightness == Brightness.dark;

@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app import audit
 from app.db import get_db
 from app.deps import get_current_user
 from app.models import DeviceToken, User, utcnow
@@ -39,6 +40,15 @@ def register_device(
             )
         )
     db.commit()
+    audit.record(
+        db,
+        action="device.registered",
+        summary=f"{current.username} registered a {body.platform[:32]} device for push",
+        actor=current,
+        # The token itself is a credential for reaching the phone, so only its
+        # tail is kept — enough to tell two devices apart.
+        details={"platform": body.platform[:32], "token_tail": body.token[-8:]},
+    )
     return {"ok": True}
 
 
@@ -57,4 +67,11 @@ def unregister_device(
     if row:
         db.delete(row)
         db.commit()
+        audit.record(
+            db,
+            action="device.removed",
+            summary=f"{current.username} removed a device from push",
+            actor=current,
+            details={"token_tail": body.token[-8:]},
+        )
     return {"ok": True}

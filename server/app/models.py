@@ -36,6 +36,9 @@ class User(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     mood: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    #: Bumped to invalidate every outstanding JWT for this account. Logout is
+    #: otherwise local-only; without this a stolen token lives until expiry.
+    token_version: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
     memberships: Mapped[list[ConversationMember]] = relationship(back_populates="user")
     messages: Mapped[list[Message]] = relationship(back_populates="sender")
@@ -249,6 +252,48 @@ class DeviceToken(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     user: Mapped[User] = relationship()
+
+
+class AuditEvent(Base):
+    """One thing somebody did, written down so it cannot be argued with later.
+
+    Deliberately free of foreign keys. Deleting a message, or a whole account,
+    must not take its history with it — that is the entire point of the table.
+    Message text is kept as it was found: ``before_text`` holds what was there
+    before an edit or a deletion, ``after_text`` what replaced it.
+    """
+
+    __tablename__ = "audit_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, index=True
+    )
+    action: Mapped[str] = mapped_column(String(48), nullable=False, index=True)
+    actor_user_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    # Kept alongside the id so a log entry still names its author after the
+    # account is gone.
+    actor_username: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    conversation_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    message_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    target_user_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    summary: Mapped[str] = mapped_column(String(400), nullable=False, default="")
+    before_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    after_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    #: JSON object with whatever else the action had to say.
+    details: Mapped[str | None] = mapped_column(Text, nullable=True)
+    ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+
+class ServerSetting(Base):
+    """Server-wide settings that outlive a restart, keyed by name."""
+
+    __tablename__ = "server_settings"
+
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    value: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_by: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
 
 class EncryptedBackup(Base):

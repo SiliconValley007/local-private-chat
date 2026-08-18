@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
+from app import audit
 from app.db import get_db
 from app.deps import get_current_user
 from app.models import EncryptedBackup, User, utcnow
@@ -41,6 +42,13 @@ def put_backup(
     row.nonce_b64 = body.nonce_b64
     row.updated_at = utcnow()
     db.commit()
+    audit.record(
+        db,
+        action="backup.saved",
+        summary=f"{current.username} uploaded an encrypted backup",
+        actor=current,
+        details={"ciphertext_bytes": len(body.ciphertext_b64)},
+    )
     return {"ok": True, "updated_at": row.updated_at.isoformat()}
 
 

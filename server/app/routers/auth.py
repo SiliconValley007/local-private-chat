@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app import audit
 from app.auth import create_access_token, hash_password, verify_password
 from app.db import get_db
 from app.deps import get_current_user
@@ -40,7 +41,15 @@ def register(body: RegisterRequest, db: Session = Depends(get_db)) -> AuthRespon
     db.add(user)
     db.commit()
     db.refresh(user)
-    token = create_access_token(user.id, user.username)
+    audit.record(
+        db,
+        action="account.registered",
+        summary=f"{user.username} created an account on this server",
+        actor=user,
+        after_text=user.display_name,
+        details={"device_id": body.device_id} if body.device_id else None,
+    )
+    token = create_access_token(user.id, user.username, token_version=user.token_version)
     return AuthResponse(token=token, user=user_out(user, is_online=True))
 
 
@@ -52,7 +61,14 @@ def login(body: LoginRequest, db: Session = Depends(get_db)) -> AuthResponse:
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect username or password. Please try again.",
         )
-    token = create_access_token(user.id, user.username)
+    audit.record(
+        db,
+        action="account.signed_in",
+        summary=f"{user.username} signed in",
+        actor=user,
+        details={"device_id": body.device_id} if body.device_id else None,
+    )
+    token = create_access_token(user.id, user.username, token_version=user.token_version)
     return AuthResponse(token=token, user=user_out(user, is_online=hub.is_online(user.id)))
 
 
@@ -66,7 +82,7 @@ def change_password(
     body: ChangePasswordRequest,
     db: Session = Depends(get_db),
     current: User = Depends(get_current_user),
-) -> dict[str, bool]:
+) -> dict[str, bool | str]:
     """Let a signed-in user replace their password (requires the current one).
 
     Forgotten passwords cannot use this route — an admin must run
@@ -83,6 +99,20 @@ def change_password(
             detail="Pick a new password that is different from the current one.",
         )
     current.password_hash = hash_password(body.new_password)
-    db.add(current)
-    db.commit()
-    return {"ok": True}
+    from app.sessions import bump_token_version
+
+    # Changing the password must kill every other signed-in copy of this account,
+    # otherwise a stolen session would keep working with the old password.
+    new_version = bump_token_version(db, current)
+    audit.record(
+        db,
+        action="account.password_changed",
+        summary=f"{current.username} changed their password",
+        actor=current,
+        details={"token_version": new_version},
+    )
+    # Issue a fresh token for *this* phone so the caller is not kicked out.
+    token = create_access_token(
+        current.id, current.username, token_version=current.token_version
+    )
+    return {"ok": True, "token": token}

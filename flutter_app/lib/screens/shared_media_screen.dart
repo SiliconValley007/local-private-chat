@@ -1,3 +1,4 @@
+import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:url_launcher/url_launcher.dart';
@@ -9,6 +10,7 @@ import '../theme.dart';
 import '../time_format.dart';
 import '../widgets/attachments.dart';
 import '../widgets/doodle_attachment.dart';
+import '../widgets/loading_placeholders.dart';
 import '../widgets/video_attachment.dart';
 
 /// WhatsApp-style Media / Docs / Links gallery for one conversation.
@@ -296,7 +298,7 @@ class _SharedMediaScreenState extends State<SharedMediaScreen>
           ),
           Expanded(
             child: _loading
-                ? const Center(child: CircularProgressIndicator())
+                ? const ListSkeleton(rows: 6, label: 'Loading shared media')
                 : _error != null
                 ? Center(
                     child: Padding(
@@ -434,9 +436,20 @@ class _MediaGrid extends StatelessWidget {
                           children: [
                             ColoredBox(
                               color: Colors.black87,
-                              child: Image.network(
-                                state.api.mediaThumbnailUrl(item.messageId),
-                                headers: headers,
+                              child: Image(
+                                image: ResizeImage(
+                                  CachedNetworkImageProvider(
+                                    state.api.mediaThumbnailUrl(item.messageId),
+                                    headers: headers,
+                                  ),
+                                  width:
+                                      (MediaQuery.sizeOf(context).width /
+                                              3 *
+                                              MediaQuery.devicePixelRatioOf(
+                                                context,
+                                              ))
+                                          .round(),
+                                ),
                                 fit: BoxFit.cover,
                                 errorBuilder: (_, _, _) =>
                                     const SizedBox.shrink(),
@@ -479,9 +492,18 @@ class _MediaGrid extends StatelessWidget {
                               ),
                           ],
                         )
-                      : Image.network(
-                          state.api.mediaUrl(item.messageId),
-                          headers: headers,
+                      : Image(
+                          image: ResizeImage(
+                            CachedNetworkImageProvider(
+                              state.api.mediaThumbnailUrl(item.messageId),
+                              headers: headers,
+                            ),
+                            width:
+                                (MediaQuery.sizeOf(context).width /
+                                        3 *
+                                        MediaQuery.devicePixelRatioOf(context))
+                                    .round(),
+                          ),
                           fit: BoxFit.cover,
                           errorBuilder: (_, _, _) => ColoredBox(
                             color: Theme.of(

@@ -14,6 +14,8 @@ class CallAudioController {
   static const _channel = MethodChannel('local_chat/call_audio');
 
   CallPhase? _syncedPhase;
+  CallDeliveryState? _syncedDelivery;
+  bool _syncedMuted = false;
   bool _incomingPlaying = false;
   bool _ringbackPlaying = false;
   bool _prepared = false;
@@ -26,14 +28,25 @@ class CallAudioController {
   List<CallAudioRoute> get availableRoutes => List.unmodifiable(_routes);
   CallAudioRoute? get selectedRoute => _selectedRoute;
 
-  /// Phase-driven alert tones. Idempotent for repeated syncs with same phase.
+  /// Phase-driven alert tones. Idempotent for repeated syncs with same inputs.
+  ///
+  /// Delivery is part of the key because it changes the answer without the
+  /// phase moving: an invite the server cannot deliver must silence a ringback
+  /// that is already playing.
   Future<void> syncAlerts({
     required CallPhase phase,
     required bool conversationMuted,
+    CallDeliveryState? delivery,
   }) async {
     if (!Platform.isAndroid) return;
-    if (_syncedPhase == phase) return;
+    if (_syncedPhase == phase &&
+        _syncedDelivery == delivery &&
+        _syncedMuted == conversationMuted) {
+      return;
+    }
     _syncedPhase = phase;
+    _syncedDelivery = delivery;
+    _syncedMuted = conversationMuted;
 
     if (conversationMuted || shouldStopCallAlerts(phase)) {
       await _stopAlerts();
@@ -43,7 +56,7 @@ class CallAudioController {
       await _startIncomingAlert();
       return;
     }
-    if (shouldPlayOutgoingRingback(phase)) {
+    if (shouldPlayOutgoingRingback(phase, delivery: delivery)) {
       await _startRingback();
       return;
     }
@@ -101,6 +114,8 @@ class CallAudioController {
 
   Future<void> stopAll({bool restoreAudio = true}) async {
     _syncedPhase = null;
+    _syncedDelivery = null;
+    _syncedMuted = false;
     await _stopAlerts();
     if (restoreAudio) await restoreAudioMode();
   }

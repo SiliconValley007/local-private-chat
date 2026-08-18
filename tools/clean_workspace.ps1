@@ -18,7 +18,10 @@ $targets = @(
     "flutter_app\build",
     "server\build",
     "server\dist",
-    "server\.pytest_cache"
+    "server\.pytest_cache",
+    ".pytest_cache",
+    "tools\.pytest_cache",
+    "server-update.zip"
 )
 if ($DeepFlutter) { $targets += "flutter_app\.dart_tool" }
 

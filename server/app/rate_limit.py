@@ -22,6 +22,16 @@ class NudgeRateLimiter:
         self._last_conv.clear()
         self._global_times.clear()
 
+    def prune_stale(self, now: float | None = None) -> None:
+        """Drop cooldown entries that can no longer affect a check."""
+        ts = time.monotonic() if now is None else now
+        cutoff = ts - max(self.PER_CONV_SECONDS, self.WINDOW_SECONDS) * 2
+        self._last_conv = {k: v for k, v in self._last_conv.items() if v > cutoff}
+        for sender_id, times in list(self._global_times.items()):
+            times[:] = [t for t in times if t > cutoff]
+            if not times:
+                del self._global_times[sender_id]
+
     def check(self, sender_id: int, conversation_id: int, now: float | None = None) -> bool:
         """Return True when the nudge is allowed and record it."""
         ts = time.monotonic() if now is None else now
@@ -62,6 +72,24 @@ class DoodleRateLimiter:
         self._last_begin.clear()
         self._stroke_times.clear()
         self._control_times.clear()
+
+    def prune_stale(self, now: float | None = None) -> None:
+        """Drop doodle cooldown/window entries that can no longer fire."""
+        ts = time.monotonic() if now is None else now
+        begin_cutoff = ts - self.BEGIN_COOLDOWN_SECONDS * 2
+        stroke_cutoff = ts - self.STROKE_WINDOW_SECONDS * 2
+        control_cutoff = ts - self.CONTROL_WINDOW_SECONDS * 2
+        self._last_begin = {
+            k: v for k, v in self._last_begin.items() if v > begin_cutoff
+        }
+        for key, times in list(self._stroke_times.items()):
+            self._prune(times, stroke_cutoff)
+            if not times:
+                del self._stroke_times[key]
+        for key, times in list(self._control_times.items()):
+            self._prune(times, control_cutoff)
+            if not times:
+                del self._control_times[key]
 
     def _prune(self, times: list[float], cutoff: float) -> None:
         times[:] = [t for t in times if t > cutoff]

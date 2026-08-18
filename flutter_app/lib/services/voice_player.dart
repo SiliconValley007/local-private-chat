@@ -45,6 +45,35 @@ class VoicePlaybackState {
   }
 }
 
+/// Clip lengths already learnt, keyed by message.
+///
+/// Android announces a duration when a file is *prepared*, and preparing the
+/// same file a second time announces nothing: replaying a voice note used to
+/// leave the length unknown, which showed as `0:01 / --:--` with a progress bar
+/// that never filled even though the audio was playing. Remembering the length
+/// makes every replay behave like the first.
+class VoiceClipLengths {
+  VoiceClipLengths({this.limit = 200});
+
+  /// Bounded, so a long scroll through a chat full of voice notes cannot grow
+  /// this without end.
+  final int limit;
+
+  final Map<int, Duration> _lengths = {};
+
+  Duration? of(int messageId) => _lengths[messageId];
+
+  int get count => _lengths.length;
+
+  void remember(int messageId, Duration length) {
+    if (length <= Duration.zero) return;
+    if (_lengths.length >= limit && !_lengths.containsKey(messageId)) {
+      _lengths.remove(_lengths.keys.first);
+    }
+    _lengths[messageId] = length;
+  }
+}
+
 /// One player for the whole app, so starting a voice note stops the previous
 /// one instead of layering two recordings on top of each other.
 class VoicePlayer extends ValueNotifier<VoicePlaybackState> {
@@ -66,9 +95,13 @@ class VoicePlayer extends ValueNotifier<VoicePlaybackState> {
       }),
     );
     _player.onDurationChanged.listen((d) {
+      final id = value.messageId;
+      if (id == null || d <= Duration.zero) return;
+      _lengths.remember(id, d);
       value = value.copyWith(duration: d);
     });
     _player.onPositionChanged.listen((p) {
+      if (value.messageId == null) return;
       value = value.copyWith(position: p);
     });
     _player.onPlayerComplete.listen((_) {
@@ -80,7 +113,16 @@ class VoicePlayer extends ValueNotifier<VoicePlaybackState> {
 
   final AudioPlayer _player = AudioPlayer();
 
+  final VoiceClipLengths _lengths = VoiceClipLengths();
+
+  /// Bumped on every new clip so a slow duration lookup cannot land on the
+  /// clip that replaced it.
+  int _session = 0;
+
   static const speeds = <double>[1.0, 1.5, 2.0];
+
+  /// Length of [messageId]'s clip if it is already known.
+  Duration? lengthOf(int messageId) => _lengths.of(messageId);
 
   /// Plays [path] for [messageId], pausing/resuming when it is already loaded.
   Future<void> toggle(int messageId, String path) async {
@@ -95,13 +137,24 @@ class VoicePlayer extends ValueNotifier<VoicePlaybackState> {
       return;
     }
     await _player.stop();
+    final session = ++_session;
     value = VoicePlaybackState(
       messageId: messageId,
       playing: true,
+      duration: _lengths.of(messageId),
       speed: value.speed,
     );
     await _player.setPlaybackRate(value.speed);
     await _player.play(DeviceFileSource(path));
+    if (session != _session) return;
+    // Asked for outright rather than waited for: the duration stream stays
+    // silent when a file is prepared a second time.
+    final measured = await _player.getDuration();
+    if (session != _session || measured == null || measured <= Duration.zero) {
+      return;
+    }
+    _lengths.remember(messageId, measured);
+    if (value.isFor(messageId)) value = value.copyWith(duration: measured);
   }
 
   Future<void> cycleSpeed() async {

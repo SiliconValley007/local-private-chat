@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Android 12 and up draw their own splash window and ignore
+         windowBackground for it, so the brand colour has to be declared through
+         the splash-screen attributes as well. Without this the system splash
+         fell back to the platform background and the app opened on black. -->
+    <style name="LaunchTheme" parent="@android:style/Theme.Light.NoTitleBar">
+        <item name="android:windowBackground">@drawable/launch_background</item>
+        <!-- The icon is left to the system, which uses the launcher icon. -->
+        <item name="android:windowSplashScreenBackground">@color/splash_background</item>
+    </style>
+</resources>

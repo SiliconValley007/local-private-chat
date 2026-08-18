@@ -28,6 +28,27 @@ const _groupKey = 'local_chat_messages';
 /// so an upgrade can clear the leftover.
 const _legacyBadgeId = 0;
 
+/// Chat alerts in the shade that no longer stand for anything unread.
+///
+/// A chat alert's id *is* its conversation id, so the unread counts from the
+/// inbox are enough to tell which entries have been overtaken by the user
+/// reading the chat. Ids that belong to something other than a chat — the call
+/// alert, the badge notification older builds left behind — are never touched.
+Set<int> staleChatNotificationIds({
+  required Iterable<int> active,
+  required Set<int> conversationsWithUnread,
+}) {
+  return active
+      .where(
+        (id) =>
+            id != incomingCallNotificationId &&
+            id != _legacyBadgeId &&
+            id > 0 &&
+            !conversationsWithUnread.contains(id),
+      )
+      .toSet();
+}
+
 /// Runs in its own isolate when a push arrives while the app is backgrounded or
 /// killed, so everything it needs must be initialised here from scratch.
 @pragma('vm:entry-point')
@@ -320,6 +341,32 @@ class NotificationService {
       await _plugin.cancel(conversationId);
     } catch (e) {
       debugPrint('Could not clear notification for $conversationId: $e');
+    }
+  }
+
+  /// Takes down chat alerts for conversations that have nothing unread left.
+  ///
+  /// Opening a chat used to be the only thing that cleared its notification, so
+  /// reading on one device, marking read on resume, or catching up from the
+  /// inbox all left a stale "New message" sitting in the shade. The shade is now
+  /// reconciled against the unread counts the server just reported, which also
+  /// clears alerts raised by the background push isolate — those were posted by
+  /// a different isolate and are invisible to anything this one remembers.
+  Future<void> reconcileTray(Set<int> conversationsWithUnread) async {
+    try {
+      await _ensureLocalNotifications();
+      final active = await _plugin.getActiveNotifications();
+      final stale = staleChatNotificationIds(
+        active: active.map((n) => n.id).whereType<int>(),
+        conversationsWithUnread: conversationsWithUnread,
+      );
+      for (final id in stale) {
+        await _plugin.cancel(id);
+      }
+    } catch (e) {
+      // Listing active notifications is unsupported on some Android builds;
+      // an unread badge that lingers is better than a crash on refresh.
+      debugPrint('Could not reconcile notifications: $e');
     }
   }
 

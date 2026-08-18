@@ -29,6 +29,16 @@ Future<void> presentCallScreen(BuildContext context) async {
   }
 }
 
+/// How far above the safe bottom edge the call controls sit.
+///
+/// Android puts its screen-recording privacy notice in a system window over the
+/// strip just above the navigation area, and a system window always draws on top
+/// of the app: no z-order, scrim, or elevation can rescue a button underneath
+/// it. Mute and End therefore keep clear of that strip entirely, scaled to the
+/// screen so they stay within thumb reach on short and tall phones alike.
+double callControlsBottomInset(double screenHeight) =>
+    (screenHeight * 0.17).clamp(120.0, 220.0);
+
 /// Full-screen voice/video call chrome (incoming, outgoing, active).
 class CallScreen extends StatefulWidget {
   const CallScreen({super.key});
@@ -39,8 +49,15 @@ class CallScreen extends StatefulWidget {
 
 class _CallScreenState extends State<CallScreen> {
   Timer? _tick;
+  Timer? _popRetry;
   bool _didPop = false;
   CallService? _calls;
+
+  /// Last live session, kept so the route never paints a black spinner while
+  /// popping after the call service has already cleared [CallService.active].
+  CallSession? _lastSession;
+
+  static const _callCanvas = Color(0xFF0B1220);
 
   @override
   void initState() {
@@ -59,6 +76,7 @@ class _CallScreenState extends State<CallScreen> {
   @override
   void dispose() {
     _tick?.cancel();
+    _popRetry?.cancel();
     _calls?.removeListener(_onCallChanged);
     super.dispose();
   }
@@ -79,34 +97,78 @@ class _CallScreenState extends State<CallScreen> {
 
   void _onCallChanged() {
     final session = _calls?.active;
+    if (session != null) _lastSession = session;
     if (session == null || session.phase == CallPhase.ended) {
       _popOnce();
     }
   }
 
+  /// Leaves the call route, whatever else is going on.
+  ///
+  /// This used to call `maybePop`, which asks the route's own [PopScope] for
+  /// permission — and the guard that stops a live call being swiped away
+  /// refused it. "Call ended" then had no exit at all: the button, the system
+  /// back gesture, and the automatic close all went through here and were all
+  /// denied, so the only way out was to kill the app.
   void _popOnce() {
     if (_didPop || !mounted) return;
+    final route = ModalRoute.of(context);
+    if (route == null || !route.isActive) return;
     _didPop = true;
-    Navigator.of(context).maybePop();
+    final navigator = Navigator.of(context);
+    if (route.isCurrent) {
+      navigator.pop();
+    } else {
+      // Something was pushed on top (a permission sheet, say): take this route
+      // out from under it rather than popping whatever is in front.
+      navigator.removeRoute(route);
+    }
+    // Nothing here may be a one-shot. If the pop does not take, the periodic
+    // tick rebuilds, sees the call is over, and asks again.
+    _popRetry?.cancel();
+    _popRetry = Timer(const Duration(milliseconds: 500), () {
+      if (mounted) _didPop = false;
+    });
   }
+
+  void _schedulePop() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _popOnce();
+    });
+  }
+
+  double _controlsBottomFor(BuildContext context) =>
+      callControlsBottomInset(MediaQuery.sizeOf(context).height);
 
   @override
   Widget build(BuildContext context) {
     final calls = context.watch<AppState>().calls;
-    final session = calls.active;
+    final live = calls.active;
+    if (live != null) _lastSession = live;
+    final session = live ?? _lastSession;
+
+    // No session was ever painted: leave without a loading body so the
+    // previous chat/inbox stays visible under the popping route.
     if (session == null) {
-      WidgetsBinding.instance.addPostFrameCallback((_) => _popOnce());
+      _schedulePop();
       return const Scaffold(
-        backgroundColor: Colors.black,
-        body: Center(child: CircularProgressIndicator(color: Colors.white)),
+        backgroundColor: _callCanvas,
+        body: SizedBox.expand(),
       );
     }
 
-    final phase = session.phase;
+    final ending = live == null || session.phase == CallPhase.ended;
+    if (ending) _schedulePop();
+
+    final phase = ending ? CallPhase.ended : session.phase;
     final title = switch (phase) {
       CallPhase.incoming =>
         'Incoming ${session.isVideo ? 'video' : 'voice'} call',
-      CallPhase.outgoing => outgoingCallLabel(phase),
+      CallPhase.outgoing => outgoingCallStatus(
+        phase,
+        session.deliveryState,
+        peerName: session.peerName,
+      ),
       CallPhase.ringing => outgoingCallLabel(phase),
       CallPhase.connecting => outgoingCallLabel(phase),
       CallPhase.active => formatCallElapsed(session.elapsed),
@@ -115,13 +177,16 @@ class _CallScreenState extends State<CallScreen> {
     };
 
     return PopScope(
-      canPop: false,
+      // A live call is worth confirming with a hang-up before leaving, so back
+      // is intercepted then. Once the call is over there is nothing to protect
+      // and back closes the route directly.
+      canPop: ending,
       onPopInvokedWithResult: (didPop, _) {
         if (didPop) return;
         unawaited(_onBackPressed());
       },
       child: Scaffold(
-        backgroundColor: const Color(0xFF0B1220),
+        backgroundColor: _callCanvas,
         body: SafeArea(
           child: Stack(
             children: [
@@ -194,7 +259,8 @@ class _CallScreenState extends State<CallScreen> {
                 Positioned(
                   left: 16,
                   right: 16,
-                  bottom: 140,
+                  // Clear of the controls, wherever this screen's height put them.
+                  bottom: _controlsBottomFor(context) + 108,
                   child: Material(
                     color: Colors.red.shade900.withValues(alpha: 0.85),
                     borderRadius: BorderRadius.circular(12),
@@ -211,9 +277,10 @@ class _CallScreenState extends State<CallScreen> {
               Positioned(
                 left: 0,
                 right: 0,
-                bottom: 28,
+                bottom: _controlsBottomFor(context),
                 child: _CallControls(
                   session: session,
+                  ending: ending,
                   availableRoutes: calls.availableRoutes,
                   onAccept: () => calls.acceptIncoming(),
                   onReject: () => calls.rejectIncoming(),
@@ -278,9 +345,11 @@ class _CallControls extends StatelessWidget {
     required this.onToggleCam,
     required this.onSelectRoute,
     required this.availableRoutes,
+    this.ending = false,
   });
 
   final CallSession session;
+  final bool ending;
   final VoidCallback onAccept;
   final VoidCallback onReject;
   final VoidCallback onEnd;
@@ -291,6 +360,9 @@ class _CallControls extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    if (ending) {
+      return const SizedBox(height: 80);
+    }
     if (session.phase == CallPhase.incoming) {
       return Row(
         mainAxisAlignment: MainAxisAlignment.spaceEvenly,

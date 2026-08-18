@@ -91,6 +91,37 @@ String formatListTimestamp(BuildContext context, DateTime when) {
   return DateFormat.MMMd().format(local);
 }
 
+/// A moment in the reader's own timezone, with the day spelled out:
+/// "today at 5:53 PM", "tomorrow at 5:53 PM", "Thursday at 5:53 PM",
+/// "18 Aug at 5:53 PM".
+String formatMomentWithDay(BuildContext context, DateTime when) {
+  final local = when.toLocal();
+  final now = DateTime.now();
+  final days = DateTime(
+    local.year,
+    local.month,
+    local.day,
+  ).difference(DateTime(now.year, now.month, now.day)).inDays;
+  final clock = formatClockTime(context, when);
+  if (days == 0) return 'today at $clock';
+  if (days == 1) return 'tomorrow at $clock';
+  if (days == -1) return 'yesterday at $clock';
+  if (days > 1 && days < 7) {
+    return '${DateFormat.EEEE().format(local)} at $clock';
+  }
+  if (local.year == now.year) {
+    return '${DateFormat('d MMM').format(local)} at $clock';
+  }
+  return '${DateFormat('d MMM y').format(local)} at $clock';
+}
+
+/// When a disappearing message goes, in words: "Disappears tomorrow at 7:41 AM".
+///
+/// The timer icon alone only says that a message is on a clock, not which one,
+/// so anyone who forgot the setting had no way to find out.
+String formatDisappearsAt(BuildContext context, DateTime when) =>
+    'Disappears ${formatMomentWithDay(context, when)}';
+
 /// "last seen today at 5:53 PM" — spelled out, because a bare "05:53" told the
 /// user neither which day nor whether it was morning or evening.
 String formatLastSeen(BuildContext context, DateTime when) {

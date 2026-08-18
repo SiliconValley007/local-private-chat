@@ -210,10 +210,11 @@ class _TailscaleAutomationCard extends StatelessWidget {
           onChanged: (value) => state.setTailscalePrefs(
             prefs.copyWith(autoDisconnectOnExit: value),
           ),
-          title: const Text('Disconnect when the app is closed'),
+          title: const Text('Disconnect when you leave the app'),
           subtitle: const Text(
-            'Only when Local Chat switched Tailscale on. A tunnel you turned on '
-            'yourself is left alone.',
+            'About half a minute after Local Chat goes out of sight, and only '
+            'when Local Chat switched Tailscale on. A tunnel you turned on '
+            'yourself is left alone, and a call in progress keeps its tunnel.',
           ),
         ),
         const SizedBox(height: 4),

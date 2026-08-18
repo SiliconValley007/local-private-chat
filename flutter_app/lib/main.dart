@@ -13,9 +13,16 @@ import 'services/notification_service.dart';
 import 'services/privacy_onboarding_store.dart';
 import 'services/theme_store.dart';
 import 'theme.dart';
+import 'widgets/launch_surface.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  // Cap decoded image RAM so a wallpaper + a few photo bubbles cannot push a
+  // 3 GB phone into Android's low-memory killer. Display sizes still look sharp
+  // because each Image.network also requests a resized decode.
+  PaintingBinding.instance.imageCache
+    ..maximumSize = 180
+    ..maximumSizeBytes = 40 << 20; // 40 MB
   // Must be registered before runApp so Android can start this entry point when
   // the UI isolate does not exist (backgrounded or swiped away).
   FirebaseMessaging.onBackgroundMessage(firebaseMessagingBackgroundHandler);
@@ -64,11 +71,16 @@ class _RootState extends State<_Root> {
   bool? _onboardingDone;
   int? _checkedForUserId;
 
+  /// Last signed-in shell once shown. Mid-session `ready` flaps and onboarding
+  /// reloads must not replace this with a lone spinner after a call.
+  Widget? _stableShell;
+
   Future<void> _loadOnboardingFlag(int? userId) async {
     if (userId == null) {
       setState(() {
         _onboardingDone = true;
         _checkedForUserId = null;
+        _stableShell = null;
       });
       return;
     }
@@ -81,26 +93,24 @@ class _RootState extends State<_Root> {
     });
   }
 
+  /// Continuation of the Android splash window, never a spinner on its own.
+  Widget _launchSurface() => const LaunchSurface();
+
   @override
   Widget build(BuildContext context) {
     final state = context.watch<AppState>();
+
+    // Only the very first boot may blank the tree. Once the inbox (or auth)
+    // has painted, keep that shell through brief readiness flaps after a call.
     if (!state.ready) {
-      return Scaffold(
-        body: Container(
-          alignment: Alignment.center,
-          decoration: BoxDecoration(
-            gradient: appBackgroundGradient(Theme.of(context).colorScheme),
-          ),
-          child: const CircularProgressIndicator(),
-        ),
-      );
+      return TailscaleGateScreen(child: _stableShell ?? _launchSurface());
     }
 
     Widget child;
     if (!state.isLoggedIn) {
+      _stableShell = null;
       child = const AuthScreen();
     } else {
-      // Kick the flag load once per signed-in user.
       final uid = state.me?.id;
       if (_checkedForUserId != uid || _onboardingDone == null) {
         WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -112,17 +122,12 @@ class _RootState extends State<_Root> {
           onFinished: () => setState(() => _onboardingDone = true),
         );
       } else if (_onboardingDone == null) {
-        child = Scaffold(
-          body: Container(
-            alignment: Alignment.center,
-            decoration: BoxDecoration(
-              gradient: appBackgroundGradient(Theme.of(context).colorScheme),
-            ),
-            child: const CircularProgressIndicator(),
-          ),
-        );
+        // Same user already reached the inbox: do not flash a spinner while
+        // the onboarding flag is re-read after a lifecycle churn.
+        child = _stableShell ?? _launchSurface();
       } else {
         child = const InboxScreen();
+        _stableShell = child;
       }
     }
 

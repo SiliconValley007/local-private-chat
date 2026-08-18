@@ -1,5 +1,6 @@
 import 'dart:io';
 
+import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
@@ -118,9 +119,11 @@ class _AvatarViewerScreenState extends State<AvatarViewerScreen> {
                   : InteractiveViewer(
                       minScale: 1,
                       maxScale: 4,
-                      child: Image.network(
-                        url,
-                        headers: widget.imageHeaders,
+                      child: Image(
+                        image: CachedNetworkImageProvider(
+                          url,
+                          headers: widget.imageHeaders ?? const {},
+                        ),
                         fit: BoxFit.contain,
                         width: double.infinity,
                         loadingBuilder: (context, child, progress) =>

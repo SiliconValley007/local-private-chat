@@ -1,11 +1,26 @@
 import 'dart:math' as math;
 
+import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
 import '../app_state.dart';
 import '../models.dart';
 import '../services/media_store.dart';
+
+/// Tallest and shortest a drawing may be drawn in a chat row.
+const double doodleMaxHeight = 360;
+const double doodleMinHeight = 120;
+
+/// Height a drawing of pixel size [source] will settle at in a [width] row.
+///
+/// Null while the size is unknown, which is the only case where the row has to
+/// guess and then correct itself once the drawing arrives.
+double? doodlePreviewHeight({required double width, Size? source}) {
+  if (source == null || source.width <= 0 || source.height <= 0) return null;
+  final height = width * source.height / source.width;
+  return height.clamp(doodleMinHeight, doodleMaxHeight);
+}
 
 /// Bubble-free persistent doodle: transparent PNG with [BoxFit.contain].
 class DoodleAttachment extends StatefulWidget {
@@ -33,7 +48,21 @@ class _DoodleAttachmentState extends State<DoodleAttachment> {
   Widget build(BuildContext context) {
     final state = context.read<AppState>();
     final width = math.min(widget.maxWidth, 280.0);
-    const maxHeight = 360.0;
+    // Reserving the settled height keeps the row still: without it a drawing
+    // scrolling into view grew out of the placeholder and pushed the chat along
+    // with it.
+    final settled = doodlePreviewHeight(
+      width: width,
+      source: widget.message.mediaShape,
+    );
+    final image = ResizeImage(
+      CachedNetworkImageProvider(
+        state.api.mediaUrl(widget.message.id),
+        headers: state.api.imageAuthHeaders,
+      ),
+      width: (width * MediaQuery.devicePixelRatioOf(context)).round(),
+      policy: ResizeImagePolicy.fit,
+    );
 
     return Semantics(
       label: 'Drawing',
@@ -54,19 +83,19 @@ class _DoodleAttachmentState extends State<DoodleAttachment> {
                 child: ConstrainedBox(
                   constraints: BoxConstraints(
                     maxWidth: width,
-                    maxHeight: maxHeight,
-                    minHeight: 120,
+                    maxHeight: doodleMaxHeight,
+                    minHeight: settled ?? doodleMinHeight,
                   ),
-                  child: Image.network(
-                    state.api.mediaUrl(widget.message.id),
+                  child: Image(
+                    image: image,
                     key: ValueKey(_reloadKey),
-                    headers: {'Authorization': 'Bearer ${state.api.token}'},
                     fit: BoxFit.contain,
                     loadingBuilder: (context, child, progress) {
                       if (progress == null) return child;
                       final expected = progress.expectedTotalBytes;
                       return _DoodlePlaceholder(
                         width: width,
+                        height: settled,
                         progress: expected == null
                             ? null
                             : progress.cumulativeBytesLoaded / expected,
@@ -74,6 +103,7 @@ class _DoodleAttachmentState extends State<DoodleAttachment> {
                     },
                     errorBuilder: (context, _, _) => _DoodleFailed(
                       width: width,
+                      height: settled,
                       onRetry: () => setState(() => _reloadKey++),
                     ),
                   ),
@@ -105,9 +135,12 @@ class _DoodleAttachmentState extends State<DoodleAttachment> {
 }
 
 class _DoodlePlaceholder extends StatelessWidget {
-  const _DoodlePlaceholder({required this.width, this.progress});
+  const _DoodlePlaceholder({required this.width, this.height, this.progress});
 
   final double width;
+
+  /// Height the finished drawing will take, when it is already known.
+  final double? height;
   final double? progress;
 
   @override
@@ -115,7 +148,7 @@ class _DoodlePlaceholder extends StatelessWidget {
     final scheme = Theme.of(context).colorScheme;
     return SizedBox(
       width: width,
-      height: 160,
+      height: height ?? 160,
       child: ColoredBox(
         color: scheme.surfaceContainerHighest.withValues(alpha: 0.35),
         child: Center(
@@ -131,9 +164,14 @@ class _DoodlePlaceholder extends StatelessWidget {
 }
 
 class _DoodleFailed extends StatelessWidget {
-  const _DoodleFailed({required this.width, required this.onRetry});
+  const _DoodleFailed({
+    required this.width,
+    required this.onRetry,
+    this.height,
+  });
 
   final double width;
+  final double? height;
   final VoidCallback onRetry;
 
   @override
@@ -143,7 +181,7 @@ class _DoodleFailed extends StatelessWidget {
       onTap: onRetry,
       child: SizedBox(
         width: width,
-        height: 160,
+        height: height ?? 160,
         child: ColoredBox(
           color: scheme.surfaceContainerHighest.withValues(alpha: 0.35),
           child: Column(
@@ -215,9 +253,11 @@ class DoodleViewerScreen extends StatelessWidget {
           child: Center(
             child: Hero(
               tag: 'media-hero-${message.id}',
-              child: Image.network(
-                state.api.mediaUrl(message.id),
-                headers: {'Authorization': 'Bearer ${state.api.token}'},
+              child: Image(
+                image: CachedNetworkImageProvider(
+                  state.api.mediaUrl(message.id),
+                  headers: state.api.imageAuthHeaders,
+                ),
                 fit: BoxFit.contain,
               ),
             ),

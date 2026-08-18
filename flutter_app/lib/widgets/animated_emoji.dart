@@ -1,6 +1,5 @@
 import 'dart:collection';
 import 'dart:math' as math;
-import 'dart:ui' show lerpDouble;
 
 import 'package:flutter/material.dart';
 
@@ -49,278 +48,278 @@ bool shouldAnimateSoloEmoji({
   bool animationsEnabled = true,
 }) => emojiCount == 1 && animationsEnabled;
 
-/// Restrained visual families for the procedural effect.
-enum SoloEmojiEffectCategory { hearts, kisses, celebration, general }
+/// Expressive motion family selected from the emoji's first base code point.
+enum SoloEmojiEffectCategory { love, flying, sad, general }
 
-/// Picks a category from the first emoji base in [emoji].
 SoloEmojiEffectCategory classifySoloEmojiEffect(String emoji) {
-  final trimmed = emoji.trim();
-  if (trimmed.isEmpty) return SoloEmojiEffectCategory.general;
-
-  for (final cp in trimmed.runes) {
-    if (_isKiss(cp)) return SoloEmojiEffectCategory.kisses;
-    if (_isCelebration(cp)) return SoloEmojiEffectCategory.celebration;
-    if (_isHeart(cp)) return SoloEmojiEffectCategory.hearts;
-    break; // First base glyph drives the variant.
+  for (final cp in emoji.trim().runes) {
+    if (_loveCodePoints.contains(cp)) return SoloEmojiEffectCategory.love;
+    if (_flyingCodePoints.contains(cp)) return SoloEmojiEffectCategory.flying;
+    if (_sadCodePoints.contains(cp)) return SoloEmojiEffectCategory.sad;
+    if (cp == 0xFE0F || cp == 0x200D) continue;
+    break;
   }
   return SoloEmojiEffectCategory.general;
 }
 
-bool _isHeart(int cp) =>
-    cp == 0x2764 ||
-    cp == 0x2665 ||
-    (cp >= 0x1F493 && cp <= 0x1F49F) ||
-    cp == 0x1F5A4 ||
-    cp == 0x1F90D ||
-    cp == 0x1F90E ||
-    cp == 0x1F9E1 ||
-    (cp >= 0x1FA75 && cp <= 0x1FA77);
+const _loveCodePoints = {
+  0x2764, // heart
+  0x1F493,
+  0x1F494,
+  0x1F495,
+  0x1F496,
+  0x1F497,
+  0x1F498,
+  0x1F499,
+  0x1F49A,
+  0x1F49B,
+  0x1F49C,
+  0x1F49D,
+  0x1F49E,
+  0x1F49F,
+  0x1F5A4,
+  0x1F90D,
+  0x1F90E,
+  0x1F9E1,
+  0x1FA75,
+  0x1FA76,
+  0x1FA77,
+};
 
-bool _isKiss(int cp) =>
-    cp == 0x1F48B ||
-    (cp >= 0x1F618 && cp <= 0x1F61A) ||
-    cp == 0x1F617 ||
-    cp == 0x1F619;
+const _flyingCodePoints = {
+  0x1F98B, // butterfly
+  0x1F388, // balloon
+  0x1F54A, // dove
+};
 
-bool _isCelebration(int cp) =>
-    cp == 0x1F389 ||
-    cp == 0x1F38A ||
-    cp == 0x1F973 ||
-    cp == 0x1F388 ||
-    cp == 0x1F386 ||
-    cp == 0x1F387 ||
-    cp == 0x2728 ||
-    cp == 0x1F381 ||
-    cp == 0x1F382 ||
-    cp == 0x1F383 ||
-    cp == 0x1F384 ||
-    cp == 0x1F385;
+const _sadCodePoints = {
+  0x1F622,
+  0x1F625,
+  0x1F62D, // loudly crying
+  0x1F97A, // pleading
+  0x1F641,
+  0x2639,
+};
 
-/// One frame of the squash/stretch launch, overshoot, glow, and particle burst.
+/// Normalized entrance stage boundaries (880 ms total).
+abstract final class SoloEmojiEntranceStages {
+  static const double anticipationEnd = 0.14;
+  static const double springEnd = 0.40;
+  static const double recoilEnd = 0.58;
+  static const double wobbleEnd = 0.76;
+  static const double settleEnd = 0.92;
+  static const double end = 1.0;
+}
+
+/// Every visual property for one frame. A single sampled frame keeps scale,
+/// translation, rotation, and alpha synchronized.
 class SoloEmojiMotionFrame {
   const SoloEmojiMotionFrame({
     required this.scaleX,
     required this.scaleY,
-    required this.rotation,
-    required this.glowOpacity,
-    required this.glowRadiusFactor,
-    required this.particleStrength,
+    required this.translationX,
+    required this.translationY,
+    required this.rotationDegrees,
+    required this.opacity,
   });
 
   final double scaleX;
   final double scaleY;
-  final double rotation;
-  final double glowOpacity;
-  final double glowRadiusFactor;
-
-  /// 0 when particles are gone; peaks early in the play.
-  final double particleStrength;
-
-  static const idle = SoloEmojiMotionFrame(
-    scaleX: 1,
-    scaleY: 1,
-    rotation: 0,
-    glowOpacity: 0,
-    glowRadiusFactor: 0,
-    particleStrength: 0,
-  );
-}
-
-/// Deterministic seed so the same emoji always bursts the same way.
-int soloEmojiEffectSeed(String emoji) {
-  var hash = 0;
-  for (final cp in emoji.runes) {
-    hash = 0x1fffffff & (hash + cp);
-    hash = 0x1fffffff & (hash + ((hash & 0x0007ffff) << 10));
-    hash ^= hash >> 6;
-  }
-  hash = 0x1fffffff & (hash + ((hash & 0x03ffffff) << 3));
-  hash ^= hash >> 11;
-  hash = 0x1fffffff & (hash + ((hash & 0x00003fff) << 15));
-  return hash == 0 ? 1 : hash;
-}
-
-/// How many radial particles this category may spawn (hard cap for lists).
-int soloEmojiParticleCount(SoloEmojiEffectCategory category) =>
-    switch (category) {
-      SoloEmojiEffectCategory.celebration => 10,
-      SoloEmojiEffectCategory.hearts => 6,
-      SoloEmojiEffectCategory.kisses => 5,
-      SoloEmojiEffectCategory.general => 8,
-    };
-
-/// A single procedural sparkle; positions are normalized to the emoji box.
-class SoloEmojiParticleSample {
-  const SoloEmojiParticleSample({
-    required this.dx,
-    required this.dy,
-    required this.radius,
-    required this.opacity,
-  });
-
-  final double dx;
-  final double dy;
-  final double radius;
+  final double translationX;
+  final double translationY;
+  final double rotationDegrees;
   final double opacity;
 }
 
-double _easeOutBack(double t) {
-  const c1 = 1.70158;
-  const c3 = c1 + 1;
-  return 1 + c3 * math.pow(t - 1, 3) + c1 * math.pow(t - 1, 2);
-}
+double _lerp(double a, double b, double t) => a + (b - a) * t;
 
-double _categoryOvershoot(SoloEmojiEffectCategory category) =>
-    switch (category) {
-      SoloEmojiEffectCategory.celebration => 0.11,
-      SoloEmojiEffectCategory.hearts => 0.085,
-      SoloEmojiEffectCategory.kisses => 0.075,
-      SoloEmojiEffectCategory.general => 0.065,
-    };
+double _segment(double t, double start, double end) =>
+    ((t - start) / (end - start)).clamp(0.0, 1.0);
 
-double _categoryTilt(SoloEmojiEffectCategory category) => switch (category) {
-  SoloEmojiEffectCategory.kisses => 0.055,
-  SoloEmojiEffectCategory.celebration => 0.04,
-  SoloEmojiEffectCategory.hearts => 0.03,
-  SoloEmojiEffectCategory.general => 0.035,
-};
+/// Google Messages' snappy spring curve:
+/// `cubic-bezier(0.175, 0.885, 0.32, 1.275)`.
+const Curve _popCurve = Cubic(0.175, 0.885, 0.32, 1.275);
 
-Color soloEmojiGlowColor(
-  SoloEmojiEffectCategory category,
-  Brightness brightness,
-) {
-  final dark = brightness == Brightness.dark;
-  return switch (category) {
-    SoloEmojiEffectCategory.hearts =>
-      dark ? const Color(0xFFFF6B9D) : const Color(0xFFFF4D7D),
-    SoloEmojiEffectCategory.kisses =>
-      dark ? const Color(0xFFFF8AB8) : const Color(0xFFFF7AA8),
-    SoloEmojiEffectCategory.celebration =>
-      dark ? const Color(0xFFFFD166) : const Color(0xFFFFB703),
-    SoloEmojiEffectCategory.general =>
-      dark ? AppColors.accent : AppColors.brand,
-  };
-}
-
-Color soloEmojiParticleColor(
-  SoloEmojiEffectCategory category,
-  Brightness brightness,
-) {
-  final glow = soloEmojiGlowColor(category, brightness);
-  return glow.withValues(alpha: brightness == Brightness.dark ? 0.92 : 0.85);
-}
-
-/// Samples motion at normalized progress [t] in `[0, 1]`.
-SoloEmojiMotionFrame sampleSoloEmojiMotion({
+/// A staged entrance whose scale, landing, alpha and wobble share one timeline.
+SoloEmojiMotionFrame sampleSoloEmojiEntrance({
   required double t,
   required SoloEmojiEffectCategory category,
 }) {
-  if (t <= 0) {
-    return SoloEmojiMotionFrame(
-      scaleX: 1.06,
-      scaleY: 0.68,
-      rotation: -_categoryTilt(category) * 0.35,
-      glowOpacity: 0,
-      glowRadiusFactor: 0.35,
-      particleStrength: 0,
+  final p = t.clamp(0.0, 1.0);
+  double scale;
+  double rotation;
+  double translationX;
+
+  double translationY;
+  double opacity;
+
+  if (p <= SoloEmojiEntranceStages.anticipationEnd) {
+    final q = Curves.easeOutCubic.transform(
+      _segment(p, 0, SoloEmojiEntranceStages.anticipationEnd),
     );
-  }
-  if (t >= 1) return SoloEmojiMotionFrame.idle;
-
-  final overshoot = _categoryOvershoot(category);
-  final tilt = _categoryTilt(category);
-
-  late double scaleX;
-  late double scaleY;
-  late double rotation;
-
-  if (t <= 0.34) {
-    final p = Curves.easeOutCubic.transform(t / 0.34);
-    scaleX = lerpDouble(1.06, 0.86, p)!;
-    scaleY = lerpDouble(0.68, 1.26, p)!;
-    rotation = lerpDouble(-tilt * 0.35, tilt * 0.55, p)!;
-  } else if (t <= 0.54) {
-    final p = _easeOutBack((t - 0.34) / 0.20);
-    scaleX = lerpDouble(0.86, 1 + overshoot, p)!;
-    scaleY = lerpDouble(1.26, 1 + overshoot * 0.55, p)!;
-    rotation = lerpDouble(tilt * 0.55, -tilt * 0.25, p)!;
+    scale = _lerp(0.15, 0.38, q);
+    translationX = 0;
+    translationY = _lerp(16, 10, q);
+    rotation = 0;
+    opacity = _lerp(0, 0.7, q);
+  } else if (p <= SoloEmojiEntranceStages.springEnd) {
+    final spring = _popCurve.transform(
+      _segment(
+        p,
+        SoloEmojiEntranceStages.anticipationEnd,
+        SoloEmojiEntranceStages.springEnd,
+      ),
+    );
+    scale = _lerp(0.38, 1.30, spring);
+    final q = Curves.easeOutCubic.transform(
+      _segment(
+        p,
+        SoloEmojiEntranceStages.anticipationEnd,
+        SoloEmojiEntranceStages.springEnd,
+      ),
+    );
+    rotation = category == SoloEmojiEffectCategory.flying
+        ? _lerp(-10, 4, q)
+        : 0;
+    translationX = 2 * math.sin(math.pi * q);
+    translationY = _lerp(10, -3, q);
+    opacity = _lerp(0.7, 1, q);
+  } else if (p <= SoloEmojiEntranceStages.recoilEnd) {
+    final q = Curves.easeInOutCubic.transform(
+      _segment(
+        p,
+        SoloEmojiEntranceStages.springEnd,
+        SoloEmojiEntranceStages.recoilEnd,
+      ),
+    );
+    scale = _lerp(1.30, 0.97, q);
+    rotation = _lerp(0, -7, q);
+    translationX = _lerp(0, -2.5, q);
+    translationY = _lerp(-3, 1, q);
+    opacity = 1;
+  } else if (p <= SoloEmojiEntranceStages.wobbleEnd) {
+    final q = Curves.easeInOut.transform(
+      _segment(
+        p,
+        SoloEmojiEntranceStages.recoilEnd,
+        SoloEmojiEntranceStages.wobbleEnd,
+      ),
+    );
+    scale = _lerp(0.97, 1.035, q);
+    rotation = _lerp(-7, 6, q);
+    translationX = _lerp(-2.5, 2, q);
+    translationY = _lerp(1, -1, q);
+    opacity = 1;
+  } else if (p <= SoloEmojiEntranceStages.settleEnd) {
+    final q = Curves.easeOutCubic.transform(
+      _segment(
+        p,
+        SoloEmojiEntranceStages.wobbleEnd,
+        SoloEmojiEntranceStages.settleEnd,
+      ),
+    );
+    scale = _lerp(1.035, 1, q);
+    rotation = _lerp(6, 0, q);
+    translationX = _lerp(2, 0, q);
+    translationY = _lerp(-1, 0, q);
+    opacity = 1;
   } else {
-    final p = Curves.easeOut.transform((t - 0.54) / 0.46);
-    scaleX = lerpDouble(1 + overshoot, 1, p)!;
-    scaleY = lerpDouble(1 + overshoot * 0.55, 1, p)!;
-    rotation = lerpDouble(-tilt * 0.25, 0, p)!;
+    scale = 1;
+    rotation = 0;
+    translationX = 0;
+    translationY = 0;
+    opacity = 1;
   }
 
-  final glowPeak = math.exp(-math.pow((t - 0.24) / 0.22, 2));
-  final glowTail =
-      (1 - Curves.easeIn.transform(((t - 0.42) / 0.58).clamp(0.0, 1.0)));
-  final glowOpacity = (glowPeak * 0.42 * glowTail).clamp(0.0, 0.42);
+  var scaleX = scale;
+  var scaleY = scale;
 
-  final particleStrength = t <= 0.58
-      ? (1 - Curves.easeInCubic.transform(t / 0.58)).clamp(0.0, 1.0)
-      : 0.0;
+  switch (category) {
+    case SoloEmojiEffectCategory.love:
+      final beat = math.sin(math.pi * _segment(p, 0.38, 0.72));
+      scaleX *= 1 + 0.08 * beat;
+      scaleY *= 1 + 0.08 * beat;
+    case SoloEmojiEffectCategory.flying:
+      final lift = math.sin(math.pi * _segment(p, 0.14, 0.74));
+      final decay = 1 - _segment(p, 0.65, 1);
+      translationY -= 11 * lift;
+      translationX += 4 * math.sin(2 * math.pi * p) * decay;
+      rotation += 8 * math.sin(3 * math.pi * p) * decay;
+    case SoloEmojiEffectCategory.sad:
+      final droop = math.sin(math.pi * _segment(p, 0.10, 0.55));
+      scaleX *= 1 - 0.05 * droop;
+      scaleY *= 1 + 0.16 * droop;
+      translationY += 7 * droop;
+      if (p > 0.52 && p < 0.88) {
+        final decay = 1 - _segment(p, 0.52, 0.88);
+        rotation += 2.5 * math.sin(p * math.pi * 6) * decay;
+      }
+    case SoloEmojiEffectCategory.general:
+      break;
+  }
 
   return SoloEmojiMotionFrame(
     scaleX: scaleX,
     scaleY: scaleY,
-    rotation: rotation,
-    glowOpacity: glowOpacity,
-    glowRadiusFactor: lerpDouble(0.35, 0.95, glowPeak)!,
-    particleStrength: particleStrength,
+    translationX: translationX,
+    translationY: translationY,
+    rotationDegrees: rotation,
+    opacity: opacity,
   );
 }
 
-/// Radial particles for one frame; count is bounded by [soloEmojiParticleCount].
-List<SoloEmojiParticleSample> sampleSoloEmojiParticles({
-  required double t,
-  required SoloEmojiEffectCategory category,
-  required int seed,
-}) {
-  final strength = sampleSoloEmojiMotion(
-    t: t,
-    category: category,
-  ).particleStrength;
-  if (strength <= 0.001) return const [];
-
-  final count = soloEmojiParticleCount(category);
-  final spread = switch (category) {
-    SoloEmojiEffectCategory.celebration => 0.72,
-    SoloEmojiEffectCategory.hearts => 0.58,
-    SoloEmojiEffectCategory.kisses => 0.52,
-    SoloEmojiEffectCategory.general => 0.62,
-  };
-  final lift = switch (category) {
-    SoloEmojiEffectCategory.hearts => -0.08,
-    SoloEmojiEffectCategory.kisses => -0.05,
-    SoloEmojiEffectCategory.celebration => -0.12,
-    SoloEmojiEffectCategory.general => 0,
-  };
-
-  final burst = Curves.easeOutCubic.transform((t / 0.34).clamp(0.0, 1.0));
-  final samples = <SoloEmojiParticleSample>[];
-  for (var i = 0; i < count; i++) {
-    final angleSeed = (seed + i * 9973) & 0x7fffffff;
-    final angle = (angleSeed % 360) * math.pi / 180;
-    final distJitter = 0.78 + ((angleSeed >> 8) % 35) / 100.0;
-    final dx = math.cos(angle) * spread * burst * distJitter;
-    final dy = math.sin(angle) * spread * burst * distJitter + lift * burst;
-    final radius = 1.4 + ((angleSeed >> 4) % 6) * 0.35;
-    final opacity = (strength * (0.55 + ((angleSeed >> 12) % 40) / 100.0))
-        .clamp(0.0, 1.0);
-    if (opacity <= 0.01) continue;
-    samples.add(
-      SoloEmojiParticleSample(dx: dx, dy: dy, radius: radius, opacity: opacity),
-    );
-  }
-  return samples;
+double _heartBeat(double t) {
+  if (t <= 0.12) return _lerp(1, 1.2, _segment(t, 0, 0.12));
+  if (t <= 0.24) return _lerp(1.2, 1.05, _segment(t, 0.12, 0.24));
+  if (t <= 0.38) return _lerp(1.05, 1.25, _segment(t, 0.24, 0.38));
+  if (t <= 0.58) return _lerp(1.25, 1, _segment(t, 0.38, 0.58));
+  return 1 + 0.012 * math.sin(_segment(t, 0.58, 1) * math.pi * 2);
 }
 
-/// A single emoji drawn oversized, with a Google-Messages-inspired procedural
-/// entrance: squash/stretch launch, overshoot, glow pulse, and radial sparks.
-///
-/// The static Noto glyph is always used so every Unicode emoji renders; only
-/// the surrounding motion varies by category. Tapping replays the effect after
-/// the once-per-message entrance has been consumed.
+/// Repeating ambient keyframes after the entrance has settled.
+SoloEmojiMotionFrame sampleSoloEmojiIdle({
+  required double t,
+  required SoloEmojiEffectCategory category,
+}) {
+  final p = t.clamp(0.0, 1.0);
+  final wave = math.sin(p * math.pi * 2);
+  var scaleX = 1 + 0.022 * wave;
+  var scaleY = scaleX;
+  var translationX = 0.0;
+  var translationY = -4 * wave;
+  var rotation = 0.0;
+
+  switch (category) {
+    case SoloEmojiEffectCategory.love:
+      scaleX = _heartBeat(p);
+      scaleY = scaleX;
+    case SoloEmojiEffectCategory.flying:
+      translationY = -5 * wave;
+      translationX = 3 * math.sin(p * math.pi * 4);
+      rotation = 6 * math.sin(p * math.pi * 4);
+      scaleX = 1 + 0.025 * wave;
+      scaleY = scaleX;
+    case SoloEmojiEffectCategory.sad:
+      translationY = 2 + 3 * math.sin(math.pi * p).abs();
+      scaleX = 1 - 0.015 * wave.abs();
+      scaleY = 1 + 0.04 * wave.abs();
+      rotation = 1.5 * math.sin(p * math.pi * 8);
+    case SoloEmojiEffectCategory.general:
+      break;
+  }
+
+  return SoloEmojiMotionFrame(
+    scaleX: scaleX,
+    scaleY: scaleY,
+    translationX: translationX,
+    translationY: translationY,
+    rotationDegrees: rotation,
+    opacity: 1,
+  );
+}
+
+/// An oversized, bubble-free single emoji with an expressive RCS-style
+/// entrance, category motion, and short ambient movement.
 class SoloEmojiBubble extends StatefulWidget {
   const SoloEmojiBubble({
     super.key,
@@ -335,60 +334,90 @@ class SoloEmojiBubble extends StatefulWidget {
   final String playbackKey;
   final SoloEmojiPlaybackLedger? ledger;
 
-  static const Duration playDuration = Duration(milliseconds: 680);
+  static const Duration playDuration = Duration(milliseconds: 880);
+  static const Duration idleDuration = Duration(milliseconds: 2400);
+  static const int idleCycleCount = 3;
 
   @override
   State<SoloEmojiBubble> createState() => _SoloEmojiBubbleState();
 }
 
 class _SoloEmojiBubbleState extends State<SoloEmojiBubble>
-    with SingleTickerProviderStateMixin {
-  late final AnimationController _controller = AnimationController(
+    with TickerProviderStateMixin {
+  late final AnimationController _entrance = AnimationController(
     vsync: this,
     duration: SoloEmojiBubble.playDuration,
     value: 1,
   );
-
+  late final AnimationController _idle = AnimationController(
+    vsync: this,
+    duration: SoloEmojiBubble.idleDuration,
+  );
   late final SoloEmojiEffectCategory _category = classifySoloEmojiEffect(
     widget.emoji,
   );
-  late final int _seed = soloEmojiEffectSeed(widget.emoji);
 
   bool _entranceChecked = false;
-  bool _decorActive = false;
 
   bool get _motionAllowed => !MediaQuery.disableAnimationsOf(context);
 
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
-    if (_entranceChecked) return;
+    if (!_motionAllowed) {
+      _entrance.stop();
+      _idle.stop();
+      return;
+    }
+    if (_entranceChecked) {
+      if (!_entrance.isAnimating && !_idle.isAnimating) _startIdle();
+      return;
+    }
     _entranceChecked = true;
-    if (!_motionAllowed) return;
     final ledger = widget.ledger ?? soloEmojiLedger;
-    if (ledger.markPlayed(widget.playbackKey)) _play();
+    if (ledger.markPlayed(widget.playbackKey)) {
+      _play();
+    } else {
+      _startIdle();
+    }
   }
 
   void _play() {
     if (!_motionAllowed) return;
-    setState(() => _decorActive = true);
-    _controller.forward(from: 0).whenComplete(() {
-      if (mounted) setState(() => _decorActive = false);
+    _idle
+      ..stop()
+      ..value = 0;
+    _entrance.forward(from: 0).then<void>((_) {
+      if (mounted && _motionAllowed) _startIdle();
     });
+  }
+
+  void _startIdle() {
+    if (!_motionAllowed || _idle.isAnimating) return;
+    _runIdleCycles(0);
+  }
+
+  Future<void> _runIdleCycles(int completed) async {
+    if (!mounted || !_motionAllowed) return;
+    if (completed >= SoloEmojiBubble.idleCycleCount) {
+      _idle.stop();
+      return;
+    }
+    await _idle.forward(from: 0);
+    if (!mounted || !_motionAllowed) return;
+    await _runIdleCycles(completed + 1);
   }
 
   @override
   void dispose() {
-    _controller.dispose();
+    _entrance.dispose();
+    _idle.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    final brightness = Theme.of(context).brightness;
-    final glowColor = soloEmojiGlowColor(_category, brightness);
-    final particleColor = soloEmojiParticleColor(_category, brightness);
-    final box = widget.fontSize * 1.22;
+    final box = widget.fontSize * 1.7;
 
     return Semantics(
       button: true,
@@ -399,65 +428,47 @@ class _SoloEmojiBubbleState extends State<SoloEmojiBubble>
         onTap: _play,
         child: RepaintBoundary(
           child: SizedBox(
-            width: box * 1.55,
-            height: box * 1.45,
-            child: AnimatedBuilder(
-              animation: _controller,
-              builder: (context, child) {
-                final frame = _controller.isAnimating || _decorActive
-                    ? sampleSoloEmojiMotion(
-                        t: _controller.value,
-                        category: _category,
-                      )
-                    : SoloEmojiMotionFrame.idle;
-                final particles = frame.particleStrength > 0
-                    ? sampleSoloEmojiParticles(
-                        t: _controller.value,
-                        category: _category,
-                        seed: _seed,
-                      )
-                    : const <SoloEmojiParticleSample>[];
-
-                return Stack(
-                  alignment: Alignment.center,
-                  clipBehavior: Clip.none,
-                  children: [
-                    if (frame.glowOpacity > 0.01)
-                      ExcludeSemantics(
-                        child: CustomPaint(
-                          size: Size(box * 1.4, box * 1.4),
-                          painter: SoloEmojiGlowPainter(
-                            color: glowColor,
-                            opacity: frame.glowOpacity,
-                            radiusFactor: frame.glowRadiusFactor,
-                          ),
-                        ),
+            width: box,
+            height: box,
+            child: Center(
+              child: AnimatedBuilder(
+                animation: Listenable.merge([_entrance, _idle]),
+                builder: (context, child) {
+                  final frame = _entrance.isAnimating || _entrance.value < 1
+                      ? sampleSoloEmojiEntrance(
+                          t: _entrance.value,
+                          category: _category,
+                        )
+                      : _motionAllowed
+                      ? sampleSoloEmojiIdle(t: _idle.value, category: _category)
+                      : const SoloEmojiMotionFrame(
+                          scaleX: 1,
+                          scaleY: 1,
+                          translationX: 0,
+                          translationY: 0,
+                          rotationDegrees: 0,
+                          opacity: 1,
+                        );
+                  return Opacity(
+                    opacity: frame.opacity.clamp(0, 1),
+                    child: Transform.translate(
+                      key: const Key('solo-emoji-translation'),
+                      offset: Offset(frame.translationX, frame.translationY),
+                      child: Transform(
+                        key: const Key('solo-emoji-transform'),
+                        alignment: Alignment.center,
+                        transform: Matrix4.identity()
+                          ..rotateZ(frame.rotationDegrees * math.pi / 180)
+                          ..scaleByDouble(frame.scaleX, frame.scaleY, 1.0, 1.0),
+                        child: child,
                       ),
-                    if (particles.isNotEmpty)
-                      ExcludeSemantics(
-                        child: CustomPaint(
-                          size: Size(box * 1.5, box * 1.5),
-                          painter: SoloEmojiParticlePainter(
-                            particles: particles,
-                            color: particleColor,
-                            fontSize: widget.fontSize,
-                          ),
-                        ),
-                      ),
-                    Transform(
-                      key: const Key('solo-emoji-transform'),
-                      alignment: Alignment.center,
-                      transform: Matrix4.identity()
-                        ..rotateZ(frame.rotation)
-                        ..scaleByDouble(frame.scaleX, frame.scaleY, 1.0, 1.0),
-                      child: child,
                     ),
-                  ],
-                );
-              },
-              child: Text(
-                widget.emoji,
-                style: emojiTextStyle(fontSize: widget.fontSize),
+                  );
+                },
+                child: Text(
+                  widget.emoji,
+                  style: emojiTextStyle(fontSize: widget.fontSize),
+                ),
               ),
             ),
           ),
@@ -465,73 +476,4 @@ class _SoloEmojiBubbleState extends State<SoloEmojiBubble>
       ),
     );
   }
-}
-
-class SoloEmojiGlowPainter extends CustomPainter {
-  SoloEmojiGlowPainter({
-    required this.color,
-    required this.opacity,
-    required this.radiusFactor,
-  });
-
-  final Color color;
-  final double opacity;
-  final double radiusFactor;
-
-  @override
-  void paint(Canvas canvas, Size size) {
-    if (opacity <= 0) return;
-    final center = Offset(size.width / 2, size.height / 2);
-    final radius = size.shortestSide * 0.5 * radiusFactor;
-    final paint = Paint()
-      ..shader = RadialGradient(
-        colors: [
-          color.withValues(alpha: opacity),
-          color.withValues(alpha: opacity * 0.35),
-          color.withValues(alpha: 0),
-        ],
-        stops: const [0, 0.55, 1],
-      ).createShader(Rect.fromCircle(center: center, radius: radius));
-    canvas.drawCircle(center, radius, paint);
-  }
-
-  @override
-  bool shouldRepaint(covariant SoloEmojiGlowPainter oldDelegate) =>
-      oldDelegate.color != color ||
-      oldDelegate.opacity != opacity ||
-      oldDelegate.radiusFactor != radiusFactor;
-}
-
-class SoloEmojiParticlePainter extends CustomPainter {
-  SoloEmojiParticlePainter({
-    required this.particles,
-    required this.color,
-    required this.fontSize,
-  });
-
-  final List<SoloEmojiParticleSample> particles;
-  final Color color;
-  final double fontSize;
-
-  @override
-  void paint(Canvas canvas, Size size) {
-    if (particles.isEmpty) return;
-    final center = Offset(size.width / 2, size.height / 2);
-    final unit = fontSize * 0.42;
-    final paint = Paint()..style = PaintingStyle.fill;
-    for (final p in particles) {
-      paint.color = color.withValues(alpha: p.opacity.clamp(0, 1));
-      canvas.drawCircle(
-        center + Offset(p.dx * unit, p.dy * unit),
-        p.radius,
-        paint,
-      );
-    }
-  }
-
-  @override
-  bool shouldRepaint(covariant SoloEmojiParticlePainter oldDelegate) =>
-      oldDelegate.particles != particles ||
-      oldDelegate.color != color ||
-      oldDelegate.fontSize != fontSize;
 }

@@ -332,6 +332,7 @@ class CallService extends ChangeNotifier {
   Future<void> acceptIncoming() async {
     final session = active;
     if (session == null || session.phase != CallPhase.incoming) return;
+    onIncomingEnded?.call(session.callId);
     try {
       session.phase = CallPhase.connecting;
       notifyListeners();
@@ -474,6 +475,9 @@ class CallService extends ChangeNotifier {
           session.deliveryState,
         );
         _armOutgoingTimeout(session);
+        // Delivery decides whether the ringback keeps going, and it arrives
+        // without the phase moving, so the tones need telling directly.
+        await _syncCallAudio(session);
         notifyListeners();
         break;
 
@@ -685,6 +689,7 @@ class CallService extends ChangeNotifier {
     await CallAudioController.instance.syncAlerts(
       phase: session.phase,
       conversationMuted: muted,
+      delivery: session.deliveryState,
     );
     if (session.phase == CallPhase.connecting ||
         session.phase == CallPhase.active) {

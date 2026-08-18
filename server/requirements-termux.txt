@@ -5,7 +5,7 @@
 # NOTE: pydantic-core still compiles via Rust here (FastAPI requires pydantic),
 # so `export ANDROID_API_LEVEL=24` is required before installing.
 fastapi>=0.115.0
-uvicorn[standard]>=0.32.0
+uvicorn>=0.32.0
 sqlalchemy>=2.0.36
 pydantic>=2.10.0
 python-jose>=3.3.0

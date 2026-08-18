@@ -16,9 +16,8 @@ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 # https://developer.apple.com/library/archive/documentation/General/Reference/InfoPlistKeyReference/Articles/CoreFoundationKeys.html
 # In Windows, build-name is used as the major, minor, and patch parts
 # of the product and file versions while build-number is used as the build suffix.
-# Version name stays 1.5.x; the build number rises so the APK installs cleanly
-# over the previous one.
-version: 1.7.1+24
+# The build number rises so the APK installs cleanly over the previous one.
+version: 1.8.3+36
 
 environment:
   sdk: ^3.12.2
@@ -64,6 +63,8 @@ dependencies:
   flutter_webrtc: ^1.6.0
   wechat_assets_picker: ^10.1.3
   photo_manager: ^3.12.0
+  cached_network_image: ^3.4.1
+  flutter_cache_manager: ^3.4.2
 dev_dependencies:
   flutter_test:
     sdk: flutter

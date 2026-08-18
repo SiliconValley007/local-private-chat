@@ -6,25 +6,40 @@ from collections.abc import Generator
 
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.pool import NullPool
 
 from app.base import Base
-from app.config import DATABASE_URL, ensure_dirs
+from app.config import DATABASE_URL, LOW_MEMORY, SQLITE_CACHE_KB, ensure_dirs
 
 __all__ = ["Base", "SessionLocal", "engine", "get_db", "init_db"]
 
 
 ensure_dirs()
 
-engine = create_engine(
-    DATABASE_URL,
-    connect_args={"check_same_thread": False},
-)
+# NullPool on a phone: no idle SQLite connections sitting around between
+# requests. A home chat server has a handful of clients, so the cost of opening
+# a connection per checkout is cheaper than holding page caches for each one.
+_engine_kwargs: dict = {
+    "connect_args": {"check_same_thread": False, "timeout": 30},
+}
+if LOW_MEMORY:
+    _engine_kwargs["poolclass"] = NullPool
 
-# SQLite foreign keys
+engine = create_engine(DATABASE_URL, **_engine_kwargs)
+
+
 @event.listens_for(engine, "connect")
 def _set_sqlite_pragma(dbapi_connection, _connection_record) -> None:
     cursor = dbapi_connection.cursor()
     cursor.execute("PRAGMA foreign_keys=ON")
+    # WAL lets a WebSocket write and a REST read overlap without blocking.
+    cursor.execute("PRAGMA journal_mode=WAL")
+    cursor.execute("PRAGMA synchronous=NORMAL")
+    # Negative cache_size is kilobytes; keeps SQLite from eating phone RAM.
+    cursor.execute(f"PRAGMA cache_size=-{SQLITE_CACHE_KB}")
+    cursor.execute("PRAGMA temp_store=FILE")
+    if LOW_MEMORY:
+        cursor.execute("PRAGMA mmap_size=0")
     cursor.close()
 
 
@@ -68,6 +83,7 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("conversations", "wallpaper_set_at", "DATETIME"),
     ("conversations", "disappear_after_seconds", "INTEGER"),
     ("conversations", "anniversary_on", "TEXT"),
+    ("users", "token_version", "INTEGER NOT NULL DEFAULT 0"),
 )
 
 

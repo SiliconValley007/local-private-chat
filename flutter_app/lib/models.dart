@@ -1,3 +1,5 @@
+import 'dart:ui' show Size;
+
 import 'time_format.dart';
 
 class ChatUser {
@@ -171,6 +173,8 @@ class ChatMessage {
     this.mediaSize,
     this.mediaMime,
     this.mediaDurationMs,
+    this.mediaWidth,
+    this.mediaHeight,
     this.clientId,
     required this.createdAt,
     this.editedAt,
@@ -195,6 +199,19 @@ class ChatMessage {
 
   /// Video length in milliseconds, when known (videos only).
   final int? mediaDurationMs;
+
+  /// Pixel size of the preview, when the server could read it.
+  ///
+  /// Sizing a row from this instead of waiting for the decode is what stops the
+  /// transcript shifting under the reader as pictures arrive.
+  final int? mediaWidth;
+  final int? mediaHeight;
+
+  /// Preview shape in pixels, or null while it is unknown.
+  Size? get mediaShape => mediaWidth != null && mediaHeight != null
+      ? Size(mediaWidth!.toDouble(), mediaHeight!.toDouble())
+      : null;
+
   final String? clientId;
   final DateTime createdAt;
   final DateTime? editedAt;
@@ -242,6 +259,8 @@ class ChatMessage {
       mediaSize: json['media_size'] as int?,
       mediaMime: json['media_mime'] as String?,
       mediaDurationMs: json['media_duration_ms'] as int?,
+      mediaWidth: json['media_width'] as int?,
+      mediaHeight: json['media_height'] as int?,
       clientId: json['client_id'] as String?,
       createdAt: parseServerTime(json['created_at'] as String),
       editedAt: tryParseServerTime(json['edited_at'] as String?),
@@ -265,6 +284,8 @@ class ChatMessage {
     int? mediaSize,
     String? mediaMime,
     int? mediaDurationMs,
+    int? mediaWidth,
+    int? mediaHeight,
     DateTime? editedAt,
     DateTime? deletedAt,
     DateTime? expiresAt,
@@ -287,6 +308,8 @@ class ChatMessage {
       mediaSize: mediaSize ?? this.mediaSize,
       mediaMime: mediaMime ?? this.mediaMime,
       mediaDurationMs: mediaDurationMs ?? this.mediaDurationMs,
+      mediaWidth: mediaWidth ?? this.mediaWidth,
+      mediaHeight: mediaHeight ?? this.mediaHeight,
       clientId: clientId,
       createdAt: createdAt,
       editedAt: clearEditedAt ? null : (editedAt ?? this.editedAt),

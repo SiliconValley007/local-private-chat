@@ -1,3 +1,4 @@
+import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
 
 import '../theme.dart';
@@ -84,9 +85,17 @@ class Avatar extends StatelessWidget {
     Widget content = fallback;
     if (imageUrl != null) {
       content = ClipOval(
-        child: Image.network(
-          imageUrl!,
-          headers: imageHeaders,
+        child: Image(
+          image: ResizeImage(
+            CachedNetworkImageProvider(
+              imageUrl!,
+              headers: imageHeaders ?? const {},
+            ),
+            width: (radius * 2 * MediaQuery.devicePixelRatioOf(context))
+                .round(),
+            height: (radius * 2 * MediaQuery.devicePixelRatioOf(context))
+                .round(),
+          ),
           width: radius * 2,
           height: radius * 2,
           fit: BoxFit.cover,

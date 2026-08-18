@@ -6,6 +6,7 @@ import '../app_state.dart';
 import '../chat_navigation.dart';
 import '../errors.dart';
 import '../invite_flow.dart';
+import '../load_state.dart';
 import '../models.dart';
 import '../services/theme_store.dart';
 import '../theme.dart';
@@ -16,12 +17,15 @@ import '../widgets/change_password_dialog.dart';
 import '../widgets/receipt_ticks.dart';
 import '../widgets/rename_dialog.dart';
 import '../widgets/error_banner.dart';
+import '../widgets/loading_placeholders.dart';
+import 'activity_log_screen.dart';
 import 'backup_screen.dart';
 import 'global_search_screen.dart';
 import 'new_chat_screen.dart';
 import 'new_group_screen.dart';
 import 'privacy_onboarding_screen.dart';
 import 'qr_invite_screen.dart';
+import 'server_info_screen.dart';
 import 'server_setup_screen.dart';
 import 'self_profile_screen.dart';
 import 'share_target_screen.dart';
@@ -37,6 +41,7 @@ class InboxScreen extends StatefulWidget {
 
 class _InboxScreenState extends State<InboxScreen> {
   final _search = TextEditingController();
+  final _searchFocus = FocusNode();
   String _query = '';
 
   /// True while a share picker or invite prompt is on screen, so a rebuild
@@ -55,7 +60,13 @@ class _InboxScreenState extends State<InboxScreen> {
   @override
   void dispose() {
     _search.dispose();
+    _searchFocus.dispose();
     super.dispose();
+  }
+
+  /// Lets go of the search box, closing the keyboard with it.
+  void _dropSearchFocus() {
+    if (_searchFocus.hasFocus) _searchFocus.unfocus();
   }
 
   /// Picks up whatever Android handed the app: a share to forward into a chat,
@@ -320,6 +331,17 @@ class _InboxScreenState extends State<InboxScreen> {
       case 'password':
         if (!mounted) return;
         await showChangePasswordDialog(context);
+      case 'server_status':
+        await navigator.push(
+          MaterialPageRoute(builder: (_) => const ServerInfoScreen()),
+        );
+      case 'activity_log':
+        await navigator.push(
+          MaterialPageRoute(builder: (_) => const ActivityLogScreen()),
+        );
+        // The role may have been claimed or handed on in there, which decides
+        // whether this entry is still offered.
+        await state.refreshAdminStatus(force: true);
       case 'settings':
         await navigator.push(
           MaterialPageRoute(builder: (_) => const ServerSetupScreen()),
@@ -386,6 +408,12 @@ class _InboxScreenState extends State<InboxScreen> {
       WidgetsBinding.instance.addPostFrameCallback((_) => _routeHandoffs());
     }
     final conversations = _visible(state, state.conversations);
+    // A search that matches nothing is genuinely empty, whatever the inbox is
+    // doing, so only an unfiltered list waits on the first load.
+    final inboxView = collectionView(
+      phase: _query.trim().isEmpty ? state.inboxPhase : LoadPhase.ready,
+      isEmpty: conversations.isEmpty,
+    );
     final unreadTotal = state.conversations.fold<int>(
       0,
       (sum, c) => sum + c.unreadCount,
@@ -460,8 +488,8 @@ class _InboxScreenState extends State<InboxScreen> {
             tooltip: 'More',
             position: PopupMenuPosition.under,
             onSelected: _onMenuSelected,
-            itemBuilder: (_) => const [
-              PopupMenuItem(
+            itemBuilder: (_) => [
+              const PopupMenuItem(
                 value: 'search_all',
                 child: ListTile(
                   dense: true,
@@ -470,7 +498,7 @@ class _InboxScreenState extends State<InboxScreen> {
                   title: Text('Search all messages'),
                 ),
               ),
-              PopupMenuItem(
+              const PopupMenuItem(
                 value: 'starred',
                 child: ListTile(
                   dense: true,
@@ -479,7 +507,7 @@ class _InboxScreenState extends State<InboxScreen> {
                   title: Text('Starred messages'),
                 ),
               ),
-              PopupMenuItem(
+              const PopupMenuItem(
                 value: 'appearance',
                 child: ListTile(
                   dense: true,
@@ -488,7 +516,7 @@ class _InboxScreenState extends State<InboxScreen> {
                   title: Text('Appearance'),
                 ),
               ),
-              PopupMenuItem(
+              const PopupMenuItem(
                 value: 'media',
                 child: ListTile(
                   dense: true,
@@ -497,7 +525,7 @@ class _InboxScreenState extends State<InboxScreen> {
                   title: Text('Media downloads'),
                 ),
               ),
-              PopupMenuItem(
+              const PopupMenuItem(
                 value: 'qr',
                 child: ListTile(
                   dense: true,
@@ -506,7 +534,7 @@ class _InboxScreenState extends State<InboxScreen> {
                   title: Text('My invite QR'),
                 ),
               ),
-              PopupMenuItem(
+              const PopupMenuItem(
                 value: 'backup',
                 child: ListTile(
                   dense: true,
@@ -515,7 +543,7 @@ class _InboxScreenState extends State<InboxScreen> {
                   title: Text('Backup & restore'),
                 ),
               ),
-              PopupMenuItem(
+              const PopupMenuItem(
                 value: 'privacy_tips',
                 child: ListTile(
                   dense: true,
@@ -524,7 +552,7 @@ class _InboxScreenState extends State<InboxScreen> {
                   title: Text('Show privacy tips'),
                 ),
               ),
-              PopupMenuItem(
+              const PopupMenuItem(
                 value: 'password',
                 child: ListTile(
                   dense: true,
@@ -533,7 +561,28 @@ class _InboxScreenState extends State<InboxScreen> {
                   title: Text('Change password'),
                 ),
               ),
-              PopupMenuItem(
+              const PopupMenuItem(
+                value: 'server_status',
+                child: ListTile(
+                  dense: true,
+                  contentPadding: EdgeInsets.zero,
+                  leading: Icon(Icons.monitor_heart_outlined),
+                  title: Text('Server status'),
+                ),
+              ),
+              // Only for the admin, and for anyone at all while nobody holds the
+              // role — that is how the first admin appoints themselves.
+              if (state.offersActivityLog)
+                const PopupMenuItem(
+                  value: 'activity_log',
+                  child: ListTile(
+                    dense: true,
+                    contentPadding: EdgeInsets.zero,
+                    leading: Icon(Icons.fact_check_outlined),
+                    title: Text('Activity log'),
+                  ),
+                ),
+              const PopupMenuItem(
                 value: 'settings',
                 child: ListTile(
                   dense: true,
@@ -542,7 +591,7 @@ class _InboxScreenState extends State<InboxScreen> {
                   title: Text('Server settings'),
                 ),
               ),
-              PopupMenuItem(
+              const PopupMenuItem(
                 value: 'logout',
                 child: ListTile(
                   dense: true,
@@ -561,123 +610,145 @@ class _InboxScreenState extends State<InboxScreen> {
         tooltip: 'Start a chat',
         child: const Icon(Icons.edit_rounded),
       ),
-      body: Column(
-        children: [
-          if (state.error != null)
-            Padding(
-              padding: const EdgeInsets.fromLTRB(16, 10, 16, 0),
-              child: ErrorBanner(
-                message: state.error!,
-                onRetry: () {
-                  state.clearError();
-                  state.refreshInbox();
-                },
+      // A tap on the list, on a chat, or on the empty space around them should
+      // put the keyboard away, like every other chat app.
+      body: GestureDetector(
+        behavior: HitTestBehavior.translucent,
+        onTap: _dropSearchFocus,
+        child: Column(
+          children: [
+            if (state.error != null)
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 10, 16, 0),
+                child: ErrorBanner(
+                  message: state.error!,
+                  onRetry: () {
+                    state.clearError();
+                    state.refreshInbox();
+                  },
+                ),
               ),
-            ),
-          if (state.showReconnecting)
-            Padding(
-              padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
-              child: Center(
-                child: Chip(
-                  avatar: Icon(
-                    Icons.sync_rounded,
-                    size: 16,
-                    color: Colors.amber.shade900,
-                  ),
-                  label: Text(
-                    'Reconnecting to server…',
-                    style: theme.textTheme.labelMedium?.copyWith(
+            if (state.showReconnecting)
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+                child: Center(
+                  child: Chip(
+                    avatar: Icon(
+                      Icons.sync_rounded,
+                      size: 16,
                       color: Colors.amber.shade900,
-                      fontWeight: FontWeight.w600,
                     ),
+                    label: Text(
+                      'Reconnecting to server…',
+                      style: theme.textTheme.labelMedium?.copyWith(
+                        color: Colors.amber.shade900,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                    backgroundColor: Colors.amber.withValues(alpha: 0.14),
+                    side: BorderSide(color: Colors.amber.shade700),
+                    visualDensity: VisualDensity.compact,
+                    materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
                   ),
-                  backgroundColor: Colors.amber.withValues(alpha: 0.14),
-                  side: BorderSide(color: Colors.amber.shade700),
-                  visualDensity: VisualDensity.compact,
-                  materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                ),
+              ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
+              child: TextField(
+                controller: _search,
+                focusNode: _searchFocus,
+                onChanged: (value) => setState(() => _query = value),
+                onTapOutside: (_) => _dropSearchFocus(),
+                onSubmitted: (_) => _dropSearchFocus(),
+                textInputAction: TextInputAction.search,
+                decoration: InputDecoration(
+                  hintText: 'Search chats',
+                  prefixIcon: const Icon(Icons.search_rounded, size: 20),
+                  suffixIcon: _query.isEmpty
+                      ? null
+                      : IconButton(
+                          icon: const Icon(Icons.close_rounded, size: 18),
+                          onPressed: () {
+                            _search.clear();
+                            _dropSearchFocus();
+                            setState(() => _query = '');
+                          },
+                        ),
+                  border: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(AppRadius.pill),
+                    borderSide: BorderSide.none,
+                  ),
+                  enabledBorder: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(AppRadius.pill),
+                    borderSide: BorderSide.none,
+                  ),
+                  focusedBorder: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(AppRadius.pill),
+                    borderSide: BorderSide(color: scheme.primary, width: 1.4),
+                  ),
                 ),
               ),
             ),
-          Padding(
-            padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
-            child: TextField(
-              controller: _search,
-              onChanged: (value) => setState(() => _query = value),
-              textInputAction: TextInputAction.search,
-              decoration: InputDecoration(
-                hintText: 'Search chats',
-                prefixIcon: const Icon(Icons.search_rounded, size: 20),
-                suffixIcon: _query.isEmpty
-                    ? null
-                    : IconButton(
-                        icon: const Icon(Icons.close_rounded, size: 18),
-                        onPressed: () {
-                          _search.clear();
-                          setState(() => _query = '');
+            Expanded(
+              child: RefreshIndicator(
+                onRefresh: state.refreshInbox,
+                // A chat list that has not answered yet is not an empty one, so
+                // stand-in rows wait rather than inviting you to start your first
+                // chat over history that is seconds away.
+                child: inboxView == CollectionView.skeleton
+                    ? const ListSkeleton(label: 'Loading chats')
+                    : inboxView == CollectionView.empty
+                    ? _InboxEmptyState(
+                        searching: _query.trim().isNotEmpty,
+                        onStart: _startNew,
+                      )
+                    : ListView.separated(
+                        padding: const EdgeInsets.fromLTRB(12, 8, 12, 96),
+                        keyboardDismissBehavior:
+                            ScrollViewKeyboardDismissBehavior.onDrag,
+                        itemCount: conversations.length,
+                        separatorBuilder: (_, _) => const SizedBox(height: 6),
+                        itemBuilder: (context, index) {
+                          final conv = conversations[index];
+                          return _ConversationTile(
+                            conversation: conv,
+                            title: state.titleFor(conv),
+                            avatarUrl: conv.type == 'dm'
+                                ? state.avatarUrlFor(conv.peer?.id)
+                                : null,
+                            avatarHeaders: state.api.imageAuthHeaders,
+                            timeLabel: formatListTimestamp(
+                              context,
+                              conv.updatedAt,
+                            ),
+                            online: conv.type == 'dm' && conv.peer != null
+                                ? (state.onlineByUser[conv.peer!.id] ??
+                                      conv.peer!.isOnline)
+                                : null,
+                            fromMe: conv.lastMessage?.senderId == state.me?.id,
+                            receiptLevel: state.inboxReceiptLevelFor(conv),
+                            previewText:
+                                state.typingLabelFor(conv) ??
+                                state.previewFor(conv),
+                            previewIsTyping: state.typingLabelFor(conv) != null,
+                            pinned: state.isPinned(conv.id),
+                            muted: state.isMuted(conv.id),
+                            onTap: () {
+                              // The row wins the tap over the wrapper, so the
+                              // keyboard has to be dismissed here too.
+                              _dropSearchFocus();
+                              pushChat(context, conversation: conv);
+                            },
+                            onLongPress: () => _showConversationActions(conv),
+                            onAvatarTap: () =>
+                                _viewConversationAvatar(state, conv),
+                          );
                         },
                       ),
-                border: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(AppRadius.pill),
-                  borderSide: BorderSide.none,
-                ),
-                enabledBorder: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(AppRadius.pill),
-                  borderSide: BorderSide.none,
-                ),
-                focusedBorder: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(AppRadius.pill),
-                  borderSide: BorderSide(color: scheme.primary, width: 1.4),
-                ),
               ),
             ),
-          ),
-          Expanded(
-            child: RefreshIndicator(
-              onRefresh: state.refreshInbox,
-              child: conversations.isEmpty
-                  ? _InboxEmptyState(
-                      searching: _query.trim().isNotEmpty,
-                      onStart: _startNew,
-                    )
-                  : ListView.separated(
-                      padding: const EdgeInsets.fromLTRB(12, 8, 12, 96),
-                      itemCount: conversations.length,
-                      separatorBuilder: (_, _) => const SizedBox(height: 6),
-                      itemBuilder: (context, index) {
-                        final conv = conversations[index];
-                        return _ConversationTile(
-                          conversation: conv,
-                          title: state.titleFor(conv),
-                          avatarUrl: conv.type == 'dm'
-                              ? state.avatarUrlFor(conv.peer?.id)
-                              : null,
-                          avatarHeaders: state.api.imageAuthHeaders,
-                          timeLabel: formatListTimestamp(
-                            context,
-                            conv.updatedAt,
-                          ),
-                          online: conv.type == 'dm' && conv.peer != null
-                              ? (state.onlineByUser[conv.peer!.id] ??
-                                    conv.peer!.isOnline)
-                              : null,
-                          fromMe: conv.lastMessage?.senderId == state.me?.id,
-                          receiptLevel: state.inboxReceiptLevelFor(conv),
-                          previewText:
-                              state.typingLabelFor(conv) ??
-                              state.previewFor(conv),
-                          previewIsTyping: state.typingLabelFor(conv) != null,
-                          pinned: state.isPinned(conv.id),
-                          muted: state.isMuted(conv.id),
-                          onTap: () => pushChat(context, conversation: conv),
-                          onLongPress: () => _showConversationActions(conv),
-                          onAvatarTap: () =>
-                              _viewConversationAvatar(state, conv),
-                        );
-                      },
-                    ),
-            ),
-          ),
-        ],
+          ],
+        ),
       ),
     );
   }

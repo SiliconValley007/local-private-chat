@@ -109,9 +109,9 @@ int emojiOnlyCount(String? text) {
 
 /// Font size for an emoji-only message, or null to render it as normal text.
 double? emojiOnlyFontSize(int count) => switch (count) {
-  1 => 46,
-  2 => 38,
-  3 => 32,
+  1 => 60,
+  2 => 52,
+  3 => 48,
   4 || 5 || 6 => 24,
   _ => null,
 };

@@ -2,14 +2,18 @@ import 'dart:async';
 import 'dart:io';
 
 // material.dart (not widgets.dart) for ThemeMode, which lives in Material.
+import 'package:flutter_cache_manager/flutter_cache_manager.dart';
 import 'package:flutter/material.dart';
 import 'package:uuid/uuid.dart';
 
 import 'api_client.dart';
 import 'app_config.dart';
+import 'audit.dart';
 import 'chat_navigation.dart';
 import 'doodle_stroke.dart';
+import 'e2e_text.dart';
 import 'errors.dart';
+import 'load_state.dart';
 import 'media_review.dart';
 import 'message_merge.dart';
 import 'message_preview.dart';
@@ -33,7 +37,10 @@ import 'services/tailscale_assist.dart';
 import 'services/tailscale_prefs_store.dart';
 import 'services/theme_store.dart';
 import 'services/video_thumbnail_service.dart';
+import 'services/voice_player.dart';
+import 'theme.dart';
 import 'time_format.dart';
+import 'upload_limits.dart';
 
 /// Formats typing indicator copy for DM/group chats.
 ///
@@ -51,9 +58,12 @@ String? formatTypingLabel({
   return '${typerNames[0]} and ${typerNames.length - 1} others are typing…';
 }
 
-/// Fixed height ratio for chat image bubbles so async decode does not grow
-/// the list and yank the bottom anchor upward.
-const double chatImageHeightRatio = 0.72;
+/// Page size used when a search sweeps a chat's history (the server's maximum).
+const int searchHistoryPageSize = 100;
+
+/// Upper bound on those pages, so a server that keeps answering cannot spin
+/// this forever. Ten thousand messages is far past any real chat here.
+const int searchHistoryPageBudget = 100;
 
 class AppState extends ChangeNotifier with WidgetsBindingObserver {
   AppState(
@@ -84,6 +94,9 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     calls.addListener(notifyListeners);
     realtime.addHandler(_onEvent);
     realtime.onAuthFailure = _onSessionRejected;
+    api.onSessionRejected = () {
+      unawaited(_onSessionRejected());
+    };
     realtime.onConnectionChanged = _onRealtimeConnectionChanged;
     WidgetsBinding.instance.addObserver(this);
   }
@@ -151,6 +164,13 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
 
   int _healthTicks = 0;
   bool _checkInFlight = false;
+  bool _checkCoalesced = false;
+  bool _coalescedQuick = true;
+  bool _coalescedNudge = false;
+
+  int _tailscalePhaseWriteSeq = 0;
+  bool _settleForcedNudge = false;
+  bool _detachedDisconnectSent = false;
 
   /// How long [TailscaleOwnershipPhase.pendingConnect] may wait before routing
   /// that appears is treated as someone else's tunnel.
@@ -178,6 +198,28 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   /// conversationId -> pin/mute prefs for this phone only.
   Map<int, ConversationPrefs> conversationPrefs = {};
   final Map<int, List<ChatMessage>> messagesByConv = {};
+
+  /// Conversations whose history has answered at least once this session.
+  ///
+  /// Emptiness alone cannot tell a brand-new chat from one that has not replied
+  /// yet, and guessing paints "Say hello to …" over history that is about to
+  /// arrive. Screens ask here before claiming a transcript is empty.
+  final Set<int> _resolvedConversations = {};
+
+  /// Whether the inbox itself has answered, for the same reason.
+  bool _inboxResolved = false;
+
+  /// Whether a chat may be described as empty rather than still loading.
+  LoadPhase conversationPhase(int conversationId) => loadPhaseFor(
+    resolved: _resolvedConversations.contains(conversationId),
+    hasCached: messagesByConv[conversationId]?.isNotEmpty ?? false,
+  );
+
+  /// Whether the chat list may be described as empty rather than still loading.
+  LoadPhase get inboxPhase => loadPhaseFor(
+    resolved: _inboxResolved,
+    hasCached: conversations.isNotEmpty,
+  );
 
   /// Sticky-pinned messages per conversation (Telegram-style banner).
   final Map<int, List<ChatMessage>> pinsByConv = {};
@@ -262,7 +304,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       showReconnecting = false;
       final active = activeConversationId;
       if (active != null && isLoggedIn) {
-        unawaited(syncConversation(active, markRead: true));
+        syncInBackground(active, markRead: true);
       }
     } else {
       clearAllTyping();
@@ -299,6 +341,9 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   bool isMuted(int conversationId) =>
       conversationPrefs[conversationId]?.muted ?? false;
 
+  bool coupleDetailsEnabled(int conversationId) =>
+      conversationPrefs[conversationId]?.coupleDetailsEnabled ?? false;
+
   /// Applies an appearance choice and remembers it for future launches.
   Future<void> setThemeMode(ThemeMode mode) async {
     if (mode == themeMode) return;
@@ -318,11 +363,9 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     await _restoreTailscaleSessionFromNative();
     NotificationService.instance.onTokenRefresh = _onFcmTokenRefreshed;
     NotificationService.instance.onForegroundMessagePush = (conversationId) {
-      unawaited(
-        syncConversation(
-          conversationId,
-          markRead: activeConversationId == conversationId,
-        ),
+      syncInBackground(
+        conversationId,
+        markRead: activeConversationId == conversationId,
       );
     };
     NotificationService.instance.onIncomingCallPush = (pending) {
@@ -353,16 +396,23 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
 
   /// Polls the server so the gate screen reacts when it comes back up.
   ///
-  /// Deliberately faster while the link is down — a 12s wait after Tailscale
-  /// connects felt like the app had not noticed. Paused while the app is in the
-  /// background to spare battery and mobile data.
+  /// Reachable: a cheap probe every 15s. Unreachable: every 9s with backoff
+  /// room via `_checkInFlight`. Both paths stop entirely while the app is in
+  /// the background so the radio and CPU stay quiet.
   void _startHealthChecks() {
     _healthTimer?.cancel();
     _healthTicks = 0;
     _healthTimer = Timer.periodic(const Duration(seconds: 3), (_) {
       _healthTicks++;
-      if (serverReachable && _healthTicks % 4 != 0) return;
-      refreshConnectivity();
+      if (serverReachable) {
+        // Once every 15 seconds while the link is healthy.
+        if (_healthTicks % 5 != 0) return;
+        unawaited(refreshConnectivity(nudgeTailscale: false, quick: true));
+        return;
+      }
+      // Every 9 seconds while recovering — still responsive, not thrashing.
+      if (_healthTicks % 3 != 0) return;
+      unawaited(refreshConnectivity(quick: true));
     });
   }
 
@@ -382,11 +432,13 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     return sent;
   }
 
-  /// Loads native ownership, retries an interrupted owned disconnect, and syncs
-  /// the exit rule without discarding a durable [owned] claim from a prior run.
+  /// Loads native ownership and syncs the exit rule without discarding a durable
+  /// [owned] claim from a prior run.
+  ///
+  /// Reopening means the user now wants the tunnel up. Retrying the previous
+  /// exit's DISCONNECT here races the CONNECT sent moments later.
   Future<void> _restoreTailscaleSessionFromNative() async {
     _lastTunnelRouting = null;
-    await tailscale.retryInterruptedDisconnect();
     await _syncTailscalePhaseFromNative();
     await tailscale.setExitPolicy(
       enabled: tailscalePrefs.autoDisconnectOnExit,
@@ -396,6 +448,16 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
 
   Future<void> _syncTailscalePhaseFromNative() async {
     final snap = await tailscale.readOwnershipSnapshot();
+    if (!TailscaleAssist.shouldAcceptNativePhase(
+      local: _tailscalePhase,
+      native: snap.phase,
+    )) {
+      if (_tailscalePhase == TailscaleOwnershipPhase.pendingConnect &&
+          snap.connectRequestedAt != null) {
+        _connectRequestedAt = snap.connectRequestedAt;
+      }
+      return;
+    }
     _tailscalePhase = snap.phase;
     _connectRequestedAt = snap.connectRequestedAt;
     await TailscalePrefsStore.savePhase(_tailscalePhase);
@@ -406,6 +468,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
         phase != TailscaleOwnershipPhase.pendingConnect) {
       return;
     }
+    final seq = ++_tailscalePhaseWriteSeq;
     _tailscalePhase = phase;
     if (phase != TailscaleOwnershipPhase.pendingConnect) {
       if (phase != TailscaleOwnershipPhase.owned) {
@@ -414,10 +477,12 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     }
     notifyListeners();
     await TailscalePrefsStore.savePhase(phase);
+    if (seq != _tailscalePhaseWriteSeq) return;
     await tailscale.setExitPolicy(
       enabled: tailscalePrefs.autoDisconnectOnExit,
       phase: phase,
     );
+    if (seq != _tailscalePhaseWriteSeq) return;
     if (phase == TailscaleOwnershipPhase.owned) {
       await tailscale.markOwnedNative();
     } else if (phase == TailscaleOwnershipPhase.unowned) {
@@ -442,7 +507,17 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     notifyListeners();
     final deadline = DateTime.now().add(budget);
     try {
-      await _nudgeTailscale();
+      if (!_settleForcedNudge) {
+        _settleForcedNudge = true;
+        final sent = await _nudgeTailscale(force: true);
+        if (!sent && DateTime.now().isBefore(deadline)) {
+          // A reopen within the native exit guard is expected to be rejected
+          // once. Retry just after that short guard rather than waiting for the
+          // nine-second background health tick.
+          await Future<void>.delayed(const Duration(milliseconds: 3200));
+          await _nudgeTailscale(force: true);
+        }
+      }
       while (!serverReachable && DateTime.now().isBefore(deadline)) {
         await Future<void>.delayed(const Duration(milliseconds: 700));
         // Cheap probes here: this loop only needs to spot the moment the tunnel
@@ -453,6 +528,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       // The background health timer will continue patient checks if needed.
     } finally {
       settling = false;
+      _settleForcedNudge = false;
       notifyListeners();
     }
   }
@@ -503,15 +579,26 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     bool nudgeTailscale = true,
     bool quick = false,
   }) async {
-    if (nudgeTailscale && !serverReachable) {
-      await _nudgeTailscale();
+    if (_checkInFlight) {
+      _checkCoalesced = true;
+      _coalescedQuick = TailscaleAssist.mergeCoalescedQuick(
+        existing: _coalescedQuick,
+        incoming: quick,
+      );
+      _coalescedNudge = TailscaleAssist.mergeCoalescedNudge(
+        existing: _coalescedNudge,
+        incoming: nudgeTailscale,
+      );
+      return;
     }
-    if (_checkInFlight) return; // Timer ticks must not stack up on each other.
     _checkInFlight = true;
     checkingConnectivity = true;
     notifyListeners();
     final ServerCheck check;
     try {
+      if (nudgeTailscale && !serverReachable) {
+        await _nudgeTailscale();
+      }
       check = quick
           ? await connectivity.check(
               timeout: const Duration(seconds: 3),
@@ -529,6 +616,16 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     notifyListeners();
     if (serverReachable && wasDown && isLoggedIn) {
       await _afterLogin();
+    }
+    if (_checkCoalesced) {
+      _checkCoalesced = false;
+      final againQuick = _coalescedQuick;
+      final againNudge = _coalescedNudge;
+      _coalescedQuick = true;
+      _coalescedNudge = false;
+      unawaited(
+        refreshConnectivity(nudgeTailscale: againNudge, quick: againQuick),
+      );
     }
   }
 
@@ -649,19 +746,24 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
         unawaited(calls.syncActiveCallAudio());
       case AppLifecycleState.paused:
       case AppLifecycleState.detached:
+      case AppLifecycleState.hidden:
         unawaited(calls.onAppLifecycleBackground());
         // Let the socket go while the app is away. Android can freeze our
         // isolate at any moment, and a socket that looks alive to the server
         // means it skips the push notification — so nothing would be shown.
         _healthTimer?.cancel();
         realtime.disconnect();
+        clearAllTyping();
+        unawaited(VoicePlayer.instance.stop());
         // This drop is deliberate, so it must not leave a warning waiting to
         // appear on the next resume.
         _reconnectNotice?.cancel();
         showReconnecting = false;
         if (state == AppLifecycleState.detached) _onDetached();
       case AppLifecycleState.inactive:
-      case AppLifecycleState.hidden:
+        // Brief OS overlays (incoming call UI, permission sheets). Do not drop
+        // the socket here — that would reconnect for every system dialog.
+        clearAllTyping();
         break;
     }
   }
@@ -679,7 +781,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       await refreshInbox();
       final active = activeConversationId;
       if (active != null) {
-        unawaited(syncConversation(active, markRead: true));
+        syncInBackground(active, markRead: true);
       }
       unawaited(calls.recoverPendingCalls());
       _consumePendingCall();
@@ -691,13 +793,16 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   /// Android usually kills the isolate before this finishes, which is why the
   /// native side holds the same rule and sends the broadcast on task removal.
   void _onDetached() {
+    if (_detachedDisconnectSent) return;
     if (!TailscaleAssist.shouldDisconnectOnExit(
       enabled: tailscalePrefs.autoDisconnectOnExit,
       phase: _tailscalePhase,
     )) {
       return;
     }
-    // Native keeps [owned] until disconnect succeeds so a kill mid-flight retries.
+    // Native task-removal / activity-finish hooks also disconnect; this is a
+    // best-effort duplicate guard for the rare detached callback only.
+    _detachedDisconnectSent = true;
     unawaited(tailscale.requestDisconnect(force: false));
   }
 
@@ -772,12 +877,59 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     realtime.disconnect();
     _reconnectNotice?.cancel();
     showReconnecting = false;
+    // Authenticated image bytes must never cross account boundaries on a
+    // shared phone. Keep them between launches, but clear them on sign-out.
+    try {
+      await DefaultCacheManager().emptyCache();
+    } catch (_) {
+      // Cache cleanup must never trap the user in the old account.
+    }
     await api.logout();
     conversations = [];
     messagesByConv.clear();
     pinsByConv.clear();
     localContacts = [];
+    // The next account starts over: nothing here has answered for them yet, and
+    // a sync queued for the account that just left must not run against the new
+    // one's session.
+    _resolvedConversations.clear();
+    _syncQueued.clear();
+    _inboxResolved = false;
+    adminStatus = null;
+    _adminChecked = false;
     notifyListeners();
+  }
+
+  /// Who may read the server's activity log, once the server has said.
+  ///
+  /// Null until asked, which is why the menu entry appears a moment after the
+  /// inbox rather than with it.
+  AdminStatus? adminStatus;
+  bool _adminChecked = false;
+
+  /// Whether to offer the activity log in the menu.
+  ///
+  /// Shown to the admin, and to anyone at all while the role is unclaimed —
+  /// that is how the first admin appoints themselves. Everyone else is not
+  /// teased with a screen the server would refuse them.
+  bool get offersActivityLog {
+    final status = adminStatus;
+    if (status == null) return false;
+    return status.isAdmin || status.canClaim;
+  }
+
+  /// Asks once per session, or again after the role changes hands.
+  Future<void> refreshAdminStatus({bool force = false}) async {
+    if (_adminChecked && !force) return;
+    _adminChecked = true;
+    try {
+      adminStatus = await api.fetchAdminStatus();
+      notifyListeners();
+    } catch (_) {
+      // An older server has no admin endpoint, and a flaky one can be asked
+      // again next launch. Either way the menu simply stays as it was.
+      _adminChecked = false;
+    }
   }
 
   /// In-flight inbox fetch, so overlapping callers share one request.
@@ -823,6 +975,8 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       return b.updatedAt.compareTo(a.updatedAt);
     });
     conversations = list;
+    // An empty chat list is only worth announcing once the server has answered.
+    _inboxResolved = true;
     for (final c in conversations) {
       if (c.peer != null) {
         onlineByUser[c.peer!.id] = c.peer!.isOnline;
@@ -862,6 +1016,16 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     }
     notifyListeners();
     await NotificationService.instance.setAppBadgeCount(totalUnread);
+    // The shade is corrected from the counts the server just gave us, so a chat
+    // read anywhere — here, on another device, or by resuming into it — loses
+    // its notification without having to be opened again.
+    await NotificationService.instance.reconcileTray({
+      for (final c in conversations)
+        if (c.unreadCount > 0) c.id,
+    });
+    // Not awaited: whether this account may read the activity log only decides
+    // one menu entry, and the inbox must not wait on it.
+    unawaited(refreshAdminStatus());
   }
 
   /// The inbox subtitle for a chat, with DM last messages decrypted and a
@@ -875,7 +1039,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       final clear = _dmPreview[conv.id];
       summary = clear != null
           ? chatMessagePreview(last.copyWith(body: clear), viewerUserId: me?.id)
-          : '\u{1F512} Encrypted message';
+          : encryptedPreview;
     } else {
       summary = chatMessagePreview(last, viewerUserId: me?.id);
     }
@@ -903,6 +1067,22 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     };
     await ConversationPrefsStore.save(conversationPrefs);
     notifyListeners();
+  }
+
+  /// Shows relationship-only UI for this DM on this phone.
+  ///
+  /// Streak and anniversary data remain shared with the other member; this
+  /// preference only decides whether this device presents them as "couple
+  /// details". A family or work chat therefore stays a normal DM.
+  Future<void> setCoupleDetailsEnabled(int conversationId, bool enabled) async {
+    final current =
+        conversationPrefs[conversationId] ?? const ConversationPrefs();
+    conversationPrefs = {
+      ...conversationPrefs,
+      conversationId: current.copyWith(coupleDetailsEnabled: enabled),
+    };
+    notifyListeners();
+    await ConversationPrefsStore.save(conversationPrefs);
   }
 
   /// The conversation in the inbox list, or null if it isn't loaded.
@@ -944,7 +1124,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
 
   /// How much to darken the wallpaper behind messages (0 when none is set).
   double wallpaperDimFor(int conversationId) =>
-      conversationById(conversationId)?.wallpaperDim ?? 0.25;
+      conversationById(conversationId)?.wallpaperDim ?? wallpaperDimDefault;
 
   /// Uploads a shared wallpaper for the chat. Everyone in it sees the new image
   /// on their next inbox refresh (pushed immediately over the socket).
@@ -955,7 +1135,8 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
 
   /// Adjusts the shared darkening of a chat's wallpaper.
   Future<void> setChatWallpaperDim(int conversationId, double dim) async {
-    final updated = await api.setWallpaperDim(conversationId, dim);
+    final clamped = dim.clamp(wallpaperDimFloor, 0.8);
+    final updated = await api.setWallpaperDim(conversationId, clamped);
     _replaceConversation(updated);
   }
 
@@ -1202,98 +1383,158 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     return conversations.firstWhere((c) => c.id == conv.id, orElse: () => conv);
   }
 
-  /// Per-conversation sync generation so stale HTTP responses cannot win.
-  final Map<int, int> _syncGeneration = {};
+  /// One in-flight sync per conversation, plus the request waiting behind it.
   final Map<int, Future<void>> _syncInFlight = {};
+  final Map<int, _SyncRequest> _syncQueued = {};
   final Map<int, int> _parseResyncCounts = {};
   static const _maxParseResyncs = 2;
 
+  /// Whether a transcript fetch for [conversationId] has not answered yet.
+  bool isSyncingConversation(int conversationId) =>
+      _syncInFlight.containsKey(conversationId);
+
+  /// Asks for a sync without waiting for it or caring if it fails.
+  ///
+  /// Overlapping callers share one future now, so an unhandled failure would be
+  /// reported once per caller. The next socket frame, resume, or reopen asks
+  /// again anyway.
+  void syncInBackground(
+    int conversationId, {
+    bool full = false,
+    bool markRead = false,
+  }) {
+    unawaited(
+      syncConversation(
+        conversationId,
+        full: full,
+        markRead: markRead,
+      ).catchError((_) {}),
+    );
+  }
+
   /// Reconciles the on-device transcript with the server without clobbering
   /// optimistic rows or websocket updates that arrived mid-flight.
+  ///
+  /// Opening a chat while a push, a socket frame, and a reconnect all ask for
+  /// the same conversation is the normal case, not the exception. Overlapping
+  /// callers therefore share the pass that is already running and fold their
+  /// flags into the one queued behind it, so every request is answered by a
+  /// fetch that started after it was made. An earlier design let each caller
+  /// invalidate the others by bumping a generation counter; two of them could
+  /// then trade invalidations indefinitely, and the transcript never merged and
+  /// the conversation was never marked read until the app was restarted.
   Future<void> syncConversation(
     int conversationId, {
     bool full = false,
     bool markRead = false,
-  }) async {
-    final generation =
-        (_syncGeneration[conversationId] = (_syncGeneration[conversationId] ?? 0) + 1);
+  }) {
+    final queued = _syncQueued[conversationId];
+    if (queued == null) {
+      _syncQueued[conversationId] = _SyncRequest(
+        full: full,
+        markRead: markRead,
+      );
+    } else {
+      queued.absorb(full: full, markRead: markRead);
+    }
 
+    final running = _syncInFlight[conversationId];
+    if (running != null) return running;
+
+    final done = Completer<void>();
+    _syncInFlight[conversationId] = done.future;
+    unawaited(_drainConversationSyncs(conversationId, done));
+    return done.future;
+  }
+
+  /// Runs queued syncs for one conversation until nothing is waiting.
+  Future<void> _drainConversationSyncs(
+    int conversationId,
+    Completer<void> done,
+  ) async {
+    Object? failure;
+    StackTrace? failureTrace;
     while (true) {
-      final inFlight = _syncInFlight[conversationId];
-      if (inFlight != null) {
-        await inFlight;
-        if (_syncGeneration[conversationId] != generation) {
-          return syncConversation(
-            conversationId,
-            full: full,
-            markRead: markRead,
-          );
-        }
-      }
-
-      final job = _runSyncConversation(
-        conversationId,
-        generation,
-        full: full,
-        markRead: markRead,
-      );
-      _syncInFlight[conversationId] = job;
+      final request = _syncQueued.remove(conversationId);
+      if (request == null) break;
       try {
-        await job;
-      } finally {
-        if (_syncInFlight[conversationId] == job) {
-          _syncInFlight.remove(conversationId);
-        }
-      }
-
-      if (_syncGeneration[conversationId] == generation) {
+        await _runSyncConversation(
+          conversationId,
+          full: request.full,
+          markRead: request.markRead,
+        );
         _parseResyncCounts.remove(conversationId);
-        return;
+      } catch (error, trace) {
+        failure = error;
+        failureTrace = trace;
+        // Whatever piled up behind a failed pass would only hit the same dead
+        // link. The next event, resume, or reopen asks again.
+        _syncQueued.remove(conversationId);
+        break;
       }
-      return syncConversation(
-        conversationId,
-        full: full,
-        markRead: markRead,
-      );
+    }
+    // Released in the same synchronous step as the loop's exit check, so a
+    // caller arriving now starts a fresh pass instead of joining a finished one.
+    _syncInFlight.remove(conversationId);
+    if (failure != null) {
+      done.completeError(failure, failureTrace);
+    } else {
+      done.complete();
     }
   }
 
   Future<void> _runSyncConversation(
-    int conversationId,
-    int generation, {
+    int conversationId, {
     required bool full,
     required bool markRead,
   }) async {
-    final local = List<ChatMessage>.from(
-      messagesByConv[conversationId] ?? const [],
-    );
-    final watermark = full ? null : maxServerMessageId(local);
+    final watermark = full
+        ? null
+        : maxServerMessageId(messagesByConv[conversationId] ?? const []);
     final page = watermark == null
         ? await api.listMessages(conversationId)
         : await api.listMessages(conversationId, afterId: watermark);
 
-    if (_syncGeneration[conversationId] != generation) return;
-
     final incoming = await _decryptList(page);
-    if (_syncGeneration[conversationId] != generation) return;
 
+    // Re-read instead of reusing a pre-fetch snapshot: a socket frame or an
+    // optimistic send that landed during the round trip belongs in the result.
+    final local = List<ChatMessage>.from(
+      messagesByConv[conversationId] ?? const [],
+    );
     messagesByConv[conversationId] = mergeConversationMessages(
       local: local,
       incoming: incoming,
     );
+    // The server has spoken, so an empty transcript is now a fact rather than a
+    // guess and the empty-chat illustration may be shown.
+    _resolvedConversations.add(conversationId);
     _learnReceiptMarks(conversationId, incoming);
     applyReceiptMarks(conversationId);
     ensureE2eHandshake(conversationId);
+    // Paint what arrived before touching the network again. Marking read used
+    // to come first, which meant a flaky read call hid history that was already
+    // on the device.
+    notifyListeners();
 
     final shouldRead =
         markRead ||
         (activeConversationId == conversationId &&
             incoming.any((m) => m.senderId != me?.id));
-    if (shouldRead) {
+    if (shouldRead) await markConversationRead(conversationId);
+  }
+
+  /// Clears the unread badge for a conversation the user is looking at.
+  ///
+  /// Best effort by design: history is already on screen by the time this runs,
+  /// so a failed read call must leave the transcript alone. The server keeps the
+  /// message unread, which is the truthful outcome, and the next open retries.
+  Future<void> markConversationRead(int conversationId) async {
+    try {
       await api.markRead(conversationId);
       await refreshInbox();
-    } else {
-      notifyListeners();
+    } catch (error) {
+      debugPrint('markRead failed for conversation $conversationId: $error');
     }
   }
 
@@ -1488,12 +1729,12 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   }
 
   String nudgeCaptionFor(NudgeRecord record) => formatNudgeOverlayCaption(
-        record: record,
-        viewerUserId: me?.id,
-        conversation: _conversationById(record.conversationId),
-        nameFor: nameFor,
-        nameForMember: nameForMember,
-      );
+    record: record,
+    viewerUserId: me?.id,
+    conversation: _conversationById(record.conversationId),
+    nameFor: nameFor,
+    nameForMember: nameForMember,
+  );
 
   @visibleForTesting
   void reconcileNudgesForTest(int conversationId, List<NudgeRecord> page) {
@@ -1523,7 +1764,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
 
   @visibleForTesting
   void Function(NudgeRecord record, {required bool isEcho})?
-      onIncomingNudgeHandled;
+  onIncomingNudgeHandled;
 
   @visibleForTesting
   void resetNudgeHistoryForTest() {
@@ -1641,7 +1882,10 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   bool historyIsComplete(int conversationId) =>
       _historyComplete.contains(conversationId);
 
-  Future<void> loadOlder(int conversationId) async {
+  bool isLoadingOlder(int conversationId) =>
+      _loadingOlder.contains(conversationId);
+
+  Future<void> loadOlder(int conversationId, {int pageSize = 50}) async {
     final current = messagesByConv[conversationId];
     if (current == null || current.isEmpty) return;
     if (_historyComplete.contains(conversationId)) return;
@@ -1650,7 +1894,11 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       final oldestId = current.first.id;
       if (oldestId <= 0) return;
       final older = await _decryptList(
-        await api.listMessages(conversationId, beforeId: oldestId),
+        await api.listMessages(
+          conversationId,
+          beforeId: oldestId,
+          limit: pageSize,
+        ),
       );
       if (older.isEmpty) {
         _historyComplete.add(conversationId);
@@ -1666,8 +1914,23 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     }
   }
 
-  /// Paginate until [messageId] is in the local transcript, or history ends.
+  /// Brings [messageId] into the local transcript, ready to be scrolled to.
+  ///
+  /// Asks for the whole stretch between the message and the history already held
+  /// in one request. Paging backwards instead costs a round trip per fifty rows,
+  /// which on a phone server is several seconds of the chat sitting on the newest
+  /// message doing nothing visible — and every one of those pages shifts the
+  /// list, which used to send the jump chasing a moving target.
+  ///
+  /// Falls back to paging when the stretch is longer than one window, or when an
+  /// older server does not know the endpoint.
   Future<bool> ensureMessageLoaded(int conversationId, int messageId) async {
+    if ((messagesByConv[conversationId] ?? const <ChatMessage>[]).any(
+      (m) => m.id == messageId,
+    )) {
+      return true;
+    }
+    if (await _loadMessageWindow(conversationId, messageId)) return true;
     for (var attempt = 0; attempt < 40; attempt++) {
       final messages = messagesByConv[conversationId] ?? const <ChatMessage>[];
       if (messages.any((m) => m.id == messageId)) return true;
@@ -1681,6 +1944,34 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       if (after == before) return false;
     }
     return false;
+  }
+
+  /// One request for the history around [messageId]; true once it is loaded.
+  Future<bool> _loadMessageWindow(int conversationId, int messageId) async {
+    final held = messagesByConv[conversationId] ?? const <ChatMessage>[];
+    final oldestHeld = held.isEmpty ? null : held.first.id;
+    try {
+      final window = await _decryptList(
+        await api.listMessageWindow(
+          conversationId,
+          messageId: messageId,
+          // Sent messages waiting for the server have no id to stop at yet.
+          upToId: (oldestHeld != null && oldestHeld > 0) ? oldestHeld : null,
+        ),
+      );
+      if (window.isEmpty) return false;
+      messagesByConv[conversationId] = mergeConversationMessages(
+        local: messagesByConv[conversationId] ?? const <ChatMessage>[],
+        incoming: window,
+      );
+      notifyListeners();
+      return (messagesByConv[conversationId] ?? const <ChatMessage>[]).any(
+        (m) => m.id == messageId,
+      );
+    } catch (_) {
+      // A missing message, or a server that predates the endpoint: page instead.
+      return false;
+    }
   }
 
   Future<List<SharedItem>> listShared(
@@ -1701,6 +1992,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     // A DM's bodies are ciphertext on the server, so the server can't match
     // them. Search the decrypted transcript this phone already holds instead.
     if (conversationId != null && _dmPeerId(conversationId) != null) {
+      await ensureTranscriptForSearch(conversationId);
       return _localSearch(
         conversationId,
         query,
@@ -1722,6 +2014,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       final local = <ChatMessage>[];
       for (final conv in conversations) {
         if (conv.type != 'dm') continue;
+        await ensureTranscriptForSearch(conv.id);
         local.addAll(
           _localSearch(
             conv.id,
@@ -1747,6 +2040,33 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       before: before,
       after: after,
     );
+  }
+
+  /// Pages a chat's whole history in before it is searched locally.
+  ///
+  /// A sealed DM can only be matched on this phone, and this phone used to hold
+  /// whatever happened to be resident: the newest fifty rows after opening a
+  /// chat, eighty after leaving it. So the same word was found once and missing
+  /// the next time, with nothing visibly different. Search now reads to the
+  /// start of the chat first.
+  ///
+  /// Pages are the server's maximum size to keep the round trips down, and the
+  /// budget is a stop for a runaway loop, not an expected limit.
+  Future<void> ensureTranscriptForSearch(int conversationId) async {
+    if ((messagesByConv[conversationId] ?? const <ChatMessage>[]).isEmpty) {
+      await loadMessages(conversationId, initial: true);
+    }
+    for (var page = 0; page < searchHistoryPageBudget; page++) {
+      if (historyIsComplete(conversationId)) return;
+      final before = (messagesByConv[conversationId] ?? const []).length;
+      await loadOlder(conversationId, pageSize: searchHistoryPageSize);
+      final after = (messagesByConv[conversationId] ?? const []).length;
+      if (after != before) continue;
+      // A page the scroll listener started is already in flight; that request
+      // is fetching what this loop wants, so wait for it rather than give up.
+      if (!isLoadingOlder(conversationId)) return;
+      await Future<void>.delayed(const Duration(milliseconds: 120));
+    }
   }
 
   List<ChatMessage> _localSearch(
@@ -1907,25 +2227,180 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     String? caption,
     ChatMessage? replyTo,
   }) async {
-    final preview = await _previewFor(file, type);
-    final wireCaption = await _wireCaptionFor(conversationId, caption);
-    late final ChatMessage msg;
+    await _requireSendableSize(file, type);
+    // A single attachment reports itself too. Without this a 300 MB video looked
+    // exactly like a send that never started: no bar, no bytes, nothing.
+    mediaUploadTotal = 1;
+    mediaUploadDone = 0;
+    mediaUploadBytesSent = 0;
+    mediaUploadBytesTotal = 0;
+    mediaUploadWaiting = false;
+    notifyListeners();
+    _setUploadBytes(0, await file.length());
+    await tailscale.noteTransfer(true);
     try {
-      msg = await api.uploadMedia(
-        conversationId: conversationId,
-        file: file,
-        type: type,
-        thumbnail: preview.file,
-        durationMs: preview.durationMs,
-        caption: wireCaption,
-        replyToMessageId: replyTo?.id,
-      );
+      final preview = await _previewFor(file, type);
+      final wireCaption = await _wireCaptionFor(conversationId, caption);
+      late final ChatMessage msg;
+      try {
+        msg = await _uploadMediaWithRetry(
+          conversationId: conversationId,
+          file: file,
+          type: type,
+          thumbnail: preview.file,
+          durationMs: preview.durationMs,
+          caption: wireCaption,
+          replyToMessageId: replyTo?.id,
+        );
+      } finally {
+        await _removeGeneratedThumbnail(preview.file);
+      }
+      await upsertFromWire(msg);
+      await refreshInbox();
+      return msg;
     } finally {
-      await _removeGeneratedThumbnail(preview.file);
+      await tailscale.noteTransfer(false);
+      _clearUploadProgress();
     }
-    await upsertFromWire(msg);
-    await refreshInbox();
-    return msg;
+  }
+
+  /// Bytes of the attachment now going up, for the composer's progress bar.
+  int mediaUploadBytesSent = 0;
+  int mediaUploadBytesTotal = 0;
+
+  /// True while an upload is paused waiting for Tailscale/connectivity back.
+  bool mediaUploadWaiting = false;
+
+  void _setUploadBytes(int sent, int total) {
+    mediaUploadBytesSent = sent;
+    mediaUploadBytesTotal = total;
+    notifyListeners();
+  }
+
+  void _clearUploadProgress() {
+    mediaUploadTotal = 0;
+    mediaUploadDone = 0;
+    mediaUploadBytesSent = 0;
+    mediaUploadBytesTotal = 0;
+    mediaUploadWaiting = false;
+    notifyListeners();
+  }
+
+  /// Sends [file], and if the tunnel drops mid-transfer waits and retries once
+  /// from the start. True byte-resume is not available on this protocol.
+  Future<ChatMessage> _uploadMediaWithRetry({
+    required int conversationId,
+    required File file,
+    required String type,
+    File? thumbnail,
+    int? durationMs,
+    String? caption,
+    String? clientId,
+    int? replyToMessageId,
+  }) async {
+    Object? lastError;
+    for (var attempt = 0; attempt < 3; attempt++) {
+      try {
+        if (attempt > 0) {
+          mediaUploadWaiting = true;
+          notifyListeners();
+          await _waitForUploadPath();
+          mediaUploadWaiting = false;
+          _setUploadBytes(0, await file.length());
+          notifyListeners();
+        }
+        return await api.uploadMedia(
+          conversationId: conversationId,
+          file: file,
+          type: type,
+          thumbnail: thumbnail,
+          durationMs: durationMs,
+          caption: caption,
+          clientId: clientId,
+          replyToMessageId: replyToMessageId,
+          onProgress: _setUploadBytes,
+        );
+      } catch (e) {
+        lastError = e;
+        if (!_looksLikeTransientUploadFailure(e) || attempt == 2) {
+          rethrow;
+        }
+      }
+    }
+    throw lastError ?? StateError('upload failed');
+  }
+
+  bool _looksLikeTransientUploadFailure(Object error) {
+    final text = error.toString().toLowerCase();
+    return text.contains('upload stopped') ||
+        text.contains('connection') ||
+        text.contains('socket') ||
+        text.contains('timed out') ||
+        text.contains('network') ||
+        text.contains('unreachable') ||
+        text.contains('failed host lookup');
+  }
+
+  Future<void> _waitForUploadPath() async {
+    // Brief pause so Tailscale can reconnect after a background bounce, then
+    // probe the server until it answers or we give up and let the caller fail.
+    for (var i = 0; i < 24; i++) {
+      await Future<void>.delayed(const Duration(seconds: 5));
+      try {
+        await api.fetchUploadLimits();
+        return;
+      } catch (_) {
+        // Keep waiting.
+      }
+    }
+  }
+
+  /// Server-declared attachment ceiling, asked for once per session.
+  UploadLimits? uploadLimits;
+
+  Future<UploadLimits?> _limits() async {
+    final known = uploadLimits;
+    if (known != null) return known;
+    try {
+      return uploadLimits = await api.fetchUploadLimits();
+    } catch (_) {
+      // An older server has no limits endpoint, and a flaky one can be asked
+      // again on the next send. Either way the upload still goes ahead and the
+      // server's own answer decides.
+      return null;
+    }
+  }
+
+  /// Refuses an attachment the server would reject, before a byte is sent.
+  ///
+  /// Uploading first and finding out later is minutes of a phone's radio spent
+  /// on an answer that was knowable up front.
+  Future<void> _requireSendableSize(File file, String type) async {
+    if (type == 'doodle' || type == 'voice') return;
+    final limits = await _limits();
+    if (limits == null) return;
+    final bytes = await file.length();
+    final message = tooLargeMessage(
+      fileBytes: bytes,
+      limits: limits,
+      isVideo: type == 'video',
+    );
+    if (message == null) return;
+    // The cached ceiling may predate space being freed on the server, so the
+    // refusal is confirmed against a fresh answer before the user sees it.
+    final fresh = await _refreshedLimits();
+    if (fresh != null && fresh.allows(bytes)) return;
+    error = message;
+    notifyListeners();
+    throw ApiException(message);
+  }
+
+  Future<UploadLimits?> _refreshedLimits() async {
+    try {
+      return uploadLimits = await api.fetchUploadLimits();
+    } catch (_) {
+      return uploadLimits;
+    }
   }
 
   /// Max attachments in one send, matching WhatsApp's album cap. Beyond this the
@@ -1995,20 +2470,33 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     if (files.isEmpty) return;
     mediaUploadTotal = files.length;
     mediaUploadDone = 0;
+    mediaUploadWaiting = false;
     notifyListeners();
+    await tailscale.noteTransfer(true);
 
     var failures = 0;
+    var tooLarge = 0;
     try {
       for (var i = 0; i < files.length; i++) {
         final clientId = '${DateTime.now().microsecondsSinceEpoch}_$i';
         final actualType = typeOf?.call(files[i]) ?? type;
+        try {
+          await _requireSendableSize(files[i], actualType);
+        } catch (_) {
+          // Named individually below; one outsized clip must not stop the album.
+          tooLarge++;
+          mediaUploadDone = i + 1;
+          notifyListeners();
+          continue;
+        }
+        _setUploadBytes(0, await files[i].length());
         final preview = await _previewFor(files[i], actualType);
         final wireCaption = await _wireCaptionFor(
           conversationId,
           captionForBatchIndex(index: i, caption: caption),
         );
         try {
-          final msg = await api.uploadMedia(
+          final msg = await _uploadMediaWithRetry(
             conversationId: conversationId,
             file: files[i],
             type: actualType,
@@ -2028,30 +2516,39 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
         }
       }
     } finally {
-      mediaUploadTotal = 0;
-      mediaUploadDone = 0;
-      notifyListeners();
+      await tailscale.noteTransfer(false);
+      _clearUploadProgress();
     }
 
     await refreshInbox();
-    if (failures > 0) {
-      error = failures == files.length
-          ? (files.length == 1
-                ? "Couldn't send that file."
-                : "Couldn't send those ${files.length} files.")
-          : "Couldn't send $failures of ${files.length} files.";
-      notifyListeners();
+    final unsent = failures + tooLarge;
+    if (unsent > 0) {
+      // The size refusal already explains itself; only add the tally when other
+      // files failed too, so the specific reason is not overwritten by a count.
+      if (tooLarge == 0 || failures > 0) {
+        error = unsent == files.length
+            ? (files.length == 1
+                  ? "Couldn't send that file."
+                  : "Couldn't send those ${files.length} files.")
+            : "Couldn't send $unsent of ${files.length} files.";
+        notifyListeners();
+      }
     }
   }
 
   /// Generates one small preview frame and reads the clip length; failure never
   /// blocks the video itself.
   Future<VideoPreview> _previewFor(File file, String type) async {
-    if (type != 'video') return const VideoPreview();
     try {
-      return await VideoThumbnailService.create(file.path);
+      if (type == 'video') {
+        return await VideoThumbnailService.create(file.path);
+      }
+      if (type == 'image') {
+        return await VideoThumbnailService.createImage(file.path);
+      }
+      return const VideoPreview();
     } catch (e) {
-      debugPrint('Video preview generation skipped: $e');
+      debugPrint('Media preview generation skipped: $e');
       return const VideoPreview();
     }
   }
@@ -2065,13 +2562,39 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     }
   }
 
+  /// How many messages to keep for chats that are not on screen.
+  ///
+  /// Opening many conversations used to leave every page of history resident.
+  /// On a 3 GB phone that is the difference between a calm chat app and Android
+  /// killing it after an afternoon of browsing. The open chat keeps its full
+  /// loaded window; everything else is trimmed to this cap.
+  static const int inactiveTranscriptCap = 80;
+
   void setActiveConversation(int? id) {
+    final previous = activeConversationId;
     activeConversationId = id;
     if (id != null) {
       // Reading the chat is the same signal WhatsApp uses: once you are looking
       // at it, its notification has served its purpose.
       NotificationService.instance.clearConversation(id);
     }
+    // Leaving or switching chats: free the transcript that is no longer shown.
+    if (previous != null && previous != id) {
+      _trimInactiveTranscript(previous);
+    }
+  }
+
+  void _trimInactiveTranscript(int conversationId) {
+    final list = messagesByConv[conversationId];
+    if (list == null || list.length <= inactiveTranscriptCap) return;
+    // Keep the newest page; older history is re-fetched by loadOlder / jump.
+    messagesByConv[conversationId] = list.sublist(
+      list.length - inactiveTranscriptCap,
+    );
+    // The history dropped here can be asked for again. Leaving the
+    // "read to the end" mark in place made loadOlder refuse to refetch it, so a
+    // re-opened chat could neither scroll back nor search past these 80 rows.
+    _historyComplete.remove(conversationId);
   }
 
   void setTyping(int conversationId, bool isTyping) {
@@ -2173,11 +2696,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     _upsertNudgeRecord(optimistic);
     onSentNudgeOptimistic?.call(optimistic);
     notifyListeners();
-    realtime.sendNudge(
-      conversationId,
-      variant: variant,
-      nudgeId: nudgeId,
-    );
+    realtime.sendNudge(conversationId, variant: variant, nudgeId: nudgeId);
     return true;
   }
 
@@ -2264,13 +2783,22 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   }
 
   Future<void> _presentIncomingCall(CallSession session) async {
-    if (!(conversationPrefs[session.conversationId]?.muted ?? false)) {
+    final muted = conversationPrefs[session.conversationId]?.muted ?? false;
+    // Foreground already gets the full-screen CallScreen. A heads-up
+    // notification on top of Accept/Decline is a second surface for the same
+    // invite and reads as a bug. Keep the alert only when the UI may be hidden.
+    final lifecycle = WidgetsBinding.instance.lifecycleState;
+    final appVisible =
+        lifecycle == null || lifecycle == AppLifecycleState.resumed;
+    if (!muted && !appVisible) {
       await NotificationService.instance.showIncomingCall(
         callId: session.callId,
         conversationId: session.conversationId,
         title: session.peerName,
         isVideo: session.isVideo,
       );
+    } else {
+      await NotificationService.instance.cancelIncomingCall();
     }
     await PendingCallStore.instance.save(
       PendingCall(
@@ -2283,6 +2811,10 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       ),
     );
     _presentCallScreen();
+    // Fullscreen owns the invite now — clear any heads-up that raced in.
+    if (appVisible) {
+      unawaited(NotificationService.instance.cancelIncomingCall());
+    }
   }
 
   void _presentCallScreen() {
@@ -2450,6 +2982,8 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     for (final entry in byConv.entries) {
       entry.value.sort((a, b) => a.id.compareTo(b.id));
       messagesByConv[entry.key] = entry.value;
+      // Restored history is real history: show it without waiting for a fetch.
+      _resolvedConversations.add(entry.key);
     }
 
     var dmsOpened = 0;
@@ -2478,6 +3012,98 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       'names': aliasesRestored,
       'stars': starsRestored,
     };
+  }
+
+  /// Opens a sealed body from the activity log, when this phone can.
+  ///
+  /// The server stores a DM body exactly as the sender's phone sealed it, so the
+  /// log holds a token nobody on the server can read — and that is the point.
+  /// But a member of that chat already holds the shared key, so their own copy
+  /// of a message they sent or received is readable *here*, on the device, with
+  /// nothing decrypted anywhere else. That is what lets the admin see what a
+  /// message said before it was edited or deleted in their own chats without
+  /// weakening the encryption for anybody else's.
+  ///
+  /// Returns null when the text is not sealed (the caller then shows it as-is),
+  /// when this account is not in that chat, or when the key is gone — a
+  /// reinstalled phone derives a new identity and old history stays sealed for
+  /// good.
+  /// Set [prepare] to let this load what it needs first — the identity key, the
+  /// chat list, a key swap — which costs a request but is what makes an entry
+  /// readable on the first look instead of only after the chat was visited.
+  Future<String?> revealSealedAuditText(
+    int? conversationId,
+    String? text, {
+    bool prepare = false,
+  }) async {
+    if (conversationId == null) return null;
+    if (!E2EService.isCipherText(text)) return null;
+    if (prepare) await _prepareSealedReveal(conversationId);
+    final peerId = _dmPeerId(conversationId);
+    if (peerId == null) return null;
+    return e2e.decryptFrom(peerId, text);
+  }
+
+  /// True when a sealed entry from [conversationId] can be opened right now,
+  /// from keys already on this phone. The log retries on this, so an entry that
+  /// was looked at a moment too early is not left reading "not readable" once
+  /// the key it needed has arrived.
+  bool canRevealSealedChat(int? conversationId) {
+    if (conversationId == null || !e2e.isReady) return false;
+    final peerId = _dmPeerId(conversationId);
+    return peerId != null && e2e.hasPeerKey(peerId);
+  }
+
+  /// Gets this phone ready to open its own sealed history.
+  ///
+  /// The activity log can be reached before the inbox has answered — a cold
+  /// launch, or straight after signing in — and without the chat there is no
+  /// peer to derive a key with, which used to leave a member's own message
+  /// showing as unreadable. A chat whose peer key never arrived also gets one
+  /// key-swap nudge here.
+  Future<void> _prepareSealedReveal(int conversationId) async {
+    await e2e.init();
+    if (conversationById(conversationId) == null) {
+      try {
+        await refreshInbox();
+      } catch (_) {
+        return;
+      }
+    }
+    final peerId = _dmPeerId(conversationId);
+    if (peerId == null || e2e.hasPeerKey(peerId)) return;
+    _sendE2eHandshake(conversationId);
+  }
+
+  /// The name this reader knows a chat by, for the activity log's sentences.
+  ///
+  /// Nicknames live on the phone, never on the server, so the log can only be
+  /// written with "chat 1" — the readable name has to be attached here.
+  String? chatNameFor(int? conversationId) {
+    if (conversationId == null) return null;
+    return _titleForConversation(conversationId);
+  }
+
+  /// The other person in a DM, by name, for a log entry whose own record of the
+  /// parties is missing — an entry written by an older server.
+  String? chatPeerUsername(int? conversationId) {
+    if (conversationId == null) return null;
+    final name = _peerUsernameForConversation(conversationId);
+    return name.isEmpty ? null : name;
+  }
+
+  /// A username for a numeric account id, when this phone has seen it.
+  String? usernameForUserId(int? userId) {
+    if (userId == null) return null;
+    if (userId == me?.id) return me?.username;
+    for (final c in conversations) {
+      final peer = c.peer;
+      if (peer != null && peer.id == userId) return peer.username;
+      for (final m in c.members) {
+        if (m.userId == userId) return m.username;
+      }
+    }
+    return null;
   }
 
   /// The other person in a DM, or null for groups / unknown chats.
@@ -2674,7 +3300,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
         final cid = event['conversation_id'] as int?;
         unawaited(refreshInbox());
         if (cid != null && cid == activeConversationId) {
-          unawaited(syncConversation(cid, markRead: true));
+          syncInBackground(cid, markRead: true);
         }
         break;
       case 'pins.changed':
@@ -2730,7 +3356,9 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
         realtime.ackDelivered(msg.id);
         api.markDelivered(msg.id);
         if (activeConversationId == msg.conversationId) {
-          api.markRead(msg.conversationId);
+          // Awaited nowhere, but routed through the guarded helper so the badge
+          // is refreshed on success and a flaky read cannot raise here.
+          unawaited(markConversationRead(msg.conversationId));
         } else if (!isMuted(msg.conversationId)) {
           // Only who it is from, never what it says. A socket delivery must look
           // exactly like a push one, or a message would be readable in the shade
@@ -2756,11 +3384,13 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   void _scheduleBoundedResync(int conversationId) {
     final count = (_parseResyncCounts[conversationId] ?? 0) + 1;
     if (count > _maxParseResyncs) {
-      debugPrint('message sync resync cap reached for conversation $conversationId');
+      debugPrint(
+        'message sync resync cap reached for conversation $conversationId',
+      );
       return;
     }
     _parseResyncCounts[conversationId] = count;
-    unawaited(syncConversation(conversationId));
+    syncInBackground(conversationId);
   }
 
   Future<void> _handleUpdatedMessage(Map<String, dynamic> event) async {
@@ -3037,6 +3667,23 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     realtime.disconnect();
     connectivity.dispose();
     super.dispose();
+  }
+}
+
+/// A pending transcript sync, with the strongest flags any caller asked for.
+///
+/// Two callers wanting the same conversation are answered by one fetch, and the
+/// wider request wins: a full reload beats an incremental one, and a request to
+/// mark the chat read is never dropped because an anonymous refresh joined it.
+class _SyncRequest {
+  _SyncRequest({required this.full, required this.markRead});
+
+  bool full;
+  bool markRead;
+
+  void absorb({required bool full, required bool markRead}) {
+    this.full = this.full || full;
+    this.markRead = this.markRead || markRead;
   }
 }
 

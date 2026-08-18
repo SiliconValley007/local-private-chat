@@ -9,7 +9,7 @@ import subprocess
 import sys
 
 import uvicorn
-from app.config import HOST, PORT
+from app.config import ACCESS_LOG, HOST, LOW_MEMORY, MAX_CONCURRENCY, PORT
 
 # Linux/Android ioctl for "give me this interface's IPv4 address".
 _SIOCGIFADDR = 0x8915
@@ -252,7 +252,20 @@ if __name__ == "__main__":
         raise SystemExit(1)
     _print_banner()
     try:
-        uvicorn.run("app.main:app", host=HOST, port=PORT, reload=False)
+        # Phone servers keep logging quiet and concurrency bounded so a handful
+        # of uploads cannot push Termux into the Android low-memory killer.
+        uvicorn_kwargs: dict = {
+            "host": HOST,
+            "port": PORT,
+            "reload": False,
+        }
+        if LOW_MEMORY:
+            uvicorn_kwargs["access_log"] = ACCESS_LOG
+            uvicorn_kwargs["log_level"] = "info" if ACCESS_LOG else "warning"
+            uvicorn_kwargs["timeout_keep_alive"] = 5
+            if MAX_CONCURRENCY > 0:
+                uvicorn_kwargs["limit_concurrency"] = MAX_CONCURRENCY
+        uvicorn.run("app.main:app", **uvicorn_kwargs)
     except OSError as exc:
         if getattr(exc, "winerror", None) == 10048 or getattr(exc, "errno", None) in (98, 10048):
             _print_port_in_use()

@@ -5,6 +5,8 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../e2e_text.dart';
+
 /// End-to-end encryption for one-to-one chats.
 ///
 /// Every device owns a long-lived X25519 identity key. When two people open a
@@ -21,7 +23,7 @@ class E2EService {
     : _seeds = seedStore ?? const SecureSeedStore();
 
   static const _peerKeysKey = 'e2e_peer_pubkeys_v1';
-  static const cipherPrefix = 'e2e1:';
+  static const cipherPrefix = e2eCipherPrefix;
 
   final E2ESeedStore _seeds;
   final _x25519 = X25519();
@@ -124,8 +126,7 @@ class E2EService {
   }
 
   /// True when [body] is an encrypted token this service produced.
-  static bool isCipherText(String? body) =>
-      body != null && body.startsWith(cipherPrefix);
+  static bool isCipherText(String? body) => isE2eCipherText(body);
 
   /// Seals [plaintext] for [peerId]. Returns null when no key is known yet, so
   /// the caller can fall back to sending plaintext rather than blocking a chat.

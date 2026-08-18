@@ -7,6 +7,7 @@ from fastapi.responses import FileResponse
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
+from app import audit
 from app.avatars import (
     avatar_media_type,
     avatar_rel_path,
@@ -81,6 +82,14 @@ async def upload_my_avatar(
     current.avatar_updated_at = now
     db.commit()
     db.refresh(current)
+    audit.record(
+        db,
+        action="account.avatar_set",
+        summary=f"{current.username} changed their profile photo",
+        actor=current,
+        before_text=old_path,
+        after_text=rel_path,
+    )
 
     delete_avatar_file(old_path)
     await broadcast_user_updated(db, current)
@@ -98,6 +107,13 @@ async def delete_my_avatar(
         current.avatar_updated_at = None
         db.commit()
         db.refresh(current)
+        audit.record(
+            db,
+            action="account.avatar_removed",
+            summary=f"{current.username} removed their profile photo",
+            actor=current,
+            before_text=old_path,
+        )
         delete_avatar_file(old_path)
         await broadcast_user_updated(db, current)
     return user_out(current, is_online=hub.is_online(current.id))

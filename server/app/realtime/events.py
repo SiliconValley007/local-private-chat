@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import select
 
 from app.avatars import avatar_version_for, has_avatar
+from app.image_shape import media_pixel_size
 from app.models import Conversation, ConversationMember, Message, User
 from app.schemas import (
     ConversationOut,
@@ -116,6 +117,20 @@ def quoted_message(message: Message | None) -> QuotedMessage | None:
     )
 
 
+def preview_pixel_size(message: Message) -> tuple[int, int] | None:
+    """Shape of what a chat row will draw for [message], when it draws a picture.
+
+    Videos and photos are previewed through their thumbnail, which keeps the
+    original's proportions; a drawing is shown as sent.
+    """
+
+    if message.type not in ("image", "video", "doodle"):
+        return None
+    return media_pixel_size(message.media_thumb_path) or media_pixel_size(
+        message.media_path
+    )
+
+
 def message_out(
     message: Message,
     viewer_id: int | None = None,
@@ -128,6 +143,7 @@ def message_out(
     ]
     deleted = message.deleted_at is not None
     reactions = aggregate_reactions(message, viewer_id)
+    shape = None if deleted else preview_pixel_size(message)
     return MessageOut(
         id=message.id,
         conversation_id=message.conversation_id,
@@ -138,6 +154,8 @@ def message_out(
         media_size=None if deleted else message.media_size,
         media_mime=None if deleted else message.media_mime,
         media_duration_ms=None if deleted else message.media_duration_ms,
+        media_width=None if shape is None else shape[0],
+        media_height=None if shape is None else shape[1],
         client_id=message.client_id,
         created_at=message.created_at,
         edited_at=None if deleted else message.edited_at,

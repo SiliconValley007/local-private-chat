@@ -22,6 +22,10 @@ class _GlobalSearchScreenState extends State<GlobalSearchScreen> {
   bool _loading = false;
   String? _error;
 
+  /// Bumped per search so a slow earlier answer cannot overwrite a newer one.
+  /// Sweeping sealed DM history takes long enough for that to happen.
+  int _generation = 0;
+
   static const _filters = <(String?, String)>[
     (null, 'All text'),
     ('image', 'Photos'),
@@ -39,29 +43,33 @@ class _GlobalSearchScreenState extends State<GlobalSearchScreen> {
 
   Future<void> _run() async {
     final q = _query.text.trim();
+    FocusScope.of(context).unfocus();
     if (q.isEmpty && _mediaType == null) {
       setState(() {
+        _generation++;
         _results = const [];
         _error = null;
       });
       return;
     }
+    final generation = ++_generation;
     setState(() {
       _loading = true;
       _error = null;
+      _results = const [];
     });
     try {
       final results = await context.read<AppState>().searchMessages(
         q,
         mediaType: _mediaType,
       );
-      if (!mounted) return;
+      if (!mounted || generation != _generation) return;
       setState(() {
         _results = results;
         _loading = false;
       });
     } catch (e) {
-      if (!mounted) return;
+      if (!mounted || generation != _generation) return;
       setState(() {
         _loading = false;
         _error = friendlyMessage(e);

@@ -37,4 +37,25 @@ class VideoThumbnailService {
       return const VideoPreview();
     }
   }
+
+  /// Creates the small upload-time photo preview used by transcript bubbles.
+  ///
+  /// The original is still uploaded for full-screen zoom and downloads.
+  static Future<VideoPreview> createImage(String imagePath) async {
+    if (!Platform.isAndroid) return const VideoPreview();
+    try {
+      final result = await _channel.invokeMapMethod<String, dynamic>(
+        'createImage',
+        {'path': imagePath, 'maxWidth': 720, 'quality': 78},
+      );
+      final path = result?['path'] as String?;
+      return VideoPreview(
+        file: path == null || path.isEmpty ? null : File(path),
+      );
+    } on PlatformException {
+      return const VideoPreview();
+    } on MissingPluginException {
+      return const VideoPreview();
+    }
+  }
 }

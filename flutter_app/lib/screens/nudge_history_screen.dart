@@ -6,6 +6,7 @@ import '../models.dart';
 import '../nudge_log.dart';
 import '../time_format.dart';
 import '../widgets/error_banner.dart';
+import '../widgets/loading_placeholders.dart';
 
 /// Per-chat nudge history — sent and received pokes kept off the transcript.
 class NudgeHistoryScreen extends StatefulWidget {
@@ -43,7 +44,7 @@ class _NudgeHistoryScreenState extends State<NudgeHistoryScreen> {
     return Scaffold(
       appBar: AppBar(title: const Text('Nudge history')),
       body: loading && items.isEmpty
-          ? const Center(child: CircularProgressIndicator())
+          ? const ListSkeleton(rows: 6, label: 'Loading nudge history')
           : Column(
               children: [
                 if (error != null)

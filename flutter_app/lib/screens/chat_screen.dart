@@ -2,6 +2,10 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+// ScrollCacheExtent is declared in the rendering library and not re-exported by
+// material.dart.
+import 'package:flutter/rendering.dart' show ScrollCacheExtent;
+import 'package:flutter/scheduler.dart';
 import 'package:flutter/services.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:provider/provider.dart';
@@ -16,8 +20,10 @@ import '../chat_navigation.dart';
 import '../chat_scroll.dart';
 import '../couple_details.dart';
 import '../doodle_stroke.dart';
+import '../e2e_text.dart';
 import '../emoji.dart';
 import '../errors.dart';
+import '../load_state.dart';
 import '../models.dart';
 import '../nudge_log.dart';
 import '../services/export_service.dart';
@@ -30,6 +36,7 @@ import '../services/voice_player.dart';
 import '../services/draft_store.dart';
 import '../theme.dart';
 import '../time_format.dart';
+import '../upload_limits.dart';
 import '../widgets/animated_emoji.dart';
 import '../widgets/attachments.dart';
 import '../widgets/avatar.dart';
@@ -38,6 +45,8 @@ import '../widgets/bubble_body.dart';
 import '../widgets/chat_background.dart';
 import '../widgets/doodle_attachment.dart';
 import '../widgets/doodle_overlay.dart';
+import '../widgets/loading_placeholders.dart';
+import '../widgets/message_highlight.dart';
 import '../widgets/rich_message_text.dart';
 import '../widgets/nudge_overlay.dart';
 import '../widgets/quoted_message.dart';
@@ -50,6 +59,20 @@ import 'call_screen.dart';
 import 'contact_profile_screen.dart';
 import 'nudge_history_screen.dart';
 import 'shared_media_screen.dart';
+import 'wallpaper_crop_screen.dart';
+
+/// Toolbar height when the header carries a name, presence and a mood line.
+///
+/// The default 56 fits two lines; the mood's italic descenders were being
+/// sliced off by the bottom edge of the bar.
+const double chatHeaderHeightWithMood = 68;
+
+/// The same height, grown for a phone set to larger text.
+///
+/// Clamped because past a point the bar would eat the chat rather than the
+/// three lines it is there to show; the mood ellipsises instead.
+double chatHeaderHeightForScale(TextScaler scaler) =>
+    chatHeaderHeightWithMood * scaler.scale(1).clamp(1.0, 1.4);
 
 class ChatScreen extends StatefulWidget {
   const ChatScreen({
@@ -105,6 +128,12 @@ class _ChatScreenState extends State<ChatScreen> {
   int? _highlightedMessageId;
   Timer? _highlightTimer;
 
+  /// True while a jump is walking towards a message off screen.
+  bool _jumping = false;
+
+  /// True while an in-chat search is reading history and matching it.
+  bool _searchRunning = false;
+
   /// Set once the user closes the anniversary-day banner, so it stays gone for
   /// this visit instead of springing back on every rebuild.
   bool _anniversaryBannerDismissed = false;
@@ -122,10 +151,7 @@ class _ChatScreenState extends State<ChatScreen> {
     // haptic already fired in AppState, for every screen).
     _nudgeSub = _appState.nudges.listen((n) {
       if (!mounted || n.conversationId != widget.conversation.id) return;
-      _nudgeOverlay.play(
-        glyph: n.variant.emoji,
-        caption: n.caption,
-      );
+      _nudgeOverlay.play(glyph: n.variant.emoji, caption: n.caption);
     });
     _doodleIncoming = DoodleIncomingController(
       conversationId: widget.conversation.id,
@@ -147,17 +173,42 @@ class _ChatScreenState extends State<ChatScreen> {
   /// reversed list itself, so only a jump to a specific message needs work.
   Future<void> _openConversation() async {
     try {
-      await _appState.loadMessages(widget.conversation.id, initial: true);
+      await _loadHistoryWithRetry();
       if (!mounted) return;
       final target = widget.initialMessageId;
       if (target != null) {
         _openingConversation = false;
         await _goToMessage(target);
       }
-    } catch (_) {
-      // AppState already exposes load failures through its normal error UI.
+    } catch (error) {
+      // Silence here used to leave a placeholder that never resolved, with no
+      // way to tell a slow link from a chat that failed to open.
+      if (mounted) _showMessage(friendlyMessage(error));
     } finally {
-      if (mounted) _openingConversation = false;
+      // setState, not a bare assignment: an empty chat waits on this flag to
+      // swap its placeholder for the real illustration, and nothing else is
+      // guaranteed to rebuild afterwards.
+      if (mounted) setState(() => _openingConversation = false);
+    }
+  }
+
+  /// Fetches history, retrying a failed first attempt before giving up.
+  ///
+  /// Opening a chat is the one moment the transcript has to be right, and the
+  /// tunnel is often still settling right after a resume. One quick retry turns
+  /// that into a slightly slower open instead of a chat that looks empty and
+  /// stays that way until the app is restarted.
+  Future<void> _loadHistoryWithRetry() async {
+    const attempts = 3;
+    for (var attempt = 1; attempt <= attempts; attempt++) {
+      try {
+        await _appState.loadMessages(widget.conversation.id, initial: true);
+        return;
+      } catch (_) {
+        if (attempt == attempts || !mounted) rethrow;
+        await Future<void>.delayed(Duration(milliseconds: 400 * attempt));
+        if (!mounted) return;
+      }
     }
   }
 
@@ -171,6 +222,7 @@ class _ChatScreenState extends State<ChatScreen> {
     _appState.removeListener(_onAppStateChanged);
     _endDoodleMode(sendEnd: false);
     _nudgeOverlay.dispose();
+    _messageKeys.clear();
     _appState.setActiveConversation(null);
     _appState.setTyping(widget.conversation.id, false);
     VoicePlayer.instance.stop();
@@ -187,11 +239,12 @@ class _ChatScreenState extends State<ChatScreen> {
     if (!_scroll.hasClients) return;
     final position = _scroll.position;
 
-    if (!_openingConversation &&
-        shouldLoadOlder(
-          pixels: position.pixels,
-          maxScrollExtent: position.maxScrollExtent,
-        )) {
+    if (shouldPageHistory(
+      opening: _openingConversation,
+      jumping: _jumping,
+      pixels: position.pixels,
+      maxScrollExtent: position.maxScrollExtent,
+    )) {
       _appState.loadOlder(widget.conversation.id);
     }
     final shouldShow = shouldShowJumpToLatest(position.pixels);
@@ -410,45 +463,128 @@ class _ChatScreenState extends State<ChatScreen> {
     });
   }
 
-  /// Scrolls to a quoted message and flashes it.
+  /// Scrolls a starred, quoted, pinned or searched-for message into view and
+  /// flashes it.
   ///
-  /// Off-screen items are not laid out, so this first moves near the message by
-  /// its position in the list, then lets [Scrollable.ensureVisible] settle it
-  /// once the row has actually been built.
+  /// Rows that are off screen are never laid out, so there is no context for
+  /// [Scrollable.ensureVisible] to work with and nothing to measure. Guessing an
+  /// offset from the message's position assumes every row is the same height,
+  /// which lands *near* the message — close enough to see the neighbourhood, not
+  /// close enough to know which bubble was meant.
+  ///
+  /// So this walks instead of guessing: hop towards the target, let the frame
+  /// build, and repeat until the row exists, then centre it and settle again
+  /// once late images have had their say.
   Future<void> _goToMessage(int messageId) async {
+    // Two jumps at once would fight over the same scroll position, and the one
+    // that lost would leave the reader somewhere neither of them meant.
+    if (_jumping) return;
+    _jumping = true;
+    try {
+      await _jumpToMessage(messageId);
+    } finally {
+      _jumping = false;
+    }
+  }
+
+  List<ChatMessage> get _transcript =>
+      _appState.messagesByConv[widget.conversation.id] ?? const <ChatMessage>[];
+
+  int _indexOfMessage(int messageId) =>
+      _transcript.indexWhere((m) => m.id == messageId);
+
+  Future<void> _jumpToMessage(int messageId) async {
     final loaded = await _appState.ensureMessageLoaded(
       widget.conversation.id,
       messageId,
     );
     if (!mounted) return;
-    if (!loaded) {
+    if (!loaded || _indexOfMessage(messageId) < 0) {
       _showMessage('That message is no longer available.');
       return;
     }
 
-    final messages = _appState.messagesByConv[widget.conversation.id] ?? [];
-    final index = messages.indexWhere((m) => m.id == messageId);
-    if (index < 0) {
-      _showMessage('That message is no longer available.');
-      return;
+    // Opening straight onto a starred or searched-for message arrives here in
+    // the same breath as the history, before the list has attached itself.
+    for (var wait = 0; wait < 5 && !_scroll.hasClients; wait++) {
+      await _nextFrame();
+      if (!mounted) return;
     }
+    if (!_scroll.hasClients) return;
 
-    _highlight(messageId);
+    if (await _ensureVisible(messageId)) return;
 
-    if (!await _ensureVisible(messageId)) {
-      if (_scroll.hasClients && messages.length > 1) {
-        _scroll.jumpTo(
-          approximateOffsetForIndex(
-            index: index,
-            messageCount: messages.length,
-            maxScrollExtent: _scroll.position.maxScrollExtent,
-          ),
-        );
-        await Future<void>.delayed(const Duration(milliseconds: 16));
-        await _ensureVisible(messageId);
-      }
+    // Where the reader was standing, to be put back if the walk comes to
+    // nothing. An abandoned walk ends deep in layout the list only estimated,
+    // which reads as an empty chat and needs a restart to shake off.
+    final home = _scroll.position.pixels;
+
+    final outcome = await huntForMessage(
+      // Read every hop, never remembered: indices count from the oldest message,
+      // so a page of history landing mid-walk renumbers the row being walked to.
+      indexOfTarget: () => _indexOfMessage(messageId),
+      targetIsBuilt: () => _messageKeys[messageId]?.currentContext != null,
+      builtRows: _liveBuiltRows,
+      geometry: () => (
+        pixels: _scroll.position.pixels,
+        viewportExtent: _scroll.position.viewportDimension,
+        maxScrollExtent: _scroll.position.maxScrollExtent,
+      ),
+      jumpTo: _scroll.jumpTo,
+      nextFrame: _nextFrame,
+      keepGoing: () => mounted && _scroll.hasClients,
+    );
+    if (!mounted || !_scroll.hasClients) return;
+
+    switch (outcome) {
+      case HuntResult.arrived:
+        if (await _ensureVisible(messageId)) {
+          // Quotes, photos and video thumbnails finish measuring a beat later
+          // and can nudge the row off centre, so correct once they have.
+          await _nextFrame();
+          if (!mounted) return;
+          await _ensureVisible(messageId);
+          return;
+        }
+        _returnTo(home);
+        _reportMissedJump();
+      case HuntResult.gone:
+        _returnTo(home);
+        _showMessage('That message is no longer available.');
+      case HuntResult.missed:
+        _returnTo(home);
+        _reportMissedJump();
     }
   }
+
+  /// Puts the reader back where a jump started.
+  void _returnTo(double offset) {
+    if (!_scroll.hasClients) return;
+    _scroll.jumpTo(
+      offset.clamp(newestMessageOffset, _scroll.position.maxScrollExtent),
+    );
+  }
+
+  /// Says so when a jump gave up, rather than leaving the reader adrift in the
+  /// middle of the transcript wondering whether anything happened.
+  void _reportMissedJump() {
+    _highlightTimer?.cancel();
+    if (_highlightedMessageId != null) {
+      setState(() => _highlightedMessageId = null);
+    }
+    _showMessage('Could not reach that message. Please try again.');
+  }
+
+  /// Waits for the list to lay out whatever the last hop brought into range.
+  ///
+  /// The timeout is only a way out of waiting for a frame that will never come.
+  /// It used to be shorter than a slow frame on a modest phone, so a hop would
+  /// give up on the layout it had just asked for, read the old position, and
+  /// jump again — several screens at a time, past the row it was looking for.
+  Future<void> _nextFrame() => SchedulerBinding.instance.endOfFrame.timeout(
+    const Duration(milliseconds: 320),
+    onTimeout: () {},
+  );
 
   Future<void> _openSharedMedia(Conversation conv) async {
     final messageId = await Navigator.of(context).push<int>(
@@ -461,6 +597,8 @@ class _ChatScreenState extends State<ChatScreen> {
   Future<bool> _ensureVisible(int messageId) async {
     final target = _messageKeys[messageId]?.currentContext;
     if (target == null) return false;
+    // Lit as the row appears, so the glow rides in with it.
+    _light(messageId);
     await Scrollable.ensureVisible(
       target,
       // Centred, because alignment is measured from the leading edge and this
@@ -469,15 +607,47 @@ class _ChatScreenState extends State<ChatScreen> {
       duration: const Duration(milliseconds: 220),
       curve: Curves.easeOutCubic,
     );
+    if (!mounted) return true;
+    // The hold starts once the row has settled in the middle. Starting it back
+    // when the jump began meant a long walk through history spent the whole glow
+    // before the message was even on screen, and it arrived dark.
+    _holdHighlight(messageId);
     return true;
   }
 
-  void _highlight(int messageId) {
+  void _light(int messageId) {
     _highlightTimer?.cancel();
+    if (_highlightedMessageId == messageId) return;
     setState(() => _highlightedMessageId = messageId);
-    _highlightTimer = Timer(const Duration(milliseconds: 1600), () {
-      if (mounted) setState(() => _highlightedMessageId = null);
+  }
+
+  void _holdHighlight(int messageId) {
+    _highlightTimer?.cancel();
+    _highlightTimer = Timer(messageHighlightHold, () {
+      if (!mounted || _highlightedMessageId != messageId) return;
+      setState(() => _highlightedMessageId = null);
     });
+  }
+
+  /// Message indices whose rows are laid out right now, which is how the walk in
+  /// [_goToMessage] knows which way the target lies.
+  ///
+  /// Read from the rows themselves rather than from the item builder. One long
+  /// hop makes the list create every row it passes over and then drop all but
+  /// the few it landed among, so a range collected while building describes
+  /// history that no longer exists — and a walk that trusted it stood still,
+  /// believing it had already arrived.
+  BuiltRows? _liveBuiltRows() {
+    final transcript = _transcript;
+    int? oldest;
+    int? newest;
+    for (var index = 0; index < transcript.length; index++) {
+      if (_messageKeys[transcript[index].id]?.currentContext == null) continue;
+      oldest ??= index;
+      newest = index;
+    }
+    if (oldest == null || newest == null) return null;
+    return (oldest: oldest, newest: newest);
   }
 
   /// Keys for messages currently on screen, used to scroll to a quote.
@@ -729,7 +899,11 @@ class _ChatScreenState extends State<ChatScreen> {
 
   Future<void> _searchInChat(Conversation conv, String query) async {
     final trimmed = query.trim();
-    if (trimmed.isEmpty) return;
+    if (trimmed.isEmpty || _searchRunning) return;
+    // Reading the whole chat back to its first message takes a moment on a
+    // phone server, and a search that looks like it did nothing is worse than
+    // one that visibly waits.
+    setState(() => _searchRunning = true);
     try {
       final results = await _appState.searchMessages(
         trimmed,
@@ -737,7 +911,7 @@ class _ChatScreenState extends State<ChatScreen> {
       );
       if (!mounted) return;
       if (results.isEmpty) {
-        _showMessage('No messages match that search.');
+        _showMessage('No messages in this chat match “$trimmed”.');
         return;
       }
       await showModalBottomSheet<void>(
@@ -773,6 +947,8 @@ class _ChatScreenState extends State<ChatScreen> {
       );
     } catch (e) {
       _showMessage(friendlyMessage(e));
+    } finally {
+      if (mounted) setState(() => _searchRunning = false);
     }
   }
 
@@ -843,7 +1019,9 @@ class _ChatScreenState extends State<ChatScreen> {
     if (canvas == null || canvas.width <= 0 || canvas.height <= 0) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Could not capture the drawing canvas.')),
+          const SnackBar(
+            content: Text('Could not capture the drawing canvas.'),
+          ),
         );
       }
       return;
@@ -873,9 +1051,9 @@ class _ChatScreenState extends State<ChatScreen> {
       _endDoodleMode(sendEnd: true, fromSend: true);
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text(friendlyMessage(e))),
-        );
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(friendlyMessage(e))));
       }
     } finally {
       if (tempFile != null) {
@@ -1034,6 +1212,14 @@ class _ChatScreenState extends State<ChatScreen> {
             ])
               ListTile(
                 title: Text(option.$2),
+                // Spelling out the moment on the chosen row answers "when,
+                // exactly?" without having to open a message.
+                subtitle: (current ?? 0) == option.$1 && option.$1 > 0
+                    ? Text(
+                        'A message sent now would go '
+                        '${formatMomentWithDay(context, DateTime.now().add(Duration(seconds: option.$1)))}',
+                      )
+                    : null,
                 trailing: (current ?? 0) == option.$1
                     ? const Icon(Icons.check_rounded)
                     : null,
@@ -1071,12 +1257,21 @@ class _ChatScreenState extends State<ChatScreen> {
         '${picked.month.toString().padLeft(2, '0')}-'
         '${picked.day.toString().padLeft(2, '0')}';
     await _guard(() => _appState.setAnniversary(conv.id, iso));
+    // Choosing a date is a clear enough yes: without this the date would be
+    // saved and nothing would appear, which reads as the option not working.
+    if (!_appState.coupleDetailsEnabled(conv.id)) {
+      await _guard(() => _appState.setCoupleDetailsEnabled(conv.id, true));
+    }
   }
 
   /// A gentle, dismissible strip shown only on the anniversary day itself.
   /// Returns null on every other day so the transcript stays uncluttered.
   Widget? _anniversaryBanner(Conversation conv) {
-    if (conv.type != 'dm' || _anniversaryBannerDismissed) return null;
+    if (conv.type != 'dm' ||
+        !_appState.coupleDetailsEnabled(conv.id) ||
+        _anniversaryBannerDismissed) {
+      return null;
+    }
     final countdown = anniversaryCountdown(conv.anniversaryOn);
     if (countdown == null || !countdown.isToday) return null;
     final scheme = Theme.of(context).colorScheme;
@@ -1163,50 +1358,72 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   Future<void> _openCoupleDetails(Conversation conv) async {
-    final live = _appState.conversationById(conv.id) ?? conv;
-    final countdown = anniversaryCountdown(live.anniversaryOn);
+    // A Consumer so the switch answers where it is tapped. Popping the sheet to
+    // apply the change made turning couple details off look like a dead
+    // control: the sheet closed and the option was still there.
     final action = await showModalBottomSheet<String>(
       context: context,
       showDragHandle: true,
-      builder: (sheetContext) => SafeArea(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const ListTile(
-              leading: Icon(Icons.favorite_outline_rounded),
-              title: Text('Couple details'),
-            ),
-            if (live.streakDays > 0)
-              ListTile(
-                leading: const Text('🔥', style: TextStyle(fontSize: 22)),
-                title: Text('${live.streakDays}-day streak'),
-                subtitle: const Text(
-                  'A day counts when both of you send a message.',
+      builder: (sheetContext) => Consumer<AppState>(
+        builder: (_, state, _) {
+          final live = state.conversationById(conv.id) ?? conv;
+          final showing = state.coupleDetailsEnabled(live.id);
+          final countdown = anniversaryCountdown(live.anniversaryOn);
+          return SafeArea(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                SwitchListTile(
+                  key: const Key('couple-details-sheet-switch'),
+                  secondary: const Icon(Icons.favorite_outline_rounded),
+                  title: const Text('Show in this chat'),
+                  subtitle: const Text(
+                    'The streak and the anniversary day banner, on this phone '
+                    'only',
+                  ),
+                  value: showing,
+                  onChanged: (on) => state.setCoupleDetailsEnabled(live.id, on),
                 ),
-              ),
-            ListTile(
-              leading: const Icon(Icons.event_rounded),
-              title: Text(
-                live.anniversaryOn == null
-                    ? 'Set anniversary'
-                    : countdown?.label ?? 'Anniversary',
-              ),
-              subtitle: live.anniversaryOn == null
-                  ? const Text('A private yearly month-and-day reminder')
-                  : Text(live.anniversaryOn!),
-              onTap: () => Navigator.pop(sheetContext, 'set'),
+                const Divider(height: 1),
+                // Reachable with the switch off as well: picking a date is how
+                // most people start, and it turns the display on by itself.
+                ListTile(
+                  key: const Key('couple-details-anniversary'),
+                  leading: const Icon(Icons.event_rounded),
+                  title: Text(
+                    live.anniversaryOn == null
+                        ? 'Set anniversary'
+                        : countdown?.label ?? 'Anniversary',
+                  ),
+                  subtitle: live.anniversaryOn == null
+                      ? const Text('A private yearly month-and-day reminder')
+                      : Text(live.anniversaryOn!),
+                  onTap: () => Navigator.pop(sheetContext, 'set'),
+                ),
+                if (live.anniversaryOn != null)
+                  ListTile(
+                    key: const Key('couple-details-clear-anniversary'),
+                    leading: const Icon(Icons.event_busy_outlined),
+                    title: const Text('Clear anniversary'),
+                    onTap: () => Navigator.pop(sheetContext, 'clear'),
+                  ),
+                if (showing && live.streakDays > 0)
+                  ListTile(
+                    leading: const Text('🔥', style: TextStyle(fontSize: 22)),
+                    title: Text('${live.streakDays}-day streak'),
+                    subtitle: const Text(
+                      'A day counts when both of you send a message.',
+                    ),
+                  ),
+                const SizedBox(height: 8),
+              ],
             ),
-            if (live.anniversaryOn != null)
-              ListTile(
-                leading: const Icon(Icons.event_busy_outlined),
-                title: const Text('Clear anniversary'),
-                onTap: () => Navigator.pop(sheetContext, 'clear'),
-              ),
-          ],
-        ),
+          );
+        },
       ),
     );
     if (!mounted) return;
+    final live = _appState.conversationById(conv.id) ?? conv;
     if (action == 'set') {
       await _pickAnniversary(live);
     } else if (action == 'clear') {
@@ -1245,13 +1462,18 @@ class _ChatScreenState extends State<ChatScreen> {
                       leading: const Icon(Icons.brightness_6_rounded),
                       title: const Text('Dim'),
                       subtitle: Slider(
-                        value: (live.wallpaperDim ?? 0.25).clamp(0.0, 0.8),
+                        value: (live.wallpaperDim ?? wallpaperDimDefault).clamp(
+                          wallpaperDimFloor,
+                          0.8,
+                        ),
                         max: 0.8,
                         divisions: 8,
                         label:
-                            '${((live.wallpaperDim ?? 0.25) * 100).round()}%',
-                        onChanged: (value) =>
-                            state.setChatWallpaperDim(conv.id, value),
+                            '${(((live.wallpaperDim ?? wallpaperDimDefault).clamp(wallpaperDimFloor, 0.8)) * 100).round()}%',
+                        onChanged: (value) => state.setChatWallpaperDim(
+                          conv.id,
+                          value.clamp(wallpaperDimFloor, 0.8),
+                        ),
                       ),
                     ),
                     ListTile(
@@ -1275,7 +1497,25 @@ class _ChatScreenState extends State<ChatScreen> {
     if (choice != 'pick') return;
     final picked = await MediaPickerService.pickSingleGalleryImage(context);
     if (picked == null || !mounted) return;
-    await _guard(() => _appState.setChatWallpaper(conv.id, picked));
+    // The photo is framed first: zoom, position, and dim are the user's call,
+    // not a centre crop chosen for them.
+    final framed = await Navigator.of(context).push<WallpaperChoice>(
+      MaterialPageRoute(
+        builder: (_) => WallpaperCropScreen(
+          source: picked,
+          initialDim: _appState.wallpaperDimFor(conv.id),
+        ),
+      ),
+    );
+    if (framed == null || !mounted) return;
+    try {
+      await _guard(() async {
+        await _appState.setChatWallpaper(conv.id, framed.image);
+        await _appState.setChatWallpaperDim(conv.id, framed.dim);
+      });
+    } finally {
+      await framed.image.delete().catchError((_) => framed.image);
+    }
   }
 
   List<PopupMenuEntry<String>> _chatMenuItems(
@@ -1284,7 +1524,12 @@ class _ChatScreenState extends State<ChatScreen> {
   ) {
     final pinned = state.isPinned(conv.id);
     final muted = state.isMuted(conv.id);
-    final anniversary = anniversaryCountdown(conv.anniversaryOn);
+    final coupleEnabled = state.coupleDetailsEnabled(conv.id);
+    final coupleLabel = coupleMenuLabel(
+      enabled: coupleEnabled,
+      streakDays: conv.streakDays,
+      countdown: anniversaryCountdown(conv.anniversaryOn),
+    );
     return [
       const PopupMenuItem(
         value: 'search',
@@ -1383,19 +1628,23 @@ class _ChatScreenState extends State<ChatScreen> {
           subtitle: Text(_disappearingLabel(conv.disappearAfterSeconds)),
         ),
       ),
-      if (conv.type == 'dm')
+      // Every DM offers this, because a chat that has never been asked about it
+      // is exactly the chat that needs somewhere to say yes. Switched off it is
+      // named for what it does and shows nothing in the chat, so a menu shared
+      // with a parent reads as plainly as any other setting.
+      if (offersCoupleDetails(conv.type))
         PopupMenuItem(
           value: 'couple',
           child: ListTile(
             dense: true,
             contentPadding: EdgeInsets.zero,
-            leading: const Icon(Icons.favorite_outline_rounded),
-            title: Text(
-              conv.streakDays > 0
-                  ? 'Couple details · ${conv.streakDays}-day streak'
-                  : 'Couple details',
+            leading: Icon(
+              coupleEnabled
+                  ? Icons.favorite_rounded
+                  : Icons.favorite_outline_rounded,
             ),
-            subtitle: anniversary == null ? null : Text(anniversary.label),
+            title: Text(coupleLabel.title),
+            subtitle: Text(coupleLabel.subtitle),
           ),
         ),
     ];
@@ -1423,6 +1672,15 @@ class _ChatScreenState extends State<ChatScreen> {
       orElse: () => widget.conversation,
     )!;
     final messages = state.messagesByConv[conv.id] ?? const <ChatMessage>[];
+    // The first load of this visit outranks anything AppState remembers: a chat
+    // opened while its own fetch is still in flight has established nothing, so
+    // "Say hello to …" would be a guess that history is about to contradict.
+    final transcriptView = collectionView(
+      phase: _openingConversation
+          ? LoadPhase.loading
+          : state.conversationPhase(conv.id),
+      isEmpty: messages.isEmpty,
+    );
     _followNewMessages(messages.length);
     final online = conv.type == 'dm' && conv.peer != null
         ? (state.onlineByUser[conv.peer!.id] ?? false)
@@ -1442,6 +1700,11 @@ class _ChatScreenState extends State<ChatScreen> {
       child: Scaffold(
         backgroundColor: AppColors.chatCanvasFor(context),
         appBar: AppBar(
+          // A name, a presence line and a mood do not fit in the default bar,
+          // and the third line was being cut through its descenders.
+          toolbarHeight: mood != null && !_searching
+              ? chatHeaderHeightForScale(MediaQuery.textScalerOf(context))
+              : null,
           leading: _searching
               ? IconButton(
                   tooltip: 'Cancel search',
@@ -1522,10 +1785,12 @@ class _ChatScreenState extends State<ChatScreen> {
                                         child: Semantics(
                                           key: ValueKey(presence),
                                           label: presence,
-                                          child: SingleChildScrollView(
-                                            scrollDirection: Axis.horizontal,
+                                          child: FittedBox(
+                                            fit: BoxFit.scaleDown,
+                                            alignment: Alignment.centerLeft,
                                             child: Text(
                                               presence,
+                                              maxLines: 1,
                                               style: TextStyle(
                                                 fontSize: 12.5,
                                                 color:
@@ -1541,15 +1806,23 @@ class _ChatScreenState extends State<ChatScreen> {
                                         ),
                                       ),
                                     if (mood != null)
-                                      Text(
-                                        mood,
-                                        style: TextStyle(
-                                          fontSize: 11.5,
-                                          color: scheme.onSurfaceVariant
-                                              .withValues(alpha: 0.9),
-                                          fontStyle: FontStyle.italic,
+                                      Padding(
+                                        padding: const EdgeInsets.only(top: 1),
+                                        child: Text(
+                                          mood,
+                                          maxLines: 1,
+                                          style: TextStyle(
+                                            fontSize: 11.5,
+                                            // Italics need room under the
+                                            // baseline; the default line height
+                                            // clipped their tails.
+                                            height: 1.25,
+                                            color: scheme.onSurfaceVariant
+                                                .withValues(alpha: 0.9),
+                                            fontStyle: FontStyle.italic,
+                                          ),
+                                          overflow: TextOverflow.ellipsis,
                                         ),
-                                        overflow: TextOverflow.ellipsis,
                                       ),
                                   ],
                                 ),
@@ -1562,12 +1835,30 @@ class _ChatScreenState extends State<ChatScreen> {
                 ),
           actions: [
             if (_searching)
-              IconButton(
-                tooltip: 'Search',
-                icon: const Icon(Icons.search_rounded),
-                onPressed: () => _searchInChat(conv, _searchQuery.text),
-              )
+              _searchRunning
+                  ? const Padding(
+                      padding: EdgeInsets.symmetric(horizontal: 16),
+                      child: Center(
+                        child: SizedBox(
+                          width: 18,
+                          height: 18,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        ),
+                      ),
+                    )
+                  : IconButton(
+                      tooltip: 'Search',
+                      icon: const Icon(Icons.search_rounded),
+                      onPressed: () => _searchInChat(conv, _searchQuery.text),
+                    )
             else ...[
+              if (conv.disappearAfterSeconds != null)
+                IconButton(
+                  tooltip:
+                      'Disappearing messages: ${_disappearingLabel(conv.disappearAfterSeconds)}',
+                  onPressed: () => _openDisappearingSheet(conv),
+                  icon: const Icon(Icons.timer_outlined),
+                ),
               if (conv.type == 'dm') ...[
                 IconButton(
                   tooltip: 'Voice call',
@@ -1612,7 +1903,12 @@ class _ChatScreenState extends State<ChatScreen> {
                   onDoubleTap: _doodleMode ? null : _sendNudge,
                   child: Stack(
                     children: [
-                      if (messages.isEmpty)
+                      // An unanswered chat is not an empty one: until the
+                      // history resolves, stand-in bubbles wait instead of
+                      // claiming there is nothing here.
+                      if (transcriptView == CollectionView.skeleton)
+                        const TranscriptSkeleton()
+                      else if (transcriptView == CollectionView.empty)
                         _EmptyConversation(title: title)
                       else
                         _MessageList(
@@ -1662,6 +1958,9 @@ class _ChatScreenState extends State<ChatScreen> {
               _UploadProgressBar(
                 done: state.mediaUploadDone,
                 total: state.mediaUploadTotal,
+                bytesSent: state.mediaUploadBytesSent,
+                bytesTotal: state.mediaUploadBytesTotal,
+                waiting: state.mediaUploadWaiting,
               ),
             // Keys matter here. Inserting the draft bar above the composer shifts
             // the composer down a slot, and without keys Flutter rebuilds it from
@@ -1700,7 +1999,7 @@ class _ChatScreenState extends State<ChatScreen> {
 }
 
 /// Scrolling transcript with date separators and grouped runs of messages.
-class _MessageList extends StatelessWidget {
+class _MessageList extends StatefulWidget {
   const _MessageList({
     required this.controller,
     required this.messages,
@@ -1725,26 +2024,37 @@ class _MessageList extends StatelessWidget {
   final ValueChanged<ChatMessage> onReply;
   final ValueChanged<int> onQuoteTap;
 
+  @override
+  State<_MessageList> createState() => _MessageListState();
+}
+
+class _MessageListState extends State<_MessageList> {
   static bool _sameDay(DateTime a, DateTime b) =>
       a.year == b.year && a.month == b.month && a.day == b.day;
 
   @override
   Widget build(BuildContext context) {
     return ListView.builder(
-      controller: controller,
+      // Roughly a screen of rows is kept laid out beyond the viewport, so a row
+      // is measured — and its picture already resolving — before it scrolls in.
+      // A tighter window saved a little memory and paid for it in stutter.
+      scrollCacheExtent: const ScrollCacheExtent.pixels(600),
+      controller: widget.controller,
       // Built bottom-up: the newest message is the anchor, so opening a chat
       // needs no catch-up scroll and a late-loading image cannot shift it.
       reverse: true,
+      addAutomaticKeepAlives: false,
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
       itemCount: transcriptItemCount(
-        messageCount: messages.length,
-        typing: typing,
+        messageCount: widget.messages.length,
+        typing: widget.typing,
       ),
       itemBuilder: (context, index) {
+        final messages = widget.messages;
         final messageIndex = transcriptMessageIndex(
           itemIndex: index,
           messageCount: messages.length,
-          typing: typing,
+          typing: widget.typing,
         );
         if (messageIndex == null) return const _TypingBubble();
 
@@ -1753,7 +2063,7 @@ class _MessageList extends StatelessWidget {
         final next = messageIndex == messages.length - 1
             ? null
             : messages[messageIndex + 1];
-        final mine = msg.senderId == meId;
+        final mine = msg.senderId == widget.meId;
 
         final startsDay =
             previous == null ||
@@ -1769,33 +2079,40 @@ class _MessageList extends StatelessWidget {
           children: [
             if (startsDay) _DateSeparator(date: msg.createdAt.toLocal()),
             Padding(
-              key: keyFor(msg.id),
+              key: widget.keyFor(msg.id),
               padding: EdgeInsets.only(top: firstOfRun ? 8 : 2),
-              child: SwipeToReply(
-                // Pending messages have no server id yet, so there is nothing
-                // for the other side to quote.
-                enabled: !msg.pending && msg.id > 0 && !msg.isDeleted,
-                onReply: () => onReply(msg),
-                child: _MessageRow(
-                  message: msg,
-                  conversationId: conversation.id,
-                  mine: mine,
-                  firstOfRun: firstOfRun,
-                  lastOfRun: lastOfRun,
-                  showSenderName:
-                      conversation.type == 'group' && !mine && firstOfRun,
-                  senderName: senderNameOf(msg.senderId),
-                  highlighted: highlightedMessageId == msg.id,
-                  quotedSenderName: msg.replyTo == null
-                      ? null
-                      : senderNameOf(msg.replyTo!.senderId),
-                  quotedIsMine: msg.replyTo?.senderId == meId,
-                  onQuoteTap: msg.replyTo == null
-                      ? null
-                      : () => onQuoteTap(msg.replyTo!.id),
-                  onReply: msg.pending || msg.id <= 0 || msg.isDeleted
-                      ? null
-                      : () => onReply(msg),
+              // Behind the whole row, so a photo or a drawing lights up as
+              // plainly as a line of text.
+              child: MessageHighlight(
+                active: widget.highlightedMessageId == msg.id,
+                child: SwipeToReply(
+                  // Pending messages have no server id yet, so there is nothing
+                  // for the other side to quote.
+                  enabled: !msg.pending && msg.id > 0 && !msg.isDeleted,
+                  onReply: () => widget.onReply(msg),
+                  child: _MessageRow(
+                    message: msg,
+                    conversationId: widget.conversation.id,
+                    mine: mine,
+                    firstOfRun: firstOfRun,
+                    lastOfRun: lastOfRun,
+                    showSenderName:
+                        widget.conversation.type == 'group' &&
+                        !mine &&
+                        firstOfRun,
+                    senderName: widget.senderNameOf(msg.senderId),
+                    highlighted: widget.highlightedMessageId == msg.id,
+                    quotedSenderName: msg.replyTo == null
+                        ? null
+                        : widget.senderNameOf(msg.replyTo!.senderId),
+                    quotedIsMine: msg.replyTo?.senderId == widget.meId,
+                    onQuoteTap: msg.replyTo == null
+                        ? null
+                        : () => widget.onQuoteTap(msg.replyTo!.id),
+                    onReply: msg.pending || msg.id <= 0 || msg.isDeleted
+                        ? null
+                        : () => widget.onReply(msg),
+                  ),
                 ),
               ),
             ),
@@ -1873,6 +2190,15 @@ class _MessageRow extends StatelessWidget {
               ),
             ),
             const Divider(height: 1),
+            if (message.expiresAt != null)
+              ListTile(
+                key: const Key('message-expiry-row'),
+                leading: const Icon(Icons.timer_outlined),
+                title: Text(
+                  formatDisappearsAt(sheetContext, message.expiresAt!),
+                ),
+                subtitle: const Text('Then it is gone for everyone here'),
+              ),
             if (hasAttachActions) ...[
               ListTile(
                 leading: const Icon(Icons.open_in_new_rounded),
@@ -2145,6 +2471,7 @@ class _MessageRow extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
+    final state = context.watch<AppState>();
     final maxWidth = MediaQuery.of(context).size.width * 0.76;
 
     // Call logs sit centred like WhatsApp's "Video call · 21 secs", not in a
@@ -2158,16 +2485,38 @@ class _MessageRow extends StatelessWidget {
         !message.isDeleted;
     final isDoodleTile = message.type == 'doodle' && !message.isDeleted;
     final isEdgeTile = isMediaTile || isDoodleTile;
+    final metaColor = isEdgeTile ? Colors.white : scheme.outline;
+    final starred = state.isMessageStarred(message.id);
+    final pinned = state.isMessagePinned(conversationId, message.id);
+    final disappearing = message.expiresAt != null;
 
     final footer = Row(
       mainAxisSize: MainAxisSize.min,
       children: [
+        if (starred)
+          _MessageStateIcon(
+            icon: Icons.star_rounded,
+            label: 'Starred',
+            color: metaColor,
+          ),
+        if (pinned)
+          _MessageStateIcon(
+            icon: Icons.push_pin_rounded,
+            label: 'Pinned',
+            color: metaColor,
+          ),
+        if (disappearing)
+          _MessageStateIcon(
+            icon: Icons.timer_outlined,
+            label: formatDisappearsAt(context, message.expiresAt!),
+            color: metaColor,
+          ),
+        if (starred || pinned || disappearing) const SizedBox(width: 3),
         Text(
           formatClockTime(context, message.createdAt),
-          style: Theme.of(context).textTheme.labelSmall?.copyWith(
-            color: isEdgeTile ? Colors.white : scheme.outline,
-            fontSize: 11,
-          ),
+          style: Theme.of(
+            context,
+          ).textTheme.labelSmall?.copyWith(color: metaColor, fontSize: 11),
         ),
         if (mine) ...[
           const SizedBox(width: 4),
@@ -2196,6 +2545,13 @@ class _MessageRow extends StatelessWidget {
         ? null
         : () => _showActions(context);
 
+    final hasWallpaper = state.wallpaperUrlFor(conversationId) != null;
+    final bubbleColor = bubbleFillFor(
+      context: context,
+      mine: mine,
+      hasWallpaper: hasWallpaper,
+    );
+
     return Align(
       alignment: mine ? Alignment.centerRight : Alignment.centerLeft,
       child: ConstrainedBox(
@@ -2221,13 +2577,9 @@ class _MessageRow extends StatelessWidget {
                   : highlighted
                   ? Color.alphaBlend(
                       scheme.primary.withValues(alpha: 0.22),
-                      mine
-                          ? AppColors.bubbleMineFor(context)
-                          : AppColors.bubblePeerFor(context),
+                      bubbleColor,
                     )
-                  : mine
-                  ? AppColors.bubbleMineFor(context)
-                  : AppColors.bubblePeerFor(context),
+                  : bubbleColor,
               borderRadius: _bubbleRadius(),
               boxShadow: bare || isDoodleTile
                   ? null
@@ -2318,6 +2670,29 @@ class _MessageRow extends StatelessWidget {
   }
 }
 
+class _MessageStateIcon extends StatelessWidget {
+  const _MessageStateIcon({
+    required this.icon,
+    required this.label,
+    required this.color,
+  });
+
+  final IconData icon;
+  final String label;
+  final Color color;
+
+  @override
+  Widget build(BuildContext context) {
+    return Semantics(
+      label: label,
+      child: Padding(
+        padding: const EdgeInsets.only(right: 2),
+        child: Icon(icon, size: 12, color: color),
+      ),
+    );
+  }
+}
+
 /// Centered call-log entry ("Video call · 21 secs" / "Missed call"), styled
 /// like WhatsApp's in-transcript call rows.
 class _CallLogTile extends StatelessWidget {
@@ -2348,13 +2723,20 @@ class _CallLogTile extends StatelessWidget {
       endedByName: _endedByName(state, info),
     );
     final color = info.isNegative ? scheme.error : scheme.onSurfaceVariant;
+    final hasWallpaper = state.wallpaperUrlFor(message.conversationId) != null;
+    final fill = hasWallpaper
+        ? Color.alphaBlend(
+            scheme.surface.withValues(alpha: 0.92),
+            scheme.surfaceContainerHighest,
+          )
+        : scheme.surfaceContainerHighest;
 
     return Center(
       child: Container(
         margin: const EdgeInsets.symmetric(vertical: 6),
         padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
         decoration: BoxDecoration(
-          color: scheme.surfaceContainerHighest,
+          color: fill,
           borderRadius: BorderRadius.circular(14),
         ),
         child: Row(
@@ -2445,6 +2827,10 @@ class _MessageContent extends StatelessWidget {
           onLongPress: onLongPress,
         );
       default:
+        // Sealed text cannot be shown, and its token least of all: a reinstall
+        // retires the key that opened this stretch of history for good, so the
+        // bubble says as much instead of printing a line of base64.
+        if (isE2eCipherText(message.body)) return const _SealedBody();
         final scheme = Theme.of(context).colorScheme;
         final size = emojiSize;
         return Column(
@@ -2490,6 +2876,34 @@ class _MessageContent extends StatelessWidget {
           ],
         );
     }
+  }
+}
+
+/// Bubble for a body this phone has no key for.
+class _SealedBody extends StatelessWidget {
+  const _SealedBody();
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Icon(Icons.lock_outline_rounded, size: 15, color: scheme.outline),
+        const SizedBox(width: 6),
+        Flexible(
+          child: Text(
+            encryptedBodyStandIn,
+            style: TextStyle(
+              height: 1.35,
+              fontSize: 15,
+              fontStyle: FontStyle.italic,
+              color: scheme.onSurfaceVariant,
+            ),
+          ),
+        ),
+      ],
+    );
   }
 }
 
@@ -2714,15 +3128,31 @@ class _ShareOption extends StatelessWidget {
 
 /// Thin banner shown while an album of attachments is uploading in order.
 class _UploadProgressBar extends StatelessWidget {
-  const _UploadProgressBar({required this.done, required this.total});
+  const _UploadProgressBar({
+    required this.done,
+    required this.total,
+    required this.bytesSent,
+    required this.bytesTotal,
+    this.waiting = false,
+  });
 
   final int done;
   final int total;
+  final int bytesSent;
+  final int bytesTotal;
+  final bool waiting;
 
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
-    final value = total == 0 ? null : done / total;
+    final value = waiting
+        ? null
+        : uploadProgressValue(
+            filesDone: done,
+            filesTotal: total,
+            bytesSent: bytesSent,
+            bytesTotal: bytesTotal,
+          );
     return Container(
       padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
       color: scheme.surfaceContainerHighest,
@@ -2734,9 +3164,17 @@ class _UploadProgressBar extends StatelessWidget {
             child: CircularProgressIndicator(strokeWidth: 2, value: value),
           ),
           const SizedBox(width: 12),
-          Text(
-            'Sending $done of $total…',
-            style: Theme.of(context).textTheme.bodyMedium,
+          Expanded(
+            child: Text(
+              uploadProgressLabel(
+                filesDone: done,
+                filesTotal: total,
+                bytesSent: bytesSent,
+                bytesTotal: bytesTotal,
+                waiting: waiting,
+              ),
+              style: Theme.of(context).textTheme.bodyMedium,
+            ),
           ),
         ],
       ),

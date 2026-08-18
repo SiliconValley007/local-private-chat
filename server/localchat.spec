@@ -140,6 +140,7 @@ reset = Analysis(
                 "app.auth",
                 "app.db",
                 "app.models",
+                "app.sessions",
                 "bcrypt",
                 "passlib.handlers.bcrypt",
             ]
@@ -172,6 +173,54 @@ reset_exe = EXE(
     entitlements_file=None,
 )
 
+# Third entry: operator break-glass for admin username / device pin.
+set_admin = Analysis(
+    ["set_admin.py"],
+    pathex=["."],
+    binaries=[],
+    datas=[],
+    hiddenimports=sorted(
+        set(
+            passlib_hidden
+            + [
+                "app",
+                "app.admin",
+                "app.auth",
+                "app.db",
+                "app.models",
+                "app.sessions",
+                "bcrypt",
+                "passlib.handlers.bcrypt",
+            ]
+        )
+    ),
+    hookspath=[],
+    hooksconfig={},
+    runtime_hooks=[],
+    excludes=["tkinter", "matplotlib", "numpy", "pandas"],
+    noarchive=False,
+    optimize=0,
+)
+set_admin_pyz = PYZ(set_admin.pure)
+
+set_admin_exe = EXE(
+    set_admin_pyz,
+    set_admin.scripts,
+    [],
+    exclude_binaries=True,
+    name="SetAdmin",
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=True,
+    console=True,
+    disable_windowed_traceback=False,
+    argv_emulation=False,
+    target_arch=None,
+    codesign_identity=None,
+    entitlements_file=None,
+)
+
 coll = COLLECT(
     exe,
     a.binaries,
@@ -179,6 +228,9 @@ coll = COLLECT(
     reset_exe,
     reset.binaries,
     reset.datas,
+    set_admin_exe,
+    set_admin.binaries,
+    set_admin.datas,
     strip=False,
     upx=True,
     upx_exclude=[],

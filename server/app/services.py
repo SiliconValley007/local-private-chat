@@ -19,6 +19,7 @@ from app.call_log import (
     connected_duration_secs,
     should_include_ended_by,
 )
+from app import audit
 from app.call_sessions import CallSessionRecord
 from app.fcm import send_message_push, send_reaction_push
 from app.media_files import delete_message_files
@@ -127,6 +128,26 @@ def purge_expired_messages(db: Session, conversation_id: int) -> None:
         return
     files = [(m.media_path, m.media_thumb_path) for m in expired]
     ids = [m.id for m in expired]
+    # A disappearing message is the one deletion nobody asked for, so the log
+    # keeps what it said before the row is gone for good.
+    for message in expired:
+        audit.record(
+            db,
+            action="message.expired",
+            summary=(
+                f"message {message.id} reached its disappearing timer and was "
+                "removed"
+            ),
+            # Nobody did this: the timer did. Naming the sender as the actor
+            # would read as though they had deleted their own message, which is
+            # a different act entirely — they are recorded as whose message it
+            # was instead.
+            target_user_id=message.sender_id,
+            conversation_id=conversation_id,
+            message_id=message.id,
+            before_text=message.body,
+            details={**audit.snapshot(message), "expires_at": message.expires_at},
+        )
     db.execute(delete(MessageHide).where(MessageHide.message_id.in_(ids)))
     db.execute(delete(MessageReaction).where(MessageReaction.message_id.in_(ids)))
     db.execute(delete(MessageReceipt).where(MessageReceipt.message_id.in_(ids)))
@@ -319,6 +340,16 @@ async def create_and_broadcast_message(
     if offline:
         _push_to_offline_members(db, message, sender, offline)
 
+    audit.record(
+        db,
+        action="message.sent",
+        summary=f"{sender.username} sent {audit.describe_message(message)}",
+        actor=sender,
+        conversation_id=conversation_id,
+        message_id=message.id,
+        after_text=message.body,
+        details=audit.snapshot(message),
+    )
     return message
 
 
@@ -433,6 +464,15 @@ async def send_chat_nudge(
         if existing is not None and existing.sender_id == sender.id:
             await _echo_nudge_to_sender(db, sender=sender, row=existing)
         return
+
+    audit.record(
+        db,
+        action="chat.nudge",
+        summary=f"{sender.username} sent a {variant} nudge in chat {conversation_id}",
+        actor=sender,
+        conversation_id=conversation_id,
+        details={"variant": variant, "nudge_id": nudge_id},
+    )
 
     event = _nudge_event_payload(
         conversation_id=conversation_id,
@@ -575,9 +615,23 @@ async def edit_message(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Type a message before saving.",
         )
+    # Read before the overwrite: this is the only place the previous wording of
+    # an edited message still exists.
+    previous_body = message.body
     message.body = text
     message.edited_at = utcnow()
     db.commit()
+    audit.record(
+        db,
+        action="message.edited",
+        summary=f"{editor.username} edited message {message_id}",
+        actor=editor,
+        conversation_id=message.conversation_id,
+        message_id=message_id,
+        before_text=previous_body,
+        after_text=text,
+        details=audit.snapshot(message),
+    )
     message = load_message(db, message.id)
     assert message is not None
     members = member_user_ids(db, message.conversation_id)
@@ -614,6 +668,15 @@ async def soft_delete_message(
 
     media_path = message.media_path
     thumb_path = message.media_thumb_path
+    # Everything about to be cleared, kept while it still exists: after the
+    # commit below the row is a tombstone and the files are gone.
+    deleted_body = message.body
+    deleted_details = {
+        **audit.snapshot(message),
+        "media_path": media_path,
+        "on_behalf_of_sender": message.sender_id == actor.id,
+    }
+    deleted_description = audit.describe_message(message)
     db.execute(delete(MessagePin).where(MessagePin.message_id == message.id))
     message.deleted_at = utcnow()
     message.body = None
@@ -625,6 +688,20 @@ async def soft_delete_message(
     message.media_duration_ms = None
     message.edited_at = None
     db.commit()
+    audit.record(
+        db,
+        action="message.deleted",
+        summary=(
+            f"{actor.username} deleted {deleted_description} "
+            f"(message {message_id}) for everyone"
+        ),
+        actor=actor,
+        conversation_id=message.conversation_id,
+        message_id=message_id,
+        target_user_id=deleted_details["sender_id"],
+        before_text=deleted_body,
+        details=deleted_details,
+    )
     delete_message_files(media_path, thumb_path)
     message = load_message(db, message.id)
     assert message is not None
@@ -669,6 +746,19 @@ async def hide_message_for_user(
             )
         )
         db.commit()
+        audit.record(
+            db,
+            action="message.hidden",
+            summary=(
+                f"{user.username} hid message {message_id} from their own copy "
+                "of the chat"
+            ),
+            actor=user,
+            conversation_id=message.conversation_id,
+            message_id=message_id,
+            before_text=message.body,
+            details=audit.snapshot(message),
+        )
         await hub.send_to_user(user.id, events.event_stars_changed())
 
 
@@ -714,6 +804,86 @@ def list_messages_for_user(
     return rows
 
 
+"""Messages of context kept older than a message someone jumped to.
+
+Landing on the very first row reads as the top of the chat; a few rows above it
+show that the message sits inside a conversation.
+"""
+MESSAGE_WINDOW_CONTEXT = 30
+
+
+def list_message_window(
+    db: Session,
+    *,
+    conversation_id: int,
+    user_id: int,
+    message_id: int,
+    up_to_id: int | None = None,
+    limit: int = 400,
+) -> list[Message]:
+    """History from just before [message_id] up to what the caller already holds.
+
+    Walking back to a starred message one page at a time costs a round trip per
+    page, which over Tailscale is seconds of a phone staring at the newest
+    message. This returns the whole stretch in one answer.
+
+    Truncation drops the *oldest* rows, never the newest, so the block always
+    meets the caller's existing transcript and never leaves a hole in the middle
+    of it. A caller whose target fell outside the cap sees that the message is
+    missing from the answer and can page the rest of the way.
+    """
+    require_membership(db, conversation_id, user_id)
+    purge_expired_messages(db, conversation_id)
+
+    anchor = db.scalar(
+        select(Message.id).where(
+            Message.id == message_id,
+            Message.conversation_id == conversation_id,
+        )
+    )
+    if anchor is None:
+        raise HTTPException(
+            status_code=404,
+            detail="That message is no longer available.",
+        )
+
+    hidden_ids = set(
+        db.scalars(
+            select(MessageHide.message_id).where(MessageHide.user_id == user_id)
+        ).all()
+    )
+    now = utcnow()
+    visible = (
+        Message.conversation_id == conversation_id,
+        or_(Message.expires_at.is_(None), Message.expires_at >= now),
+    )
+
+    context_ids = db.scalars(
+        select(Message.id)
+        .where(*visible, Message.id <= message_id)
+        .order_by(Message.id.desc())
+        .limit(MESSAGE_WINDOW_CONTEXT + 1)
+    ).all()
+    start_id = context_ids[-1] if context_ids else message_id
+
+    q = (
+        select(Message)
+        .where(*visible, Message.id >= start_id)
+        .options(
+            selectinload(Message.receipts),
+            selectinload(Message.reactions),
+            selectinload(Message.reply_to),
+        )
+        .order_by(Message.id.desc())
+        .limit(limit)
+    )
+    if up_to_id is not None:
+        q = q.where(Message.id < up_to_id)
+    rows = [m for m in db.scalars(q).all() if m.id not in hidden_ids]
+    rows.reverse()
+    return rows
+
+
 async def set_conversation_wallpaper(
     db: Session,
     *,
@@ -732,6 +902,15 @@ async def set_conversation_wallpaper(
     conv.wallpaper_set_at = now
     db.commit()
     db.refresh(conv)
+    audit.record(
+        db,
+        action="conversation.wallpaper_set",
+        summary=f"{user.username} set the wallpaper for chat {conversation_id}",
+        actor=user,
+        conversation_id=conversation_id,
+        before_text=old_path,
+        after_text=rel_path,
+    )
     delete_wallpaper_file(old_path)
     members = member_user_ids(db, conversation_id)
     await hub.broadcast_to_users(members, events.event_conversation_updated(conversation_id))
@@ -754,6 +933,14 @@ async def clear_conversation_wallpaper(
     conv.wallpaper_set_at = None
     db.commit()
     db.refresh(conv)
+    audit.record(
+        db,
+        action="conversation.wallpaper_cleared",
+        summary=f"{user.username} removed the wallpaper from chat {conversation_id}",
+        actor=user,
+        conversation_id=conversation_id,
+        before_text=old_path,
+    )
     delete_wallpaper_file(old_path)
     members = member_user_ids(db, conversation_id)
     await hub.broadcast_to_users(members, events.event_conversation_updated(conversation_id))
@@ -771,9 +958,19 @@ async def update_wallpaper_dim(
     if conv is None:
         raise HTTPException(status_code=404, detail="That chat is no longer available.")
     require_membership(db, conversation_id, user.id)
+    previous_dim = conv.wallpaper_dim
     conv.wallpaper_dim = dim
     db.commit()
     db.refresh(conv)
+    audit.record(
+        db,
+        action="conversation.wallpaper_dimmed",
+        summary=f"{user.username} changed the wallpaper dimming in chat {conversation_id}",
+        actor=user,
+        conversation_id=conversation_id,
+        before_text=str(previous_dim),
+        after_text=str(dim),
+    )
     members = member_user_ids(db, conversation_id)
     await hub.broadcast_to_users(members, events.event_conversation_updated(conversation_id))
     return conv
@@ -792,9 +989,22 @@ async def set_disappearing(
     if conv is None:
         raise HTTPException(status_code=404, detail="That chat is no longer available.")
     require_membership(db, conversation_id, user.id)
+    previous = conv.disappear_after_seconds
     conv.disappear_after_seconds = disappear_after_seconds
     db.commit()
     db.refresh(conv)
+    audit.record(
+        db,
+        action="conversation.disappearing_set",
+        summary=(
+            f"{user.username} set disappearing messages in chat {conversation_id} "
+            f"to {disappear_after_seconds or 'off'}"
+        ),
+        actor=user,
+        conversation_id=conversation_id,
+        before_text=str(previous) if previous else "off",
+        after_text=str(disappear_after_seconds) if disappear_after_seconds else "off",
+    )
     members = member_user_ids(db, conversation_id)
     await hub.broadcast_to_users(members, events.event_conversation_updated(conversation_id))
     return conv
@@ -816,26 +1026,61 @@ async def set_anniversary(
             status_code=400,
             detail="Anniversary dates can only be set for direct chats.",
         )
+    previous = conv.anniversary_on
     conv.anniversary_on = anniversary_on
     db.commit()
     db.refresh(conv)
+    audit.record(
+        db,
+        action="conversation.anniversary_set",
+        summary=(
+            f"{user.username} "
+            + (
+                f"set the anniversary in chat {conversation_id} to {anniversary_on}"
+                if anniversary_on
+                else f"cleared the anniversary in chat {conversation_id}"
+            )
+        ),
+        actor=user,
+        conversation_id=conversation_id,
+        before_text=previous,
+        after_text=anniversary_on,
+    )
     members = member_user_ids(db, conversation_id)
     await hub.broadcast_to_users(members, events.event_conversation_updated(conversation_id))
     return conv
 
 
 async def set_user_mood(db: Session, user: User, mood: str | None) -> User:
+    previous = user.mood
     user.mood = mood.strip()[:40] if mood and mood.strip() else None
     db.commit()
     db.refresh(user)
+    audit.record(
+        db,
+        action="account.mood_set",
+        summary=f"{user.username} changed their mood",
+        actor=user,
+        before_text=previous,
+        after_text=user.mood,
+    )
     await broadcast_user_updated(db, user)
     return user
 
 
 async def set_user_display_name(db: Session, user: User, display_name: str) -> User:
+    previous = user.display_name
     user.display_name = display_name.strip()[:80]
     db.commit()
     db.refresh(user)
+    audit.record(
+        db,
+        action="account.display_name_set",
+        summary=f"{user.username} changed their display name",
+        actor=user,
+        before_text=previous,
+        after_text=user.display_name,
+    )
     await broadcast_user_updated(db, user)
     return user
 
@@ -867,9 +1112,22 @@ async def upsert_reaction(
     if reaction is None:
         reaction = MessageReaction(message_id=message_id, user_id=user.id, emoji=emoji)
         db.add(reaction)
+        previous_emoji = None
     else:
+        previous_emoji = reaction.emoji
         reaction.emoji = emoji
     db.commit()
+    audit.record(
+        db,
+        action="message.reacted",
+        summary=f"{user.username} reacted {emoji} to message {message_id}",
+        actor=user,
+        conversation_id=message.conversation_id,
+        message_id=message_id,
+        before_text=previous_emoji,
+        after_text=emoji,
+        details=audit.snapshot(message),
+    )
     message = load_message(db, message_id)
     assert message is not None
     reactions = aggregate_reactions(message, user.id)
@@ -894,6 +1152,12 @@ async def remove_reaction(
     if message is None:
         raise HTTPException(status_code=404, detail="That message is no longer available.")
     require_membership(db, message.conversation_id, user.id)
+    previous = db.scalar(
+        select(MessageReaction.emoji).where(
+            MessageReaction.message_id == message_id,
+            MessageReaction.user_id == user.id,
+        )
+    )
     db.execute(
         delete(MessageReaction).where(
             MessageReaction.message_id == message_id,
@@ -901,6 +1165,17 @@ async def remove_reaction(
         )
     )
     db.commit()
+    if previous is not None:
+        audit.record(
+            db,
+            action="message.reaction_removed",
+            summary=f"{user.username} took back their {previous} on message {message_id}",
+            actor=user,
+            conversation_id=message.conversation_id,
+            message_id=message_id,
+            before_text=previous,
+            details=audit.snapshot(message),
+        )
     message = load_message(db, message_id)
     assert message is not None
     reactions = aggregate_reactions(message, user.id)
@@ -992,7 +1267,7 @@ async def finalize_call_log(
         ended_by_user_id=ended_by,
     )
     try:
-        return await create_and_broadcast_message(
+        logged = await create_and_broadcast_message(
             db,
             conversation_id=record.conversation_id,
             sender=caller,
@@ -1001,6 +1276,46 @@ async def finalize_call_log(
             client_id=call_log_client_id(record.call_id),
             media_mime=record.media,
         )
+        callee = db.get(User, record.callee_id)
+        callee_name = (
+            callee.username if callee is not None else f"account #{record.callee_id}"
+        )
+        # Whoever hung up is the one who acted. Recording the caller for every
+        # ending would put a missed call, and a call the other side cut off, in
+        # the caller's name.
+        if ended_by == record.caller_id:
+            ender: User | None = caller
+        elif ended_by is not None:
+            ender = db.get(User, ended_by)
+        else:
+            ender = None
+        audit.record(
+            db,
+            action="call.ended",
+            summary=(
+                f"the {record.media} call between {caller.username} and "
+                f"{callee_name} ended: {outcome}"
+            ),
+            actor=ender,
+            conversation_id=record.conversation_id,
+            message_id=logged.id,
+            target_user_id=(
+                record.caller_id if ended_by == record.callee_id else record.callee_id
+            ),
+            details={
+                "call_id": record.call_id,
+                "media": record.media,
+                "outcome": outcome,
+                "duration_secs": duration,
+                "terminal_event": terminal_event,
+                "ended_by_user_id": ended_by,
+                "caller_user_id": record.caller_id,
+                "caller_username": caller.username,
+                "callee_user_id": record.callee_id,
+                "callee_username": callee_name,
+            },
+        )
+        return logged
     except IntegrityError:
         # A terminal frame from the other socket won the race. Roll this
         # transaction back, then return the one authoritative row it created.
@@ -1081,10 +1396,20 @@ def search_messages(
     if not allowed:
         return []
 
+    # Search must show the same chat the reader can scroll: a message they hid
+    # for themselves, or one whose disappearing timer has run out, is gone.
+    hidden_ids = set(
+        db.scalars(
+            select(MessageHide.message_id).where(MessageHide.user_id == user_id)
+        ).all()
+    )
     conditions = [
         Message.conversation_id.in_(allowed),
         Message.deleted_at.is_(None),
+        or_(Message.expires_at.is_(None), Message.expires_at >= utcnow()),
     ]
+    if hidden_ids:
+        conditions.append(Message.id.notin_(hidden_ids))
     kind = (media_type or "").strip().lower() or None
     if kind == "text" or kind is None:
         if needle:
@@ -1290,6 +1615,15 @@ async def pin_message(
             )
         )
         db.commit()
+        audit.record(
+            db,
+            action="message.pinned",
+            summary=f"{actor.username} pinned message {message_id}",
+            actor=actor,
+            conversation_id=message.conversation_id,
+            message_id=message_id,
+            details=audit.snapshot(message),
+        )
 
     members = member_user_ids(db, message.conversation_id)
     await hub.broadcast_to_users(
@@ -1327,6 +1661,15 @@ async def unpin_message(
         )
     )
     db.commit()
+    audit.record(
+        db,
+        action="message.unpinned",
+        summary=f"{actor.username} unpinned message {message_id}",
+        actor=actor,
+        conversation_id=message.conversation_id,
+        message_id=message_id,
+        details=audit.snapshot(message),
+    )
     members = member_user_ids(db, message.conversation_id)
     await hub.broadcast_to_users(
         members, events.event_pins_changed(message.conversation_id)
@@ -1403,6 +1746,15 @@ async def star_message(
     if existing is None:
         db.add(MessageStar(message_id=message_id, user_id=user.id))
         db.commit()
+        audit.record(
+            db,
+            action="message.starred",
+            summary=f"{user.username} starred message {message_id}",
+            actor=user,
+            conversation_id=message.conversation_id,
+            message_id=message_id,
+            details=audit.snapshot(message),
+        )
         await hub.send_to_user(user.id, events.event_stars_changed())
     return message
 
@@ -1423,6 +1775,15 @@ async def unstar_message(
         )
     )
     db.commit()
+    audit.record(
+        db,
+        action="message.unstarred",
+        summary=f"{user.username} unstarred message {message_id}",
+        actor=user,
+        conversation_id=message.conversation_id if message is not None else None,
+        message_id=message_id,
+        details=None if message is None else audit.snapshot(message),
+    )
     await hub.send_to_user(user.id, events.event_stars_changed())
 
 

@@ -22,6 +22,12 @@ object TailscaleExit {
     private const val KEY_CONNECT_AT = "connect_requested_at_ms"
     /** Legacy mirror; [KEY_PHASE] is authoritative. */
     private const val KEY_STARTED_BY_APP = "started_by_app"
+    private const val KEY_LAST_DISCONNECT_AT = "last_disconnect_at_ms"
+    private const val KEY_DISCONNECT_RETRY_AT = "disconnect_retry_at_ms"
+
+    /** In-process mirror of [KEY_LAST_DISCONNECT_AT] for connect/exit guards. */
+    @Volatile
+    private var lastDisconnectAtMs: Long = 0L
 
     private const val TAILSCALE_PACKAGE = "com.tailscale.ipn"
     private const val TAILSCALE_RECEIVER = "com.tailscale.ipn.IPNReceiver"
@@ -68,7 +74,17 @@ object TailscaleExit {
     }
 
     fun savePolicy(context: Context, enabled: Boolean, phase: TailscaleOwnershipPhase) {
-        prefs(context).edit()
+        val app = context.applicationContext
+        val current = readPhaseRaw(app)
+        if (!TailscaleExitPolicy.mayApplyPhaseWrite(current, phase)) {
+            Log.i(
+                TAG,
+                "policy phase ignored (current=${current.wire} incoming=${phase.wire})",
+            )
+            prefs(app).edit().putBoolean(KEY_ENABLED, enabled).apply()
+            return
+        }
+        prefs(app).edit()
             .putBoolean(KEY_ENABLED, enabled)
             .putString(KEY_PHASE, phase.wire)
             .putBoolean(
@@ -81,7 +97,16 @@ object TailscaleExit {
 
     /** Dart-side phase sync without touching [KEY_CONNECT_AT]. */
     fun savePhase(context: Context, phase: TailscaleOwnershipPhase) {
-        prefs(context).edit()
+        val app = context.applicationContext
+        val current = readPhaseRaw(app)
+        if (!TailscaleExitPolicy.mayApplyPhaseWrite(current, phase)) {
+            Log.i(
+                TAG,
+                "phase write ignored (current=${current.wire} incoming=${phase.wire})",
+            )
+            return
+        }
+        prefs(app).edit()
             .putString(KEY_PHASE, phase.wire)
             .putBoolean(
                 KEY_STARTED_BY_APP,
@@ -103,14 +128,28 @@ object TailscaleExit {
         routingAlreadyUp: Boolean,
     ): Boolean {
         val app = context.applicationContext
+        val now = System.currentTimeMillis()
+        val lastDisconnect = lastDisconnectAt(app, now)
+        if (TailscaleExitPolicy.shouldBlockConnectDuringExit(now, lastDisconnect)) {
+            Log.i(TAG, "connect blocked: exit disconnect guard active")
+            return false
+        }
         if (TailscaleExitPolicy.mayPersistConnectIntent(routingWasDown, routingAlreadyUp)) {
-            val now = System.currentTimeMillis()
-            prefs(app).edit()
-                .putString(KEY_PHASE, TailscaleOwnershipPhase.PENDING_CONNECT.wire)
-                .putLong(KEY_CONNECT_AT, now)
-                .putBoolean(KEY_STARTED_BY_APP, false)
-                .apply()
-            Log.i(TAG, "connect intent persisted at $now")
+            val current = readPhaseRaw(app)
+            if (TailscaleExitPolicy.mayApplyPhaseWrite(
+                    current,
+                    TailscaleOwnershipPhase.PENDING_CONNECT,
+                )
+            ) {
+                prefs(app).edit()
+                    .putString(KEY_PHASE, TailscaleOwnershipPhase.PENDING_CONNECT.wire)
+                    .putLong(KEY_CONNECT_AT, now)
+                    .putBoolean(KEY_STARTED_BY_APP, false)
+                    .apply()
+                Log.i(TAG, "connect intent persisted at $now")
+            } else {
+                Log.i(TAG, "connect intent skipped: phase write rejected")
+            }
         } else {
             Log.i(
                 TAG,
@@ -158,12 +197,35 @@ object TailscaleExit {
      * Cold-start retry when the previous run owned the tunnel but died mid-disconnect.
      */
     fun retryInterruptedDisconnectIfNeeded(context: Context) {
-        val snap = readOwnership(context)
+        val app = context.applicationContext
+        val snap = readOwnership(app)
         if (!TailscaleExitPolicy.shouldRetryInterruptedDisconnect(snap.enabled, snap.phase)) {
             return
         }
+        val now = System.currentTimeMillis()
+        val p = prefs(app)
+        val lastRetry = p.getLong(KEY_DISCONNECT_RETRY_AT, 0L)
+        if (TailscaleExitPolicy.shouldSkipDuplicateRetry(now, lastRetry)) {
+            Log.i(TAG, "skipping duplicate interrupted disconnect retry")
+            return
+        }
+        p.edit().putLong(KEY_DISCONNECT_RETRY_AT, now).apply()
         Log.i(TAG, "retrying interrupted owned disconnect")
-        sendDisconnectBroadcast(context.applicationContext, "retry interrupted disconnect")
+        sendDisconnectBroadcast(app, "retry interrupted disconnect")
+    }
+
+    private fun lastDisconnectAt(context: Context, now: Long): Long {
+        if (lastDisconnectAtMs > 0L) return lastDisconnectAtMs
+        val stored = prefs(context).getLong(KEY_LAST_DISCONNECT_AT, 0L)
+        if (stored > 0L) lastDisconnectAtMs = stored
+        return stored
+    }
+
+    private fun noteDisconnectSent(context: Context, now: Long) {
+        lastDisconnectAtMs = now
+        prefs(context.applicationContext).edit()
+            .putLong(KEY_LAST_DISCONNECT_AT, now)
+            .apply()
     }
 
     private fun sendConnectBroadcast(context: Context): Boolean {
@@ -182,6 +244,13 @@ object TailscaleExit {
     }
 
     private fun sendDisconnectBroadcast(context: Context, reason: String) {
+        val now = System.currentTimeMillis()
+        val last = lastDisconnectAt(context, now)
+        if (TailscaleExitPolicy.shouldDebounceDisconnect(now, last)) {
+            Log.i(TAG, "$reason: debounced duplicate DISCONNECT_VPN")
+            return
+        }
+        noteDisconnectSent(context, now)
         try {
             val intent = Intent(DISCONNECT_ACTION).apply {
                 component = ComponentName(TAILSCALE_PACKAGE, TAILSCALE_RECEIVER)

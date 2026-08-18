@@ -8,6 +8,7 @@ import '../message_preview.dart';
 import '../models.dart';
 import '../time_format.dart';
 import '../widgets/error_banner.dart';
+import '../widgets/loading_placeholders.dart';
 
 /// Private bookmarks for this account — WhatsApp-style starred messages.
 class StarredMessagesScreen extends StatefulWidget {
@@ -75,8 +76,10 @@ class _StarredMessagesScreenState extends State<StarredMessagesScreen> {
     final items = state.starredMessages;
     return Scaffold(
       appBar: AppBar(title: const Text('Starred messages')),
+      // Stand-in rows rather than a bare spinner, so the screen keeps its shape
+      // while the list arrives instead of jumping from a dot to a full list.
       body: state.starredLoading
-          ? const Center(child: CircularProgressIndicator())
+          ? const ListSkeleton(label: 'Loading starred messages')
           : Column(
               children: [
                 if (state.starredError != null)

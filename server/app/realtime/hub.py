@@ -29,6 +29,25 @@ class ConnectionHub:
             if not sockets:
                 del self._connections[user_id]
 
+    async def disconnect_user(self, user_id: int, *, code: int = 4401) -> int:
+        """Force-close every live socket for [user_id]. Returns how many closed.
+
+        Used when an admin (or a password reset) kills a session: the next REST
+        call already fails on token_version, but a phone with an open websocket
+        would otherwise keep chatting until it happened to reconnect.
+        """
+        async with self._lock:
+            sockets = list(self._connections.get(user_id, set()))
+            self._connections.pop(user_id, None)
+        closed = 0
+        for ws in sockets:
+            try:
+                await ws.close(code=code)
+                closed += 1
+            except Exception:  # pylint: disable=broad-exception-caught
+                pass
+        return closed
+
     def reset(self) -> None:
         """Drop all tracked sockets (used by tests between cases)."""
         self._connections.clear()

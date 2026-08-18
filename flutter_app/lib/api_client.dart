@@ -7,9 +7,30 @@ import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'app_config.dart';
+import 'audit.dart';
 import 'errors.dart';
 import 'models.dart';
 import 'nudge_log.dart';
+import 'upload_limits.dart';
+
+class OnlineAdminUser {
+  const OnlineAdminUser({
+    required this.id,
+    required this.username,
+    required this.displayName,
+  });
+
+  factory OnlineAdminUser.fromJson(Map<String, dynamic> json) =>
+      OnlineAdminUser(
+        id: (json['id'] as num).toInt(),
+        username: (json['username'] as String?) ?? '',
+        displayName: (json['display_name'] as String?) ?? '',
+      );
+
+  final int id;
+  final String username;
+  final String displayName;
+}
 
 class ApiException implements Exception {
   ApiException(this.message, {this.statusCode});
@@ -26,8 +47,18 @@ class ApiClient {
   static const _tokenKey = 'auth_token';
   static const _baseUrlKey = 'base_url';
   static const _userKey = 'user_json';
+  static const _deviceIdKey = 'device_id_v1';
   static const _requestTimeout = Duration(seconds: 20);
   static const _uploadTimeout = Duration(minutes: 3);
+
+  /// How long an upload may make no progress at all before it is abandoned.
+  ///
+  /// A wall-clock timeout is the wrong tool for attachments: a few hundred
+  /// megabytes of phone video legitimately takes longer than any number that is
+  /// short enough to catch a dead link. What actually distinguishes a stalled
+  /// upload is bytes: while they keep leaving the phone the send is healthy,
+  /// however long it takes.
+  static const _uploadStallTimeout = Duration(seconds: 45);
 
   final _secure = const FlutterSecureStorage(
     aOptions: AndroidOptions(encryptedSharedPreferences: true),
@@ -35,6 +66,14 @@ class ApiClient {
   String? baseUrl;
   String? token;
   ChatUser? currentUser;
+
+  /// Stable id for this install, used to pin the admin device.
+  String? deviceId;
+
+  /// Fired once when a 401 means the server rejected this session.
+  void Function()? onSessionRejected;
+
+  bool _sessionRejectionNotified = false;
 
   Future<void> loadPersisted() async {
     final prefs = await SharedPreferences.getInstance();
@@ -46,6 +85,7 @@ class ApiClient {
       baseUrl = savedUrl.replaceAll(RegExp(r'/+$'), '');
     }
 
+    deviceId = await _ensureDeviceId();
     token = await _secure.read(key: _tokenKey);
     final userJson = prefs.getString(_userKey);
     if (token != null && token!.isNotEmpty && userJson != null) {
@@ -64,6 +104,16 @@ class ApiClient {
       token = null;
       currentUser = null;
     }
+  }
+
+  Future<String> _ensureDeviceId() async {
+    final existing = await _secure.read(key: _deviceIdKey);
+    if (existing != null && existing.isNotEmpty) return existing;
+    final minted =
+        'lc-${DateTime.now().microsecondsSinceEpoch}-'
+        '${Object.hash(Platform.operatingSystem, Platform.localHostname)}';
+    await _secure.write(key: _deviceIdKey, value: minted);
+    return minted;
   }
 
   Future<void> setBaseUrl(String url) async {
@@ -102,6 +152,7 @@ class ApiClient {
   Future<void> logout() async {
     token = null;
     currentUser = null;
+    _sessionRejectionNotified = false;
     await _secure.delete(key: _tokenKey);
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove(_userKey);
@@ -130,6 +181,116 @@ class ApiClient {
     return _decode(res);
   }
 
+  /// Host health for the server card: RAM, disk, battery, uptime, platform.
+  Future<Map<String, dynamic>> fetchServerInfo() async {
+    final res = await _send(
+      () => http.get(
+        _uri('/api/system/info'),
+        headers: _headers(jsonBody: false),
+      ),
+    );
+    return _decode(res);
+  }
+
+  /// Who the server's admin is, and whether this account may read the log.
+  Future<AdminStatus> fetchAdminStatus() async {
+    final res = await _send(
+      () => http.get(
+        _uri('/api/admin/status'),
+        headers: _headers(jsonBody: false),
+      ),
+    );
+    return AdminStatus.fromJson(await _decode(res));
+  }
+
+  /// Names the admin account. Allowed while the role is unclaimed, and to the
+  /// admin handing it on.
+  Future<AdminStatus> setAdminUsername(String username) async {
+    final res = await _send(
+      () => http.put(
+        _uri('/api/admin/username'),
+        headers: _headers(),
+        body: jsonEncode({'username': username}),
+      ),
+    );
+    return AdminStatus.fromJson(await _decode(res));
+  }
+
+  /// Trust this phone for the activity log, or clear the pin.
+  Future<AdminStatus> setAdminDevice({required bool clear}) async {
+    final res = await _send(
+      () => http.put(
+        _uri('/api/admin/device'),
+        headers: _headers(),
+        body: jsonEncode({'clear': clear}),
+      ),
+    );
+    return AdminStatus.fromJson(await _decode(res));
+  }
+
+  Future<List<OnlineAdminUser>> listOnlineUsers() async {
+    final res = await _send(
+      () => http.get(
+        _uri('/api/admin/online'),
+        headers: _headers(jsonBody: false),
+      ),
+    );
+    return _decodeList(res)
+        .map((e) => OnlineAdminUser.fromJson(e as Map<String, dynamic>))
+        .toList();
+  }
+
+  Future<void> forceLogoutUser(int userId) async {
+    await _send(
+      () => http.post(
+        _uri('/api/admin/users/$userId/force-logout'),
+        headers: _headers(jsonBody: false),
+      ),
+    );
+  }
+
+  /// One page of the activity log, newest first.
+  Future<List<AuditEntry>> listAuditEvents({
+    int? beforeId,
+    String? category,
+    String? action,
+    String? actor,
+    int? conversationId,
+    int? messageId,
+    String? query,
+    int limit = 50,
+  }) async {
+    final params = <String, String>{'limit': '$limit'};
+    if (beforeId != null) params['before_id'] = '$beforeId';
+    if (category != null && category != 'all') params['category'] = category;
+    if (action != null && action.isNotEmpty) params['action'] = action;
+    if (actor != null && actor.trim().isNotEmpty) {
+      params['actor'] = actor.trim();
+    }
+    if (conversationId != null) params['conversation_id'] = '$conversationId';
+    if (messageId != null) params['message_id'] = '$messageId';
+    if (query != null && query.trim().isNotEmpty) params['q'] = query.trim();
+    final res = await _send(
+      () => http.get(
+        _uri('/api/admin/audit', params),
+        headers: _headers(jsonBody: false),
+      ),
+    );
+    return _decodeList(
+      res,
+    ).map((e) => AuditEntry.fromJson(e as Map<String, dynamic>)).toList();
+  }
+
+  Future<AuditSummary> fetchAuditSummary() async {
+    final res = await _send(
+      () => http.get(
+        _uri('/api/admin/audit/summary'),
+        headers: _headers(jsonBody: false),
+      ),
+    );
+    return AuditSummary.fromJson(await _decode(res));
+  }
+
   Uri _uri(String path, [Map<String, String>? query]) {
     if (baseUrl == null || baseUrl!.isEmpty) {
       throw ApiException(
@@ -143,6 +304,8 @@ class ApiClient {
     final h = <String, String>{};
     if (jsonBody) h['Content-Type'] = 'application/json';
     if (token != null) h['Authorization'] = 'Bearer $token';
+    final id = deviceId;
+    if (id != null && id.isNotEmpty) h['X-Device-Id'] = id;
     return h;
   }
 
@@ -150,8 +313,12 @@ class ApiClient {
   Future<http.Response> _send(
     Future<http.Response> Function() request, {
     Duration? timeout,
+    // Set for transfers whose honest duration is unbounded (large attachments);
+    // the caller must then police the stall itself.
+    bool untimed = false,
   }) async {
     try {
+      if (untimed) return await request();
       return await request().timeout(timeout ?? _requestTimeout);
     } on ApiException {
       rethrow;
@@ -171,12 +338,19 @@ class ApiClient {
       }
     }
     if (res.statusCode >= 400) {
+      if (res.statusCode == 401) _notifySessionRejected();
       throw ApiException(
         _messageFrom(decoded, res.statusCode),
         statusCode: res.statusCode,
       );
     }
     return decoded;
+  }
+
+  void _notifySessionRejected() {
+    if (_sessionRejectionNotified) return;
+    _sessionRejectionNotified = true;
+    onSessionRejected?.call();
   }
 
   Future<Map<String, dynamic>> _decode(http.Response res) async {
@@ -219,6 +393,7 @@ class ApiClient {
     String password, {
     String? displayName,
   }) async {
+    deviceId ??= await _ensureDeviceId();
     final res = await _send(
       () => http.post(
         _uri('/api/auth/register'),
@@ -228,6 +403,7 @@ class ApiClient {
           'password': password,
           if (displayName != null && displayName.isNotEmpty)
             'display_name': displayName,
+          if (deviceId != null) 'device_id': deviceId,
         }),
       ),
     );
@@ -238,11 +414,16 @@ class ApiClient {
   }
 
   Future<ChatUser> login(String username, String password) async {
+    deviceId ??= await _ensureDeviceId();
     final res = await _send(
       () => http.post(
         _uri('/api/auth/login'),
         headers: _headers(),
-        body: jsonEncode({'username': username, 'password': password}),
+        body: jsonEncode({
+          'username': username,
+          'password': password,
+          if (deviceId != null) 'device_id': deviceId,
+        }),
       ),
     );
     final data = await _decode(res);
@@ -256,7 +437,7 @@ class ApiClient {
     required String currentPassword,
     required String newPassword,
   }) async {
-    await _send(
+    final res = await _send(
       () => http.post(
         _uri('/api/auth/change-password'),
         headers: _headers(),
@@ -266,6 +447,11 @@ class ApiClient {
         }),
       ),
     );
+    final data = await _decode(res);
+    final fresh = data['token'] as String?;
+    if (fresh != null && currentUser != null) {
+      await _persistAuth(fresh, currentUser!);
+    }
   }
 
   Future<List<ChatUser>> listUsers({String? q}) async {
@@ -390,13 +576,46 @@ class ApiClient {
     int conversationId, {
     int? beforeId,
     int? afterId,
+    // The server's ceiling is 100. Reading a chat pages fifty at a time to keep
+    // scrolling smooth; sweeping the whole history for a search asks for more.
+    int limit = 50,
   }) async {
-    final query = <String, String>{'limit': '50'};
+    final query = <String, String>{'limit': '$limit'};
     if (beforeId != null) query['before_id'] = '$beforeId';
     if (afterId != null) query['after_id'] = '$afterId';
     final res = await _send(
       () => http.get(
         _uri('/api/conversations/$conversationId/messages', query),
+        headers: _headers(jsonBody: false),
+      ),
+    );
+    return _decodeList(res)
+        .map((e) => ChatMessage.fromJson(e as Map<String, dynamic>, meId: meId))
+        .toList();
+  }
+
+  /// History reaching from an off-screen message forwards to [upToId].
+  ///
+  /// Jumping to a starred or quoted message used to page backwards fifty rows at
+  /// a time, which is a round trip per page and seconds of waiting on a phone
+  /// server. [upToId] is the oldest message already held, so the answer stops
+  /// where the local transcript begins and joins onto it without a hole.
+  Future<List<ChatMessage>> listMessageWindow(
+    int conversationId, {
+    required int messageId,
+    int? upToId,
+    // The server's ceiling. A starred message hundreds back is the normal case
+    // in a chat this old, and asking for less means paging the difference.
+    int limit = 800,
+  }) async {
+    final query = <String, String>{
+      'message_id': '$messageId',
+      'limit': '$limit',
+      if (upToId != null) 'up_to_id': '$upToId',
+    };
+    final res = await _send(
+      () => http.get(
+        _uri('/api/conversations/$conversationId/messages/window', query),
         headers: _headers(jsonBody: false),
       ),
     );
@@ -626,9 +845,9 @@ class ApiClient {
         headers: _headers(jsonBody: false),
       ),
     );
-    return _decodeList(res)
-        .map((e) => NudgeRecord.fromJson(e as Map<String, dynamic>))
-        .toList();
+    return _decodeList(
+      res,
+    ).map((e) => NudgeRecord.fromJson(e as Map<String, dynamic>)).toList();
   }
 
   Future<List<ChatMessage>> listStarred({
@@ -697,6 +916,17 @@ class ApiClient {
     }
   }
 
+  /// What this server accepts as one attachment, right now.
+  Future<UploadLimits> fetchUploadLimits() async {
+    final res = await _send(
+      () => http.get(
+        _uri('/api/system/limits'),
+        headers: _headers(jsonBody: false),
+      ),
+    );
+    return UploadLimits.fromJson(await _decode(res));
+  }
+
   Future<ChatMessage> uploadMedia({
     required int conversationId,
     required File file,
@@ -706,12 +936,17 @@ class ApiClient {
     String? caption,
     String? clientId,
     int? replyToMessageId,
+    void Function(int sent, int total)? onProgress,
   }) async {
     final req = http.MultipartRequest(
       'POST',
       _uri('/api/conversations/$conversationId/media'),
     );
     if (token != null) req.headers['Authorization'] = 'Bearer $token';
+    final device = deviceId;
+    if (device != null && device.isNotEmpty) {
+      req.headers['X-Device-Id'] = device;
+    }
     req.fields['type'] = type;
     if (caption != null && caption.isNotEmpty) req.fields['caption'] = caption;
     if (clientId != null) req.fields['client_id'] = clientId;
@@ -721,7 +956,28 @@ class ApiClient {
     if (durationMs != null && durationMs > 0) {
       req.fields['duration_ms'] = '$durationMs';
     }
-    req.files.add(await http.MultipartFile.fromPath('file', file.path));
+    final total = await file.length();
+    var sent = 0;
+    var lastMoved = DateTime.now();
+    onProgress?.call(0, total);
+    // Reading the file through a counting stream, rather than handing its path
+    // to MultipartFile, is what makes a long send visible: the same bytes go up
+    // and the HTTP client's backpressure still bounds memory, but every chunk
+    // reports itself on the way past.
+    final counted = file.openRead().map((chunk) {
+      sent += chunk.length;
+      lastMoved = DateTime.now();
+      onProgress?.call(sent > total ? total : sent, total);
+      return chunk;
+    });
+    req.files.add(
+      http.MultipartFile(
+        'file',
+        counted,
+        total,
+        filename: _uploadFilename(file.path),
+      ),
+    );
     if (thumbnail != null) {
       req.files.add(
         await http.MultipartFile.fromPath(
@@ -731,30 +987,56 @@ class ApiClient {
         ),
       );
     }
-    final res = await _send(
-      () async => http.Response.fromStream(await req.send()),
-      timeout: _uploadTimeout,
-    );
-    final data = await _decode(res);
-    return ChatMessage.fromJson(data, meId: meId);
+
+    final client = http.Client();
+    var stalled = false;
+    // Abandons the send only once the bytes genuinely stop, so a slow but
+    // working upload of a large video is never cut off part way.
+    final watchdog = Timer.periodic(const Duration(seconds: 5), (timer) {
+      if (DateTime.now().difference(lastMoved) > _uploadStallTimeout) {
+        stalled = true;
+        timer.cancel();
+        client.close();
+      }
+    });
+    try {
+      final res = await _send(
+        () async => http.Response.fromStream(await client.send(req)),
+        // Large uploads are policed by the stall watchdog above instead of a
+        // wall-clock limit; small ones keep the ordinary ceiling.
+        timeout: _uploadTimeout,
+        untimed: total > _largeUploadBytes,
+      );
+      final data = await _decode(res);
+      return ChatMessage.fromJson(data, meId: meId);
+    } catch (e) {
+      if (stalled) {
+        throw ApiException(
+          'The upload stopped part way through. Check the connection to your '
+          'server and try again.',
+        );
+      }
+      rethrow;
+    } finally {
+      watchdog.cancel();
+      client.close();
+    }
   }
 
-  Future<File> downloadMedia(int messageId, String filename) async {
-    final res = await _send(
-      () => http.get(
-        _uri('/api/media/$messageId'),
-        headers: _headers(jsonBody: false),
-      ),
-    );
-    if (res.statusCode >= 400) {
-      // Errors arrive as JSON even though a success is raw file bytes.
-      _parse(res);
-    }
-    final dir = await Directory.systemTemp.createTemp('localchat_');
-    final out = File('${dir.path}/$filename');
-    await out.writeAsBytes(res.bodyBytes);
-    return out;
+  /// Above this, an upload is timed by progress rather than by the clock.
+  static const _largeUploadBytes = 8 * 1024 * 1024;
+
+  /// Multipart needs a name; a path may be a content-provider temp file.
+  String _uploadFilename(String path) {
+    final slash = path.lastIndexOf(Platform.pathSeparator);
+    final name = slash < 0 ? path : path.substring(slash + 1);
+    return name.isEmpty ? 'file' : name;
   }
+
+  // Attachments are fetched by MediaStore, which streams them to disk with
+  // progress and a cancel. An in-memory download helper used to live here too,
+  // on the ordinary twenty-second request deadline: for a phone video it would
+  // have held hundreds of megabytes in RAM and timed out regardless.
 
   String mediaUrl(int messageId) => '$baseUrl/api/media/$messageId';
 

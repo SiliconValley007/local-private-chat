@@ -69,12 +69,25 @@
                 <data android:mimeType="*/*"/>
             </intent-filter>
         </activity>
-        <!-- stopWithTask=false so onTaskRemoved fires when the app is swiped
-             away; that is when the Tailscale tunnel is switched back off. -->
+        <!-- Watches how long the app has been out of sight and closes the
+             Tailscale tunnel it opened, from inside the still-running process.
+             stopWithTask=false so onTaskRemoved also reaches it when the app is
+             swiped out of Recents first. -->
         <service
-            android:name=".ExitWatcherService"
+            android:name=".TailscaleGuardService"
             android:exported="false"
             android:stopWithTask="false" />
+        <!-- Alarm backstop: Android reaps a cached process minutes after the app
+             leaves the foreground, so a later swipe from Recents reaches no
+             running code. This receiver restarts the process to switch the
+             tunnel off. -->
+        <receiver
+            android:name=".TailscaleIdleExitReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.localchat.local_chat.IDLE_TAILSCALE_EXIT"/>
+            </intent-filter>
+        </receiver>
         <meta-data
             android:name="flutterEmbedding"
             android:value="2" />

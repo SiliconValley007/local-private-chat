@@ -80,9 +80,16 @@ def reset_user(username: str, new_password: str | None) -> int:
             print("Run without arguments to list usernames.", file=sys.stderr)
             return 1
         user.password_hash = hash_password(new_password)
-        db.commit()
+        from app.sessions import bump_token_version
+
+        # Old JWTs must die with the password; otherwise a stolen session would
+        # keep working after the operator "fixed" the account.
+        bump_token_version(db, user)
         print(f"Password reset for @{user.username} (id={user.id}).")
-        print("They can sign in with the new password immediately - no restart needed.")
+        print(
+            "They can sign in with the new password immediately - no restart needed."
+        )
+        print("Any previously signed-in devices were signed out.")
     return 0
 
 

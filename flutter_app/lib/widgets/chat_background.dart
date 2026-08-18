@@ -1,4 +1,7 @@
+import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
+
+import '../theme.dart';
 
 /// Paints a chat's shared wallpaper behind the transcript.
 ///
@@ -28,21 +31,46 @@ class ChatBackground extends StatelessWidget {
     final url = imageUrl;
     if (url == null || url.trim().isEmpty) return child;
 
+    final effectiveDim = dim < wallpaperDimFloor ? wallpaperDimFloor : dim;
+
     return Stack(
       fit: StackFit.expand,
       children: [
         // A wallpaper the server can't serve (offline, deleted) must not blank
         // the chat, so failures fall back to the plain surface.
-        Image.network(
-          url,
+        Image(
           key: ValueKey(url),
-          headers: headers,
+          image: ResizeImage(
+            CachedNetworkImageProvider(url, headers: headers),
+            width:
+                (MediaQuery.sizeOf(context).width *
+                        MediaQuery.devicePixelRatioOf(context))
+                    .round(),
+            height:
+                (MediaQuery.sizeOf(context).height *
+                        MediaQuery.devicePixelRatioOf(context))
+                    .round(),
+            policy: ResizeImagePolicy.fit,
+          ),
           fit: BoxFit.cover,
           gaplessPlayback: true,
+          // Faded in rather than swapped: a wallpaper that snaps into place over
+          // an already-drawn transcript reads as a glitch, and the first frame
+          // often lands a beat after the messages do.
+          frameBuilder: (_, child, frame, wasSynchronouslyLoaded) {
+            if (wasSynchronouslyLoaded) return child;
+            return AnimatedOpacity(
+              opacity: frame == null ? 0 : 1,
+              duration: const Duration(milliseconds: 220),
+              curve: Curves.easeOut,
+              child: child,
+            );
+          },
           errorBuilder: (_, _, _) =>
               ColoredBox(color: Theme.of(context).colorScheme.surface),
         ),
-        if (dim > 0) ColoredBox(color: Colors.black.withValues(alpha: dim)),
+        if (effectiveDim > 0)
+          ColoredBox(color: Colors.black.withValues(alpha: effectiveDim)),
         child,
       ],
     );

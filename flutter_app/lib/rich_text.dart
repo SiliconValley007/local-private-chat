@@ -3,6 +3,9 @@
 /// Stored as plain text on the server; rendering is client-only. Deliberately
 /// tiny — no nested HTML, no raw tags — so a message body cannot become a
 /// mini browser.
+///
+/// WhatsApp-style delimiters: *bold*, _italic_, ~strike~, `code`, ```fenced```,
+/// ||spoiler||. Markdown-style **bold** and ~~strike~~ remain supported.
 library;
 
 enum RichKind { text, bold, italic, strike, code, codeBlock, spoiler, link }
@@ -36,7 +39,8 @@ final _trailingPunctuation = RegExp(r'[.,;)\]!?]+$');
 String _trimUrl(String url) => url.replaceFirst(_trailingPunctuation, '');
 
 /// Tokenises [input] into styled spans. Order of precedence:
-/// fenced code → inline code → spoiler → bold → strike → italic → URLs → text.
+/// fenced code → inline code → spoiler → bold (** then *) → strike (~~ then ~)
+/// → italic → URLs → text.
 List<RichSpan> parseRichText(String input) {
   if (input.isEmpty) return const [];
 
@@ -85,7 +89,7 @@ List<RichSpan> parseRichText(String input) {
       }
     }
 
-    // Bold: **...**
+    // Bold alias: **...**
     if (input.startsWith('**', i)) {
       final end = input.indexOf('**', i + 2);
       if (end != -1) {
@@ -95,7 +99,22 @@ List<RichSpan> parseRichText(String input) {
       }
     }
 
-    // Strike: ~~...~~
+    // Bold (WhatsApp): *...*
+    if (input[i] == '*' &&
+        (i + 1 >= input.length || input[i + 1] != '*') &&
+        (i == 0 || input[i - 1] != '*')) {
+      final end = input.indexOf('*', i + 1);
+      if (end != -1 &&
+          end > i + 1 &&
+          (end + 1 >= input.length || input[end + 1] != '*') &&
+          (end - 1 <= i || input[end - 1] != '*')) {
+        out.add(RichSpan(RichKind.bold, input.substring(i + 1, end)));
+        i = end + 1;
+        continue;
+      }
+    }
+
+    // Strike alias: ~~...~~
     if (input.startsWith('~~', i)) {
       final end = input.indexOf('~~', i + 2);
       if (end != -1) {
@@ -105,10 +124,25 @@ List<RichSpan> parseRichText(String input) {
       }
     }
 
-    // Italic: *...* (single asterisks, not part of **)
-    if (input[i] == '*' && (i + 1 >= input.length || input[i + 1] != '*')) {
-      final end = input.indexOf('*', i + 1);
-      if (end != -1 && (end + 1 >= input.length || input[end + 1] != '*')) {
+    // Strike (WhatsApp): ~...~
+    if (input[i] == '~' &&
+        (i + 1 >= input.length || input[i + 1] != '~') &&
+        (i == 0 || input[i - 1] != '~')) {
+      final end = input.indexOf('~', i + 1);
+      if (end != -1 &&
+          end > i + 1 &&
+          (end + 1 >= input.length || input[end + 1] != '~') &&
+          (end - 1 <= i || input[end - 1] != '~')) {
+        out.add(RichSpan(RichKind.strike, input.substring(i + 1, end)));
+        i = end + 1;
+        continue;
+      }
+    }
+
+    // Italic (WhatsApp): _..._
+    if (input[i] == '_') {
+      final end = input.indexOf('_', i + 1);
+      if (end != -1 && end > i + 1) {
         out.add(RichSpan(RichKind.italic, input.substring(i + 1, end)));
         i = end + 1;
         continue;
@@ -150,8 +184,10 @@ int _nextSpecial(String input, int from) {
     if (input[j] == '`') return j;
     if (input.startsWith('||', j)) return j;
     if (input.startsWith('**', j)) return j;
-    if (input.startsWith('~~', j)) return j;
     if (input[j] == '*') return j;
+    if (input.startsWith('~~', j)) return j;
+    if (input[j] == '~') return j;
+    if (input[j] == '_') return j;
     final rest = input.substring(j);
     final m = _urlPattern.matchAsPrefix(rest);
     if (m != null) return j;
@@ -186,5 +222,8 @@ bool hasRichMarkup(String? input) {
       input.contains('~~') ||
       input.contains('||') ||
       input.contains('`') ||
-      RegExp(r'(^|[^*])\*[^*]').hasMatch(input);
+      input.contains('```') ||
+      RegExp(r'(^|[^*])\*[^*]').hasMatch(input) ||
+      RegExp(r'(^|[^~])~[^~]').hasMatch(input) ||
+      RegExp(r'_[^_\s][^_]*_').hasMatch(input);
 }

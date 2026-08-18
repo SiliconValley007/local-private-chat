@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
+from app import audit
 from app.db import get_db
 from app.deps import get_current_user
 from app.models import Message, MessageReceipt, User, utcnow
@@ -27,6 +28,7 @@ from app.services import (
     create_call_log_message,
     edit_message,
     hide_message_for_user,
+    list_message_window,
     list_messages_for_user,
     list_pinned_messages,
     list_shared_items,
@@ -66,6 +68,34 @@ def list_messages(
         user_id=current.id,
         before_id=before_id,
         after_id=after_id,
+        limit=limit,
+    )
+    return [message_out(m, current.id) for m in rows]
+
+
+@router.get(
+    "/api/conversations/{conversation_id}/messages/window",
+    response_model=list[MessageOut],
+)
+def list_message_window_around(
+    conversation_id: int,
+    message_id: int = Query(),
+    up_to_id: int | None = Query(default=None),
+    limit: int = Query(default=400, ge=50, le=800),
+    db: Session = Depends(get_db),
+    current: User = Depends(get_current_user),
+) -> list[MessageOut]:
+    """One page of history that reaches from a starred or quoted message forwards.
+
+    [up_to_id] is the oldest message the caller already has, so the answer stops
+    where its transcript begins instead of sending it twice.
+    """
+    rows = list_message_window(
+        db,
+        conversation_id=conversation_id,
+        user_id=current.id,
+        message_id=message_id,
+        up_to_id=up_to_id,
         limit=limit,
     )
     return [message_out(m, current.id) for m in rows]
@@ -336,6 +366,23 @@ async def mark_read(
             events.event_receipt("read", r.message_id, conversation_id, current.id, now),
         )
     db.commit()
+    if receipts:
+        # One line for the batch, not one per message: opening a busy chat would
+        # otherwise bury the actions worth reading.
+        first = min(r.message_id for r in receipts)
+        last = max(r.message_id for r in receipts)
+        audit.record(
+            db,
+            action="message.read",
+            summary=(
+                f"{current.username} read {len(receipts)} "
+                f"message{'' if len(receipts) == 1 else 's'} in chat {conversation_id}"
+            ),
+            actor=current,
+            conversation_id=conversation_id,
+            message_id=last,
+            details={"count": len(receipts), "from_message_id": first, "to_message_id": last},
+        )
     return {"ok": True, "marked": len(receipts)}
 
 

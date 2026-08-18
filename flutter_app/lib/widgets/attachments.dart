@@ -1,15 +1,18 @@
 import 'dart:io';
 import 'dart:math' as math;
 
+import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
 import '../app_state.dart';
+import '../e2e_text.dart';
 import '../errors.dart';
 import '../models.dart';
 import '../services/media_store.dart';
 import '../services/voice_player.dart';
 import '../theme.dart';
+import 'media_shape.dart';
 
 /// "1.4 MB" — short enough to sit under a file name.
 String formatFileSize(int? bytes) {
@@ -33,6 +36,27 @@ String formatClipDuration(Duration? value) {
   final seconds = value.inSeconds.remainder(60).toString().padLeft(2, '0');
   return '$minutes:$seconds';
 }
+
+/// Text under a voice note's waveform.
+///
+/// A clip that is loaded reads as a clock, and one that has been played before
+/// keeps its length even while idle rather than falling back to a bare label.
+String voiceClipLabel({
+  required bool loaded,
+  Duration? elapsed,
+  Duration? total,
+}) {
+  if (loaded) {
+    return '${formatClipDuration(elapsed)} / ${formatClipDuration(total)}';
+  }
+  return total == null ? 'Voice message' : formatClipDuration(total);
+}
+
+String formatPlaybackSpeed(double speed) => speed == 1.0
+    ? '1×'
+    : speed == 1.5
+    ? '1.5×'
+    : '2×';
 
 String fileExtensionOf(ChatMessage msg) {
   final name = msg.mediaName ?? '';
@@ -283,84 +307,100 @@ class _ImageAttachmentState extends State<ImageAttachment> {
   @override
   Widget build(BuildContext context) {
     final state = context.read<AppState>();
-    final caption = widget.message.body?.trim() ?? '';
+    final caption = readableBody(widget.message.body)?.trim() ?? '';
     final width = math.min(widget.maxWidth, 260.0);
+    // Decoded to the width of the bubble rather than the camera's full
+    // resolution — a 12 MP photo in a 260 px bubble is waste. Height is left to
+    // follow, because pinning both would resize the picture to a shape it never
+    // had and a screenshot would arrive squashed.
+    final image = ResizeImage(
+      CachedNetworkImageProvider(
+        state.api.mediaThumbnailUrl(widget.message.id),
+        headers: state.api.imageAuthHeaders,
+      ),
+      width: (width * MediaQuery.devicePixelRatioOf(context)).round(),
+      policy: ResizeImagePolicy.fit,
+    );
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         ClipRRect(
           borderRadius: BorderRadius.circular(AppRadius.card - 6),
-          child: Stack(
-            children: [
-              GestureDetector(
-                onTap: () => Navigator.of(context).push(
-                  MaterialPageRoute(
-                    builder: (_) => ImageViewerScreen(message: widget.message),
+          child: MediaShape(
+            key: ValueKey(_reloadKey),
+            messageId: widget.message.id,
+            image: image,
+            width: width,
+            source: widget.message.mediaShape,
+            builder: (context, box, alignment) => Stack(
+              children: [
+                GestureDetector(
+                  onTap: () => Navigator.of(context).push(
+                    MaterialPageRoute(
+                      builder: (_) =>
+                          ImageViewerScreen(message: widget.message),
+                    ),
                   ),
-                ),
-                onLongPress: widget.onLongPress,
-                child: Hero(
-                  tag: 'media-hero-${widget.message.id}',
-                  // Fixed box so a loaded photo cannot grow or shrink the bubble
-                  // after the chat has already pinned itself to the bottom.
-                  child: SizedBox(
-                    width: width,
-                    height: width * chatImageHeightRatio,
-                    child: Image.network(
-                      state.api.mediaUrl(widget.message.id),
-                      key: ValueKey(_reloadKey),
-                      headers: {'Authorization': 'Bearer ${state.api.token}'},
-                      width: width,
-                      height: width * chatImageHeightRatio,
-                      fit: BoxFit.cover,
-                      loadingBuilder: (context, child, progress) {
-                        if (progress == null) return child;
-                        final expected = progress.expectedTotalBytes;
-                        return _ImagePlaceholder(
-                          width: width,
-                          progress: expected == null
-                              ? null
-                              : progress.cumulativeBytesLoaded / expected,
-                        );
-                      },
-                      errorBuilder: (context, _, _) => _ImageFailed(
-                        width: width,
-                        onRetry: () => setState(() => _reloadKey++),
+                  onLongPress: widget.onLongPress,
+                  child: Hero(
+                    tag: 'media-hero-${widget.message.id}',
+                    child: SizedBox.fromSize(
+                      size: box,
+                      child: Image(
+                        image: image,
+                        width: box.width,
+                        height: box.height,
+                        fit: BoxFit.cover,
+                        alignment: alignment,
+                        loadingBuilder: (context, child, progress) {
+                          if (progress == null) return child;
+                          final expected = progress.expectedTotalBytes;
+                          return _ImagePlaceholder(
+                            box: box,
+                            progress: expected == null
+                                ? null
+                                : progress.cumulativeBytesLoaded / expected,
+                          );
+                        },
+                        errorBuilder: (context, _, _) => _ImageFailed(
+                          box: box,
+                          onRetry: () => setState(() => _reloadKey++),
+                        ),
                       ),
                     ),
                   ),
                 ),
-              ),
-              if (widget.footer != null)
-                Positioned(
-                  right: 0,
-                  bottom: 0,
-                  left: 0,
-                  child: IgnorePointer(
-                    child: Container(
-                      padding: const EdgeInsets.fromLTRB(10, 18, 8, 6),
-                      decoration: const BoxDecoration(
-                        gradient: LinearGradient(
-                          begin: Alignment.topCenter,
-                          end: Alignment.bottomCenter,
-                          colors: [Colors.transparent, Color(0x66000000)],
+                if (widget.footer != null)
+                  Positioned(
+                    right: 0,
+                    bottom: 0,
+                    left: 0,
+                    child: IgnorePointer(
+                      child: Container(
+                        padding: const EdgeInsets.fromLTRB(10, 18, 8, 6),
+                        decoration: const BoxDecoration(
+                          gradient: LinearGradient(
+                            begin: Alignment.topCenter,
+                            end: Alignment.bottomCenter,
+                            colors: [Colors.transparent, Color(0x66000000)],
+                          ),
                         ),
-                      ),
-                      child: Align(
-                        alignment: Alignment.centerRight,
-                        child: DefaultTextStyle.merge(
-                          style: const TextStyle(color: Colors.white),
-                          child: IconTheme(
-                            data: const IconThemeData(color: Colors.white),
-                            child: widget.footer!,
+                        child: Align(
+                          alignment: Alignment.centerRight,
+                          child: DefaultTextStyle.merge(
+                            style: const TextStyle(color: Colors.white),
+                            child: IconTheme(
+                              data: const IconThemeData(color: Colors.white),
+                              child: widget.footer!,
+                            ),
                           ),
                         ),
                       ),
                     ),
                   ),
-                ),
-            ],
+              ],
+            ),
           ),
         ),
         if (caption.isNotEmpty)
@@ -377,17 +417,17 @@ class _ImageAttachmentState extends State<ImageAttachment> {
 }
 
 class _ImagePlaceholder extends StatelessWidget {
-  const _ImagePlaceholder({required this.width, this.progress});
+  const _ImagePlaceholder({required this.box, this.progress});
 
-  final double width;
+  final Size box;
   final double? progress;
 
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
     return Container(
-      width: width,
-      height: width * chatImageHeightRatio,
+      width: box.width,
+      height: box.height,
       color: scheme.surfaceContainerHighest,
       alignment: Alignment.center,
       child: SizedBox(
@@ -400,9 +440,9 @@ class _ImagePlaceholder extends StatelessWidget {
 }
 
 class _ImageFailed extends StatelessWidget {
-  const _ImageFailed({required this.width, required this.onRetry});
+  const _ImageFailed({required this.box, required this.onRetry});
 
-  final double width;
+  final Size box;
   final VoidCallback onRetry;
 
   @override
@@ -411,8 +451,8 @@ class _ImageFailed extends StatelessWidget {
     return InkWell(
       onTap: onRetry,
       child: Container(
-        width: width,
-        height: width * chatImageHeightRatio,
+        width: box.width,
+        height: box.height,
         color: scheme.surfaceContainerHighest,
         alignment: Alignment.center,
         child: Column(
@@ -451,18 +491,35 @@ class ImageViewerScreen extends StatefulWidget {
 }
 
 class _ImageViewerScreenState extends State<ImageViewerScreen> {
-  double _drag = 0;
+  final _transform = TransformationController();
+  TapDownDetails? _doubleTap;
 
   ChatMessage get message => widget.message;
 
   @override
+  void dispose() {
+    _transform.dispose();
+    super.dispose();
+  }
+
+  void _onDoubleTap() {
+    if (_transform.value.getMaxScaleOnAxis() > 1.01) {
+      _transform.value = Matrix4.identity();
+      return;
+    }
+    final position = _doubleTap?.localPosition ?? Offset.zero;
+    _transform.value = Matrix4.identity()
+      ..translateByDouble(-position.dx * 1.5, -position.dy * 1.5, 0, 1)
+      ..scaleByDouble(2.5, 2.5, 1, 1);
+  }
+
+  @override
   Widget build(BuildContext context) {
     final state = context.read<AppState>();
-    final caption = message.body?.trim() ?? '';
-    final opacity = (1.0 - (_drag.abs() / 280)).clamp(0.35, 1.0);
+    final caption = readableBody(message.body)?.trim() ?? '';
 
     return Scaffold(
-      backgroundColor: Colors.black.withValues(alpha: opacity),
+      backgroundColor: Colors.black,
       appBar: AppBar(
         backgroundColor: Colors.black,
         foregroundColor: Colors.white,
@@ -495,34 +552,30 @@ class _ImageViewerScreenState extends State<ImageViewerScreen> {
         children: [
           Expanded(
             child: GestureDetector(
-              onVerticalDragUpdate: (d) => setState(() => _drag += d.delta.dy),
-              onVerticalDragEnd: (d) {
-                if (_drag.abs() > 120 ||
-                    (d.primaryVelocity != null &&
-                        d.primaryVelocity!.abs() > 700)) {
-                  Navigator.of(context).maybePop();
-                } else {
-                  setState(() => _drag = 0);
-                }
-              },
-              child: Transform.translate(
-                offset: Offset(0, _drag),
-                child: InteractiveViewer(
-                  minScale: 1,
-                  maxScale: 4,
-                  child: Center(
-                    child: Hero(
-                      tag: 'media-hero-${message.id}',
-                      child: Image.network(
+              behavior: HitTestBehavior.opaque,
+              onDoubleTapDown: (details) => _doubleTap = details,
+              onDoubleTap: _onDoubleTap,
+              child: InteractiveViewer(
+                transformationController: _transform,
+                minScale: 1,
+                maxScale: 5,
+                panEnabled: true,
+                scaleEnabled: true,
+                boundaryMargin: const EdgeInsets.all(80),
+                child: Center(
+                  child: Hero(
+                    tag: 'media-hero-${message.id}',
+                    child: Image(
+                      image: CachedNetworkImageProvider(
                         state.api.mediaUrl(message.id),
-                        headers: {'Authorization': 'Bearer ${state.api.token}'},
-                        errorBuilder: (context, _, _) => const Padding(
-                          padding: EdgeInsets.all(24),
-                          child: Text(
-                            "This photo couldn't be loaded from the server.",
-                            style: TextStyle(color: Colors.white70),
-                            textAlign: TextAlign.center,
-                          ),
+                        headers: state.api.imageAuthHeaders,
+                      ),
+                      errorBuilder: (context, _, _) => const Padding(
+                        padding: EdgeInsets.all(24),
+                        child: Text(
+                          "This photo couldn't be loaded from the server.",
+                          style: TextStyle(color: Colors.white70),
+                          textAlign: TextAlign.center,
                         ),
                       ),
                     ),
@@ -725,6 +778,12 @@ class _VoiceAttachmentState extends State<VoiceAttachment>
         final playing = mine && playback.playing;
         final progress = playback.progressFor(widget.message.id);
         final elapsed = mine ? playback.position : null;
+        final clipLength = VoicePlayer.instance.lengthOf(widget.message.id);
+        final label = voiceClipLabel(
+          loaded: mine,
+          elapsed: elapsed,
+          total: playback.duration ?? clipLength,
+        );
 
         return GestureDetector(
           onLongPress: widget.onLongPress,
@@ -772,9 +831,7 @@ class _VoiceAttachmentState extends State<VoiceAttachment>
                         children: [
                           Expanded(
                             child: Text(
-                              mine
-                                  ? '${formatClipDuration(elapsed)} / ${formatClipDuration(playback.duration)}'
-                                  : 'Voice message',
+                              label,
                               style: Theme.of(context).textTheme.labelSmall
                                   ?.copyWith(
                                     color: Theme.of(
@@ -783,19 +840,44 @@ class _VoiceAttachmentState extends State<VoiceAttachment>
                                   ),
                             ),
                           ),
-                          GestureDetector(
-                            onTap: () => VoicePlayer.instance.cycleSpeed(),
-                            child: Text(
-                              playback.speed == 1.0
-                                  ? '1x'
-                                  : playback.speed == 1.5
-                                  ? '1.5x'
-                                  : '2x',
-                              style: Theme.of(context).textTheme.labelSmall
-                                  ?.copyWith(
-                                    color: widget.accent,
-                                    fontWeight: FontWeight.w700,
+                          Tooltip(
+                            message: 'Tap to change playback speed',
+                            child: Semantics(
+                              button: true,
+                              label:
+                                  'Playback speed ${playback.speed} times. Tap to change.',
+                              child: InkWell(
+                                borderRadius: BorderRadius.circular(10),
+                                onTap: () => VoicePlayer.instance.cycleSpeed(),
+                                child: Container(
+                                  key: const Key('voice-speed-control'),
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 7,
+                                    vertical: 3,
                                   ),
+                                  decoration: BoxDecoration(
+                                    color: widget.accent.withValues(
+                                      alpha: 0.12,
+                                    ),
+                                    border: Border.all(
+                                      color: widget.accent.withValues(
+                                        alpha: 0.45,
+                                      ),
+                                    ),
+                                    borderRadius: BorderRadius.circular(10),
+                                  ),
+                                  child: Text(
+                                    formatPlaybackSpeed(playback.speed),
+                                    style: Theme.of(context)
+                                        .textTheme
+                                        .labelSmall
+                                        ?.copyWith(
+                                          color: widget.accent,
+                                          fontWeight: FontWeight.w800,
+                                        ),
+                                  ),
+                                ),
+                              ),
                             ),
                           ),
                         ],

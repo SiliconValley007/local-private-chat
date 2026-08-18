@@ -25,6 +25,23 @@ class _TailscaleGateScreenState extends State<TailscaleGateScreen>
     with SingleTickerProviderStateMixin {
   late final AnimationController _pulse;
 
+  /// Once the server has answered this process, brief settling flaps must not
+  /// blank the inbox/chat behind a full-screen spinner (post-call flash).
+  bool _wasReachable = false;
+
+  /// Whether the gate has waited long enough to name a culprit.
+  bool _grace = true;
+  Timer? _graceTimer;
+
+  /// How long a link may take to come up before the app blames anything.
+  ///
+  /// Relaunching after the app was swiped away is the normal case that this
+  /// protects: the tunnel was switched off on exit and takes a few seconds to
+  /// return, and "Tailscale is not connected" during those seconds is both true
+  /// and useless — it reads as a broken app for something that is about to fix
+  /// itself. The diagnosis is still only seconds away when it is warranted.
+  static const _diagnosisGrace = Duration(seconds: 7);
+
   @override
   void initState() {
     super.initState();
@@ -32,10 +49,14 @@ class _TailscaleGateScreenState extends State<TailscaleGateScreen>
       vsync: this,
       duration: const Duration(milliseconds: 1600),
     )..repeat(reverse: true);
+    _graceTimer = Timer(_diagnosisGrace, () {
+      if (mounted) setState(() => _grace = false);
+    });
   }
 
   @override
   void dispose() {
+    _graceTimer?.cancel();
     _pulse.dispose();
     super.dispose();
   }
@@ -43,15 +64,55 @@ class _TailscaleGateScreenState extends State<TailscaleGateScreen>
   @override
   Widget build(BuildContext context) {
     final state = context.watch<AppState>();
-    if (state.serverReachable) return widget.child;
+    if (state.serverReachable) {
+      _wasReachable = true;
+      if (_pulse.isAnimating) _pulse.stop();
+      return widget.child;
+    }
 
-    // While the tunnel is still coming up, any diagnosis would be a guess — and
-    // "server is not running" was the wrong guess often enough to be annoying.
-    if (state.settling) {
-      return _ConnectingView(onOpenTailscale: state.openTailscaleApp);
+    // While the tunnel is still coming up after we already had a live session,
+    // keep the app shell and only hint that the link is settling.
+    if (state.settling && _wasReachable) {
+      if (_pulse.isAnimating) _pulse.stop();
+      return Stack(
+        fit: StackFit.expand,
+        children: [
+          widget.child,
+          Positioned(
+            left: 12,
+            right: 12,
+            top: 0,
+            child: SafeArea(
+              child: Material(
+                elevation: 2,
+                color: Theme.of(context).colorScheme.surfaceContainerHighest,
+                borderRadius: BorderRadius.circular(12),
+                child: const Padding(
+                  padding: EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                  child: Text(
+                    'Reconnecting privately…',
+                    textAlign: TextAlign.center,
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ],
+      );
     }
 
     final check = state.serverCheck;
+
+    // Cold start: the tunnel is still coming up — any diagnosis would be a
+    // guess, so wait without blaming Tailscale or the server yet. The grace
+    // window covers the same thing when nothing has claimed to be settling yet,
+    // which is exactly the gap a relaunch fell into.
+    if (state.settling || (_grace && _worthWaitingFor(check))) {
+      if (_pulse.isAnimating) _pulse.stop();
+      return _ConnectingView(onOpenTailscale: state.openTailscaleApp);
+    }
+
+    if (!_pulse.isAnimating) _pulse.repeat(reverse: true);
     final details = _GateDetails.forCheck(check);
     final theme = Theme.of(context);
     final scheme = theme.colorScheme;
@@ -189,6 +250,16 @@ class _TailscaleGateScreenState extends State<TailscaleGateScreen>
       ),
     );
   }
+
+  /// Whether a link coming up on its own would explain this failure.
+  ///
+  /// A wrong address or a phone in airplane mode will not resolve itself, so
+  /// those are reported straight away rather than sitting behind the grace
+  /// window pretending to connect.
+  static bool _worthWaitingFor(ServerCheck? check) => switch (check?.status) {
+    ServerStatus.badAddress || ServerStatus.noNetwork => false,
+    _ => true,
+  };
 
   Future<void> _connectTailscale(AppState state) async {
     final messenger = ScaffoldMessenger.of(context);

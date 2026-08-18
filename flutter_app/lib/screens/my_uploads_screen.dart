@@ -1,3 +1,4 @@
+import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 import 'package:provider/provider.dart';
@@ -6,6 +7,7 @@ import '../app_state.dart';
 import '../errors.dart';
 import '../models.dart';
 import '../widgets/attachments.dart';
+import '../widgets/loading_placeholders.dart';
 
 /// Review-and-select cleanup for files owned by the signed-in user.
 class MyUploadsScreen extends StatefulWidget {
@@ -142,7 +144,7 @@ class _MyUploadsScreenState extends State<MyUploadsScreen> {
               ),
             )
           : items == null
-          ? const Center(child: CircularProgressIndicator())
+          ? const ListSkeleton(rows: 6, label: 'Loading your uploads')
           : items.isEmpty
           ? const Center(
               child: Padding(
@@ -244,9 +246,15 @@ class _OwnedMediaPreview extends StatelessWidget {
                       : Icons.insert_drive_file_outlined,
                 ),
               )
-            : Image.network(
-                imageUrl,
-                headers: api.imageAuthHeaders,
+            : Image(
+                image: ResizeImage(
+                  CachedNetworkImageProvider(
+                    imageUrl,
+                    headers: api.imageAuthHeaders,
+                  ),
+                  width: (52 * MediaQuery.devicePixelRatioOf(context)).round(),
+                  height: (52 * MediaQuery.devicePixelRatioOf(context)).round(),
+                ),
                 fit: BoxFit.cover,
                 errorBuilder: (_, _, _) => ColoredBox(
                   color: Theme.of(context).colorScheme.surfaceContainerHighest,

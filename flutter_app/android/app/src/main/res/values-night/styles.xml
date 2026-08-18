@@ -13,6 +13,8 @@
 
          This Theme is only used starting with V2 of Flutter's Android embedding. -->
     <style name="NormalTheme" parent="@android:style/Theme.Black.NoTitleBar">
-        <item name="android:windowBackground">?android:colorBackground</item>
+        <!-- Dark surface rather than pure black: this window is visible for a
+             moment on every cold start and resume. -->
+        <item name="android:windowBackground">@color/splash_background</item>
     </style>
 </resources>

@@ -8,12 +8,13 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
+from app import audit
 from app.auth import decode_access_token
 from app import db as db_module
 from app.call_sessions import call_registry
 from app.doodle_validation import DOODLE_EVENT_TYPES, validate_doodle_event
 from app.fcm import send_call_incoming_push
-from app.models import Conversation, ConversationMember, DeviceToken, MessageReceipt, User, utcnow
+from app.models import Conversation, DeviceToken, MessageReceipt, User, utcnow
 from app.realtime import events
 from app.realtime.hub import hub
 from app.rate_limit import doodle_limiter
@@ -46,6 +47,9 @@ CALL_EVENTS = frozenset(
 E2E_EVENTS = frozenset({"e2e.hello", "e2e.reply", "e2e.need_key"})
 
 
+from app.sessions import token_version_matches
+
+
 def _user_from_token(db: Session, token: str | None) -> User | None:
     if not token:
         return None
@@ -56,7 +60,12 @@ def _user_from_token(db: Session, token: str | None) -> User | None:
         user_id = int(payload["sub"])
     except (TypeError, ValueError):
         return None
-    return db.get(User, user_id)
+    user = db.get(User, user_id)
+    if user is None:
+        return None
+    if not token_version_matches(user, payload):
+        return None
+    return user
 
 
 def _dm_peer_id(db: Session, conversation_id: int, user_id: int) -> int | None:
@@ -250,6 +259,21 @@ async def _handle_call_event(db: Session, user: User, data: dict) -> None:
             caller_id=user.id,
             callee_id=peer_id,
             media=media,
+        )
+        audit.record(
+            db,
+            action="call.started",
+            summary=f"{user.username} placed a {media} call in chat {conversation_id}",
+            actor=user,
+            conversation_id=conversation_id,
+            target_user_id=peer_id,
+            details={
+                "call_id": call_id,
+                "media": media,
+                "caller_user_id": user.id,
+                "caller_username": user.username,
+                "callee_user_id": peer_id,
+            },
         )
         invite_relay = {
             **relay,

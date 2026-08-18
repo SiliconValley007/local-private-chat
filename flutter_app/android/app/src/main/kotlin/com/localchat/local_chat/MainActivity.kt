@@ -2,6 +2,7 @@ package com.localchat.local_chat
 
 import android.content.Intent
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.media.MediaMetadataRetriever
 import android.util.Log
 import io.flutter.embedding.android.FlutterActivity
@@ -17,12 +18,6 @@ class MainActivity : FlutterActivity() {
     /// Held when a share arrives before Dart is listening — a cold start from the
     /// share sheet always lands here first. Dart drains it with "getInitial".
     private var pendingIncoming: Map<String, Any?>? = null
-
-    override fun onCreate(savedInstanceState: android.os.Bundle?) {
-        super.onCreate(savedInstanceState)
-        // Previous run may have owned the tunnel but died before DISCONNECT_VPN.
-        TailscaleExit.retryInterruptedDisconnectIfNeeded(this)
-    }
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -61,10 +56,13 @@ class MainActivity : FlutterActivity() {
                     "prepareForCall" -> {
                         val isVideo = call.argument<Boolean>("isVideo") ?: false
                         audio.prepareForCall(isVideo)
+                        // A call with the screen off must keep its tunnel.
+                        AppForeground.noteCall(true)
                         result.success(null)
                     }
                     "restoreAudio" -> {
                         audio.restoreAudio()
+                        AppForeground.noteCall(false)
                         result.success(null)
                     }
                     "listRoutes" -> result.success(audio.listRoutes())
@@ -129,6 +127,11 @@ class MainActivity : FlutterActivity() {
                         TailscaleExit.retryInterruptedDisconnectIfNeeded(this)
                         result.success(null)
                     }
+                    "noteTransfer" -> {
+                        val active = call.argument<Boolean>("active") ?: false
+                        AppForeground.noteTransfer(active)
+                        result.success(null)
+                    }
                     else -> result.notImplemented()
                 }
             }
@@ -145,6 +148,16 @@ class MainActivity : FlutterActivity() {
                             return@setMethodCallHandler
                         }
                         result.success(createVideoThumbnail(path, maxWidth, quality))
+                    }
+                    "createImage" -> {
+                        val path = call.argument<String>("path")
+                        val maxWidth = call.argument<Int>("maxWidth") ?: 720
+                        val quality = call.argument<Int>("quality") ?: 78
+                        if (path.isNullOrEmpty()) {
+                            result.error("INVALID_ARGUMENT", "Image path is null", null)
+                            return@setMethodCallHandler
+                        }
+                        result.success(createImageThumbnail(path, maxWidth, quality))
                     }
                     else -> result.notImplemented()
                 }
@@ -198,6 +211,38 @@ class MainActivity : FlutterActivity() {
         return Bitmap.createScaledBitmap(source, maxWidth, height, true)
     }
 
+    /** Downsamples a gallery photo before decoding, then stores a small JPEG. */
+    private fun createImageThumbnail(
+        path: String,
+        maxWidth: Int,
+        quality: Int,
+    ): Map<String, Any?> {
+        return try {
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeFile(path, bounds)
+            if (bounds.outWidth <= 0 || bounds.outHeight <= 0) {
+                return mapOf("path" to null)
+            }
+            var sample = 1
+            while (bounds.outWidth / (sample * 2) >= maxWidth) sample *= 2
+            val decoded = BitmapFactory.decodeFile(
+                path,
+                BitmapFactory.Options().apply { inSampleSize = sample },
+            ) ?: return mapOf("path" to null)
+            val scaled = scaleToWidth(decoded, maxWidth)
+            val out = File(cacheDir, "ithumb_${System.currentTimeMillis()}.jpg")
+            FileOutputStream(out).use { stream ->
+                scaled.compress(Bitmap.CompressFormat.JPEG, quality, stream)
+            }
+            if (scaled != decoded) scaled.recycle()
+            decoded.recycle()
+            mapOf("path" to out.absolutePath)
+        } catch (e: Exception) {
+            Log.w("MainActivity", "Image thumbnail failed: ${e.message}")
+            mapOf("path" to null)
+        }
+    }
+
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
@@ -222,21 +267,46 @@ class MainActivity : FlutterActivity() {
 
     override fun onResume() {
         super.onResume()
-        // Re-armed on every resume: Android stops background services a while
-        // after an app leaves the foreground, and a stopped service would never
-        // hear onTaskRemoved when the user finally swipes the app away.
-        try {
-            startService(Intent(this, ExitWatcherService::class.java))
-        } catch (e: Exception) {
-            Log.w("MainActivity", "Exit watcher not started: ${e.message}")
-        }
+        AppForeground.markResumed()
+        // The user is back, so the background timer that would have dropped the
+        // tunnel is no longer wanted.
+        TailscaleIdleExit.cancel(this)
+        // Started from a resumed activity, the one state in which starting a
+        // service is always allowed. It is the guard, not this activity, that
+        // closes the tunnel once the app has been away for a while.
+        TailscaleGuardService.watch(this)
+    }
+
+    override fun onStop() {
+        AppForeground.markStopped()
+        // Belt to the guard's braces: an alarm for the case this process is gone
+        // before the guard's own countdown gets there.
+        if (!isFinishing) TailscaleIdleExit.arm(this)
+        super.onStop()
     }
 
     override fun onDestroy() {
         // isFinishing separates a real close from a rotation or config change.
         if (isFinishing) {
+            val wasInCall = AppForeground.callStillActive()
+            val wasTransferring = AppForeground.transferStillActive()
             callAudio?.restoreAudio()
-            TailscaleExit.disconnectIfAllowed(this, "activity finishing")
+            AppForeground.noteCall(false)
+            // Leave transferActive alone here: Dart clears it in finally. If the
+            // process is dying mid-upload, the idle alarm is the backstop.
+            if (wasInCall || wasTransferring) {
+                // Closing the task ends the work too, but let teardown finish
+                // before the process-death-safe alarm drops the tunnel.
+                TailscaleIdleExit.arm(this)
+            } else {
+                // onStop deliberately skips arming while isFinishing, so make
+                // sure even a direct close from the foreground gets a fallback.
+                TailscaleIdleExit.arm(this)
+                TailscaleExit.disconnectIfAllowed(this, "activity finishing")
+                // Do not cancel the background alarm here. DISCONNECT_VPN has
+                // no acknowledgement, so that later delivery is the fallback
+                // if Tailscale ignored this immediate best-effort broadcast.
+            }
         }
         super.onDestroy()
     }

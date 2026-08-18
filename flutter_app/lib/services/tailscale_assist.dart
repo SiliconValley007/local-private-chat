@@ -117,11 +117,16 @@ class TailscaleAssist {
     return false;
   }
 
-  /// Pure policy: may we turn the tunnel off when the app closes?
+  /// Pure policy: may we turn the tunnel off when the app leaves?
+  ///
+  /// Anything but [TailscaleOwnershipPhase.unowned] counts. A pending connect
+  /// is only recorded when routing was down beforehand, so it means this app
+  /// asked Tailscale to come up and never got its confirmation — still our
+  /// tunnel to close. Native policy reads the same rule.
   static bool shouldDisconnectOnExit({
     required bool enabled,
     required TailscaleOwnershipPhase phase,
-  }) => enabled && phase == TailscaleOwnershipPhase.owned;
+  }) => enabled && phase != TailscaleOwnershipPhase.unowned;
 
   /// Legacy bool mirror for settings copy.
   static bool shouldDisconnectOnExitLegacy({
@@ -241,6 +246,37 @@ class TailscaleAssist {
     return now.difference(lastNudgeAt) >= cooldown;
   }
 
+  static int phaseRank(TailscaleOwnershipPhase phase) {
+    switch (phase) {
+      case TailscaleOwnershipPhase.owned:
+        return 3;
+      case TailscaleOwnershipPhase.pendingConnect:
+        return 2;
+      case TailscaleOwnershipPhase.unowned:
+        return 1;
+    }
+  }
+
+  /// Stale native reads must not downgrade a fresher local [owned] claim.
+  static bool shouldAcceptNativePhase({
+    required TailscaleOwnershipPhase local,
+    required TailscaleOwnershipPhase native,
+  }) {
+    if (native == TailscaleOwnershipPhase.unowned) return true;
+    return phaseRank(native) >= phaseRank(local);
+  }
+
+  /// Merge flags when overlapping health checks coalesce instead of dropping.
+  static bool mergeCoalescedQuick({
+    required bool existing,
+    required bool incoming,
+  }) => existing && incoming;
+
+  static bool mergeCoalescedNudge({
+    required bool existing,
+    required bool incoming,
+  }) => existing || incoming;
+
   Future<TailscaleOwnershipSnapshot> readOwnershipSnapshot() async {
     if (!Platform.isAndroid) return TailscaleOwnershipSnapshot.empty;
     try {
@@ -288,7 +324,6 @@ class TailscaleAssist {
     if (!Platform.isAndroid) return false;
     final now = DateTime.now();
     if (!force && !cooldownElapsed(_lastNudgeAt, now)) return false;
-    _lastNudgeAt = now;
 
     final routingWasDown = routingWasDownBeforeConnect(lastCheck);
     final routingAlreadyUp = preexistingRoutedTunnel(lastCheck);
@@ -298,13 +333,19 @@ class TailscaleAssist {
         'routingWasDown': routingWasDown,
         'routingAlreadyUp': routingAlreadyUp,
       });
-      if (sent == true) return true;
+      // Honor native false (e.g. exit disconnect guard) — do not bypass via broadcast.
+      if (sent != null) {
+        if (sent) _lastNudgeAt = now;
+        return sent;
+      }
     } on MissingPluginException {
       // Fall through to Dart-only broadcast below.
     } catch (e) {
       debugPrint('Native connect failed, sending broadcast instead: $e');
     }
-    return _broadcast(connectAction);
+    final sent = await _broadcast(connectAction);
+    if (sent) _lastNudgeAt = now;
+    return sent;
   }
 
   Future<bool> requestDisconnect({bool force = true}) async {
@@ -319,6 +360,18 @@ class TailscaleAssist {
     } catch (e) {
       debugPrint('Host disconnect failed, sending broadcast instead: $e');
       return _broadcast(disconnectAction);
+    }
+  }
+
+  /// Tell the native guard a file transfer needs the tunnel held in background.
+  Future<void> noteTransfer(bool active) async {
+    if (!Platform.isAndroid) return;
+    try {
+      await _exitChannel.invokeMethod<void>('noteTransfer', {'active': active});
+    } on MissingPluginException {
+      // Older host build without the transfer flag.
+    } catch (e) {
+      debugPrint('Could not note transfer state: $e');
     }
   }
 

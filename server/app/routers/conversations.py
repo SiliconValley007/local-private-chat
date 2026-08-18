@@ -9,6 +9,7 @@ from fastapi.responses import FileResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
+from app import audit
 from app.db import get_db
 from app.deps import get_current_user
 from app.models import Conversation, ConversationMember, User
@@ -114,6 +115,15 @@ async def create_or_get_dm(
     db.add(ConversationMember(conversation_id=conv.id, user_id=current.id, role="member"))
     db.add(ConversationMember(conversation_id=conv.id, user_id=other.id, role="member"))
     db.commit()
+    audit.record(
+        db,
+        action="conversation.created",
+        summary=f"{current.username} started a direct chat with {other.username}",
+        actor=current,
+        conversation_id=conv.id,
+        target_user_id=other.id,
+        details={"type": "dm"},
+    )
     conv = _load_conv(db, conv.id)
     assert conv is not None
     await hub.broadcast_to_users(
@@ -149,6 +159,15 @@ async def create_group(
     for u in users:
         db.add(ConversationMember(conversation_id=conv.id, user_id=u.id, role="member"))
     db.commit()
+    audit.record(
+        db,
+        action="conversation.created",
+        summary=f"{current.username} created the group “{title}”",
+        actor=current,
+        conversation_id=conv.id,
+        after_text=title,
+        details={"type": "group", "member_ids": sorted(u.id for u in users)},
+    )
 
     conv = _load_conv(db, conv.id)
     assert conv is not None
@@ -198,6 +217,8 @@ async def add_members(
         )
 
     existing = {m.user_id for m in conv.members}
+    added: list[int] = []
+    added_usernames: list[str] = []
     for uid in body.member_ids:
         if uid in existing:
             continue
@@ -208,7 +229,21 @@ async def add_members(
                 detail="One of the people you picked is no longer on this server.",
             )
         db.add(ConversationMember(conversation_id=conv.id, user_id=uid, role="member"))
+        added.append(uid)
+        added_usernames.append(user.username)
     db.commit()
+    if added:
+        audit.record(
+            db,
+            action="conversation.members_added",
+            summary=(
+                f"{current.username} added "
+                f"{', '.join(added_usernames)} to chat {conversation_id}"
+            ),
+            actor=current,
+            conversation_id=conversation_id,
+            details={"member_ids": added, "member_usernames": added_usernames},
+        )
     conv = _load_conv(db, conversation_id)
     assert conv is not None
     await hub.broadcast_to_users(

@@ -23,10 +23,21 @@ fi
 source "$VENV/bin/activate"
 python -m pip install --upgrade pip wheel >/dev/null
 
+# Keep the phone server lean: SQLite cache, upload caps, quiet uvicorn.
+# Concurrency is left to app/config.py (64): pinning it low here made uvicorn
+# answer 503 during ordinary browsing. LOCALCHAT_ACCESS_LOG=1 restores the
+# request log when something needs diagnosing.
+export LOCALCHAT_LOW_MEMORY="${LOCALCHAT_LOW_MEMORY:-1}"
+
+# Drop PyInstaller leftovers if this folder was copied from a Windows build.
+rm -rf dist build .pytest_cache 2>/dev/null || true
+find . -type d -name '__pycache__' -not -path './.venv/*' -prune -exec rm -rf {} + 2>/dev/null || true
+
 # Rust-backed wheels (pydantic-core, cryptography) build via maturin, which cannot
 # detect this on its own. 24 is Termux's minimum API level, so it works everywhere.
 export ANDROID_API_LEVEL="${ANDROID_API_LEVEL:-24}"
 echo "ANDROID_API_LEVEL=$ANDROID_API_LEVEL"
+echo "LOCALCHAT_LOW_MEMORY=$LOCALCHAT_LOW_MEMORY"
 
 echo "Installing dependencies..."
 if ! python -m pip install --prefer-binary -r requirements.txt; then

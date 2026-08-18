@@ -32,6 +32,9 @@ class RegisterRequest(BaseModel):
     username: str
     password: str = Field(min_length=6, max_length=128)
     display_name: str | None = None
+    #: Stable install id from the phone. Used later to pin the admin device;
+    #: optional so older clients still sign up.
+    device_id: str | None = Field(default=None, max_length=80)
 
     @field_validator("username")
     @classmethod
@@ -44,10 +47,27 @@ class RegisterRequest(BaseModel):
             )
         return v
 
+    @field_validator("device_id")
+    @classmethod
+    def validate_device_id(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        cleaned = v.strip()
+        return cleaned or None
+
 
 class LoginRequest(BaseModel):
     username: str
     password: str
+    device_id: str | None = Field(default=None, max_length=80)
+
+    @field_validator("device_id")
+    @classmethod
+    def validate_device_id(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        cleaned = v.strip()
+        return cleaned or None
 
 
 class ChangePasswordRequest(BaseModel):
@@ -179,6 +199,10 @@ class MessageOut(BaseModel):
     media_size: int | None = None
     media_mime: str | None = None
     media_duration_ms: int | None = None
+    # Pixel size of the preview, so a chat row can reserve its height before the
+    # picture has been fetched and decoded.
+    media_width: int | None = None
+    media_height: int | None = None
     client_id: str | None = None
     created_at: UtcDatetime
     edited_at: UtcDatetime | None = None
@@ -304,3 +328,76 @@ class DeleteOwnedMediaRequest(BaseModel):
 class DeleteOwnedMediaOut(BaseModel):
     deleted: int
     reclaimed_bytes: int
+
+
+class AdminStatusOut(BaseModel):
+    """Whether this account may read the activity log, and who else may."""
+
+    admin_username: str | None = None
+    is_admin: bool = False
+    #: True when this account may appoint the admin — nobody holds the role yet,
+    #: or this account already does.
+    can_claim: bool = False
+    #: Set on the server itself, so the app must not offer to change it.
+    locked_by_server: bool = False
+    my_username: str
+    #: A trusted admin device pin is stored on the server.
+    admin_device_pinned: bool = False
+    #: This request's X-Device-Id matches the pin.
+    this_device_trusted: bool = False
+    #: Admin account with no pin yet — the app should offer "Trust this phone".
+    needs_device_trust: bool = False
+
+
+class SetAdminRequest(BaseModel):
+    username: str = Field(min_length=1, max_length=40)
+
+
+class SetAdminDeviceRequest(BaseModel):
+    """Trust the caller's device, or clear the pin so any admin install works."""
+
+    clear: bool = False
+
+
+class OnlineUserOut(BaseModel):
+    id: int
+    username: str
+    display_name: str
+    is_online: bool = True
+
+
+class ForceLogoutOut(BaseModel):
+    user_id: int
+    username: str
+    token_version: int
+    sockets_closed: int = 0
+
+
+class AuditEventOut(BaseModel):
+    """One entry in the activity log."""
+
+    id: int
+    at: UtcDatetime
+    action: str
+    category: str
+    actor_user_id: int | None = None
+    actor_username: str | None = None
+    conversation_id: int | None = None
+    message_id: int | None = None
+    target_user_id: int | None = None
+    summary: str
+    #: The text as it stood before an edit or a deletion, and what replaced it.
+    #: Direct-message text arrives sealed by the sender's phone, so these hold
+    #: the sealed token rather than anything the server could read.
+    before_text: str | None = None
+    after_text: str | None = None
+    details: dict | None = None
+    ip: str | None = None
+
+
+class AuditSummaryOut(BaseModel):
+    total: int
+    last_day: int
+    edits: int
+    deletions: int
+    oldest_at: UtcDatetime | None = None

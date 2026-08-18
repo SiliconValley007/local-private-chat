@@ -1,15 +1,18 @@
 import 'dart:io';
 
+import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:video_player/video_player.dart';
 
 import '../app_state.dart';
+import '../e2e_text.dart';
 import '../errors.dart';
 import '../models.dart';
 import '../services/media_store.dart';
 import '../theme.dart';
 import 'attachments.dart';
+import 'media_shape.dart';
 
 /// Inline video card: a play button, the file name, and how big it is.
 ///
@@ -37,7 +40,7 @@ class VideoAttachment extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
-    final caption = message.body?.trim() ?? '';
+    final caption = readableBody(message.body)?.trim() ?? '';
     final width = maxWidth < 260.0 ? maxWidth : 260.0;
     final durationMs = message.mediaDurationMs;
     final durationText = durationMs != null && durationMs > 0
@@ -47,6 +50,17 @@ class VideoAttachment extends StatelessWidget {
       'Video',
       formatFileSize(message.mediaSize),
     ].where((part) => part.isNotEmpty).join(' · ');
+    final api = context.read<AppState>().api;
+    // Width-bounded decode only: the thumbnail keeps the shape of the clip, and
+    // pinning a height as well would hand back a stretched frame.
+    final thumbnail = ResizeImage(
+      CachedNetworkImageProvider(
+        api.mediaThumbnailUrl(message.id),
+        headers: api.imageAuthHeaders,
+      ),
+      width: (width * MediaQuery.devicePixelRatioOf(context)).round(),
+      policy: ResizeImagePolicy.fit,
+    );
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -60,108 +74,114 @@ class VideoAttachment extends StatelessWidget {
           onLongPress: onLongPress,
           child: ClipRRect(
             borderRadius: BorderRadius.circular(AppRadius.card - 6),
-            child: Container(
+            child: MediaShape(
+              messageId: message.id,
+              image: thumbnail,
               width: width,
-              height: width * 0.62,
-              color: Colors.black.withValues(alpha: 0.82),
-              child: Stack(
-                children: [
-                  Positioned.fill(
-                    child: Hero(
-                      tag: 'media-hero-${message.id}',
-                      child: Image.network(
-                        context.read<AppState>().api.mediaThumbnailUrl(
-                          message.id,
+              source: message.mediaShape,
+              builder: (context, box, alignment) => Container(
+                width: box.width,
+                height: box.height,
+                color: Colors.black.withValues(alpha: 0.82),
+                child: Stack(
+                  children: [
+                    Positioned.fill(
+                      child: Hero(
+                        tag: 'media-hero-${message.id}',
+                        child: Image(
+                          image: thumbnail,
+                          fit: BoxFit.cover,
+                          alignment: alignment,
+                          errorBuilder: (_, _, _) => const SizedBox.shrink(),
                         ),
-                        headers: context.read<AppState>().api.imageAuthHeaders,
-                        fit: BoxFit.cover,
-                        errorBuilder: (_, _, _) => const SizedBox.shrink(),
                       ),
                     ),
-                  ),
-                  Positioned.fill(
-                    child: ColoredBox(
-                      color: Colors.black.withValues(alpha: 0.18),
-                    ),
-                  ),
-                  Center(
-                    child: Container(
-                      width: 54,
-                      height: 54,
-                      decoration: BoxDecoration(
-                        color: Colors.white.withValues(alpha: 0.92),
-                        shape: BoxShape.circle,
-                      ),
-                      child: const Icon(
-                        Icons.play_arrow_rounded,
-                        size: 34,
-                        color: Colors.black87,
+                    Positioned.fill(
+                      child: ColoredBox(
+                        color: Colors.black.withValues(alpha: 0.18),
                       ),
                     ),
-                  ),
-                  if (durationText != null)
-                    Positioned(
-                      top: 8,
-                      right: 8,
+                    Center(
                       child: Container(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 6,
-                          vertical: 2,
-                        ),
+                        width: 54,
+                        height: 54,
                         decoration: BoxDecoration(
-                          color: Colors.black.withValues(alpha: 0.6),
-                          borderRadius: BorderRadius.circular(4),
+                          color: Colors.white.withValues(alpha: 0.92),
+                          shape: BoxShape.circle,
                         ),
-                        child: Text(
-                          durationText,
-                          style: const TextStyle(
-                            color: Colors.white,
-                            fontSize: 11,
-                            fontWeight: FontWeight.w600,
-                          ),
+                        child: const Icon(
+                          Icons.play_arrow_rounded,
+                          size: 34,
+                          color: Colors.black87,
                         ),
                       ),
                     ),
-                  Positioned(
-                    left: 10,
-                    right: 10,
-                    bottom: 8,
-                    child: Row(
-                      children: [
-                        const Icon(
-                          Icons.videocam_rounded,
-                          size: 15,
-                          color: Colors.white70,
-                        ),
-                        const SizedBox(width: 5),
-                        Expanded(
+                    if (durationText != null)
+                      Positioned(
+                        top: 8,
+                        right: 8,
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 6,
+                            vertical: 2,
+                          ),
+                          decoration: BoxDecoration(
+                            color: Colors.black.withValues(alpha: 0.6),
+                            borderRadius: BorderRadius.circular(4),
+                          ),
                           child: Text(
-                            detail,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
+                            durationText,
                             style: const TextStyle(
                               color: Colors.white,
-                              fontSize: 12,
+                              fontSize: 11,
                               fontWeight: FontWeight.w600,
                             ),
                           ),
                         ),
-                        // The clock and ticks sit on the card itself, exactly as
-                        // they do over a photo, so the tile reads as one piece.
-                        if (footer != null)
-                          IgnorePointer(
-                            child: DefaultTextStyle.merge(
-                              style: const TextStyle(color: Colors.white),
-                              child: IconTheme(
-                                data: const IconThemeData(color: Colors.white),
-                                child: footer!,
+                      ),
+                    Positioned(
+                      left: 10,
+                      right: 10,
+                      bottom: 8,
+                      child: Row(
+                        children: [
+                          const Icon(
+                            Icons.videocam_rounded,
+                            size: 15,
+                            color: Colors.white70,
+                          ),
+                          const SizedBox(width: 5),
+                          Expanded(
+                            child: Text(
+                              detail,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(
+                                color: Colors.white,
+                                fontSize: 12,
+                                fontWeight: FontWeight.w600,
                               ),
                             ),
                           ),
-                      ],
+                          // The clock and ticks sit on the card itself, exactly
+                          // as they do over a photo, so it reads as one piece.
+                          if (footer != null)
+                            IgnorePointer(
+                              child: DefaultTextStyle.merge(
+                                style: const TextStyle(color: Colors.white),
+                                child: IconTheme(
+                                  data: const IconThemeData(
+                                    color: Colors.white,
+                                  ),
+                                  child: footer!,
+                                ),
+                              ),
+                            ),
+                        ],
+                      ),
                     ),
-                  ),
-                ],
+                  ],
+                ),
               ),
             ),
           ),

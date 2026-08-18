@@ -60,13 +60,33 @@ Duration outgoingTimeoutForDelivery(CallDeliveryState? delivery) {
 /// Outgoing label shown to the caller before explicit callee ack.
 String outgoingCallLabel(CallPhase phase) {
   return switch (phase) {
-    CallPhase.outgoing => 'Trying to reach…',
+    CallPhase.outgoing => 'Calling…',
     CallPhase.ringing => 'Ringing…',
     CallPhase.connecting => 'Connecting…',
     CallPhase.active => 'Connected',
     CallPhase.incoming => 'Incoming call',
     CallPhase.ended => 'Call ended',
     CallPhase.idle => '',
+  };
+}
+
+/// What the caller is told while the invite makes its way to the other phone.
+///
+/// "Trying to reach…" was the only word for every one of these, silent and
+/// identical whether the invite had been delivered, was waking a sleeping
+/// phone, or had nowhere to go at all.
+String outgoingCallStatus(
+  CallPhase phase,
+  CallDeliveryState? delivery, {
+  String peerName = '',
+}) {
+  if (phase != CallPhase.outgoing) return outgoingCallLabel(phase);
+  final who = peerName.trim().isNotEmpty ? peerName.trim() : 'them';
+  return switch (delivery) {
+    null => 'Calling…',
+    CallDeliveryState.websocket => 'Ringing their phone…',
+    CallDeliveryState.pushAttempted => 'Waking their phone…',
+    CallDeliveryState.unreachable => "Can't reach $who",
   };
 }
 
@@ -165,8 +185,20 @@ CallAudioRoute defaultRouteForMedia(String media) =>
 /// Whether incoming ringtone/vibration should play for this phase.
 bool shouldPlayIncomingAlert(CallPhase phase) => phase == CallPhase.incoming;
 
-/// Outgoing ringback starts only after callee ringing ack.
-bool shouldPlayOutgoingRingback(CallPhase phase) => phase == CallPhase.ringing;
+/// Whether the caller should hear a ringback tone.
+///
+/// It starts the moment the call is placed, not when the other phone acks: a
+/// caller staring at a silent screen has no way to tell a call that is on its
+/// way from one that never left. The exception is a callee the server says it
+/// cannot reach — that silence is the answer, and the screen says so.
+bool shouldPlayOutgoingRingback(
+  CallPhase phase, {
+  CallDeliveryState? delivery,
+}) {
+  if (phase == CallPhase.ringing) return true;
+  if (phase != CallPhase.outgoing) return false;
+  return delivery != CallDeliveryState.unreachable;
+}
 
 /// Alert tones must stop once media connects or the call ends.
 bool shouldStopCallAlerts(CallPhase phase) =>

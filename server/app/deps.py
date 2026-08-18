@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 from app.auth import decode_access_token
 from app.db import get_db
 from app.models import User
+from app.sessions import token_version_matches
 
 bearer_scheme = HTTPBearer(auto_error=False)
 
@@ -41,5 +42,10 @@ def get_current_user(
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="This account no longer exists on the server. Please create a new account.",
+        )
+    if not token_version_matches(user, payload):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=SESSION_EXPIRED,
         )
     return user

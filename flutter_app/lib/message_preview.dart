@@ -1,4 +1,5 @@
 import 'call_log.dart';
+import 'e2e_text.dart';
 import 'models.dart';
 
 /// One-line summary shared by inbox, starred, search, quotes, and notifications.
@@ -12,12 +13,15 @@ String formatMessagePreview({
   String? endedByName,
 }) {
   if (isDeleted) return 'This message was deleted';
+  // A body that is still sealed has no summary to give, and printing the token
+  // turns a starred row or an inbox subtitle into a line of base64.
+  final sealed = isE2eCipherText(body);
   switch (type) {
     case 'image':
-      final caption = body?.trim() ?? '';
+      final caption = sealed ? '' : body?.trim() ?? '';
       return caption.isEmpty ? 'Photo' : 'Photo · $caption';
     case 'video':
-      final caption = body?.trim() ?? '';
+      final caption = sealed ? '' : body?.trim() ?? '';
       return caption.isEmpty ? 'Video' : 'Video · $caption';
     case 'doodle':
       return 'Drawing';
@@ -33,6 +37,7 @@ String formatMessagePreview({
         endedByName: endedByName,
       );
     default:
+      if (sealed) return encryptedPreview;
       final text = body?.trim() ?? '';
       return text.isEmpty ? emptyTextFallback : text;
   }

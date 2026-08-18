@@ -4,4 +4,8 @@
     <color name="ic_launcher_background">#FFFFFF</color>
     <!-- Tint Android applies to the status bar notification icon. -->
     <color name="notification_color">#0E7C66</color>
+    <!-- Window colour before Flutter's first frame. It matches the Dart launch
+         surface exactly, so starting the app is one continuous colour rather
+         than black, then a spinner, then the inbox. -->
+    <color name="splash_background">#F6F9F8</color>
 </resources>

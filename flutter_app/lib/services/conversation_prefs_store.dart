@@ -7,22 +7,37 @@ import 'package:shared_preferences/shared_preferences.dart';
 /// Pin and mute are never sent to the server — they are personal, like contact
 /// nicknames. Survives restarts until the app is uninstalled.
 class ConversationPrefs {
-  const ConversationPrefs({this.pinned = false, this.muted = false});
+  const ConversationPrefs({
+    this.pinned = false,
+    this.muted = false,
+    this.coupleDetailsEnabled = false,
+  });
 
   final bool pinned;
   final bool muted;
+  final bool coupleDetailsEnabled;
 
-  ConversationPrefs copyWith({bool? pinned, bool? muted}) => ConversationPrefs(
+  ConversationPrefs copyWith({
+    bool? pinned,
+    bool? muted,
+    bool? coupleDetailsEnabled,
+  }) => ConversationPrefs(
     pinned: pinned ?? this.pinned,
     muted: muted ?? this.muted,
+    coupleDetailsEnabled: coupleDetailsEnabled ?? this.coupleDetailsEnabled,
   );
 
-  Map<String, dynamic> toJson() => {'pinned': pinned, 'muted': muted};
+  Map<String, dynamic> toJson() => {
+    'pinned': pinned,
+    'muted': muted,
+    'couple_details_enabled': coupleDetailsEnabled,
+  };
 
   factory ConversationPrefs.fromJson(Map<String, dynamic> json) =>
       ConversationPrefs(
         pinned: json['pinned'] as bool? ?? false,
         muted: json['muted'] as bool? ?? false,
+        coupleDetailsEnabled: json['couple_details_enabled'] as bool? ?? false,
       );
 }
 

@@ -107,10 +107,9 @@ class _NudgeOverlayState extends State<NudgeOverlay>
                           Padding(
                             padding: const EdgeInsets.only(top: 8),
                             child: Material(
-                              color: Theme.of(context)
-                                  .colorScheme
-                                  .surface
-                                  .withValues(alpha: 0.88),
+                              color: Theme.of(
+                                context,
+                              ).colorScheme.surface.withValues(alpha: 0.88),
                               borderRadius: BorderRadius.circular(20),
                               child: Padding(
                                 padding: const EdgeInsets.symmetric(
@@ -120,9 +119,7 @@ class _NudgeOverlayState extends State<NudgeOverlay>
                                 child: Text(
                                   widget.controller.caption!,
                                   textAlign: TextAlign.center,
-                                  style: Theme.of(context)
-                                      .textTheme
-                                      .titleSmall
+                                  style: Theme.of(context).textTheme.titleSmall
                                       ?.copyWith(fontWeight: FontWeight.w600),
                                 ),
                               ),

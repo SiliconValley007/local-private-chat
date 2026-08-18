@@ -43,6 +43,24 @@ String sendConfirmLabel({required int selected, required int max}) {
   return 'Send ($selected/$max)';
 }
 
+/// What to say when the gallery would not hand over everything that was picked.
+///
+/// Resolving a pick can fail — a large video that has to be copied out of
+/// scoped storage needs room in the cache to land in. Dropping it quietly is
+/// indistinguishable from the app ignoring the send, so the count is named.
+String? unreadableAssetsMessage({required int picked, required int resolved}) {
+  final missing = picked - resolved;
+  if (missing <= 0) return null;
+  if (resolved == 0) {
+    return picked == 1
+        ? "Android wouldn't hand that file over. It may be too large for this "
+              'phone to copy, or still syncing from the cloud.'
+        : "Android wouldn't hand those $picked files over. They may be too "
+              'large for this phone to copy, or still syncing from the cloud.';
+  }
+  return "$missing of $picked couldn't be read and were left out.";
+}
+
 /// WhatsApp-style recent gallery for chat attachments and single-image picks.
 class MediaPickerService {
   const MediaPickerService._();
@@ -63,9 +81,11 @@ class MediaPickerService {
     required int maxAssets,
     required RequestType requestType,
     bool includeCameraShortcut = false,
+    SpecialPickerType? specialPickerType,
   }) => AssetPickerConfig(
     maxAssets: maxAssets,
     requestType: requestType,
+    specialPickerType: specialPickerType,
     sortPathsByModifiedDate: true,
     pickerTheme: AssetPicker.themeData(_chatPickerColor),
     textDelegate: _textDelegate,
@@ -134,8 +154,55 @@ class MediaPickerService {
       ),
     );
     if (assets == null || assets.isEmpty) return null;
-    return assetsToFiles(assets);
+    if (!context.mounted) return assetsToFiles(assets);
+    return _resolveSelection(context, assets);
   }
+
+  /// Turns a selection into files, saying so while it takes time or falls short.
+  ///
+  /// A big clip has to be copied out of the gallery before it can be uploaded,
+  /// which happens after the picker has already closed: without the barrier the
+  /// chat just sits there for several seconds looking ignored.
+  static Future<List<File>> _resolveSelection(
+    BuildContext context,
+    List<AssetEntity> assets,
+  ) async {
+    if (!context.mounted) return assetsToFiles(assets);
+    final navigator = Navigator.of(context, rootNavigator: true);
+    final messenger = ScaffoldMessenger.maybeOf(context);
+    showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      useRootNavigator: true,
+      builder: (_) => const _PreparingAttachmentsDialog(),
+    );
+    List<File> files;
+    try {
+      files = await assetsToFiles(assets);
+    } finally {
+      if (navigator.canPop()) navigator.pop();
+    }
+    final complaint = unreadableAssetsMessage(
+      picked: assets.length,
+      resolved: files.length,
+    );
+    if (complaint != null) {
+      messenger?.showSnackBar(SnackBar(content: Text(complaint)));
+    }
+    return files;
+  }
+
+  /// Grid setup for picking one photo (wallpaper, avatar).
+  ///
+  /// [RequestType.image] hides videos, and [SpecialPickerType.noPreview] drops
+  /// the Preview/Send bar that belongs to sending an attachment: a tap picks the
+  /// photo and returns, so the caller's own framing step is the next screen.
+  @visibleForTesting
+  static AssetPickerConfig singleImageConfig() => _config(
+    maxAssets: 1,
+    requestType: RequestType.image,
+    specialPickerType: SpecialPickerType.noPreview,
+  );
 
   /// One image from the on-device gallery (avatar, wallpaper, etc.).
   static Future<File?> pickSingleGalleryImage(BuildContext context) async {
@@ -145,10 +212,12 @@ class MediaPickerService {
     final assets = await AssetPicker.pickAssets(
       context,
       permissionRequestOption: _requestOption,
-      pickerConfig: _config(maxAssets: 1, requestType: RequestType.image),
+      pickerConfig: singleImageConfig(),
     );
     if (assets == null || assets.isEmpty) return null;
-    final files = await assetsToFiles(assets);
+    final files = context.mounted
+        ? await _resolveSelection(context, assets)
+        : await assetsToFiles(assets);
     return files.isEmpty ? null : files.first;
   }
 
@@ -240,4 +309,23 @@ class MediaPickerService {
       return null;
     }
   }
+}
+
+class _PreparingAttachmentsDialog extends StatelessWidget {
+  const _PreparingAttachmentsDialog();
+
+  @override
+  Widget build(BuildContext context) => const AlertDialog(
+    content: Row(
+      children: [
+        SizedBox(
+          width: 20,
+          height: 20,
+          child: CircularProgressIndicator(strokeWidth: 2),
+        ),
+        SizedBox(width: 16),
+        Expanded(child: Text('Preparing attachment…')),
+      ],
+    ),
+  );
 }

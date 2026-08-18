@@ -101,12 +101,22 @@ class ContactProfileScreen extends StatelessWidget {
             const SizedBox(height: 14),
             Semantics(
               label: presence,
-              child: SingleChildScrollView(
-                scrollDirection: Axis.horizontal,
-                child: Text(
-                  presence,
-                  style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                    color: online ? scheme.primary : scheme.onSurfaceVariant,
+              // Centred with the name and mood above it. A horizontal scroll
+              // view hands its child unbounded width, so the row is held to at
+              // least the screen for the centring to have room, and only grows
+              // (and scrolls) for a presence line too long to fit.
+              child: LayoutBuilder(
+                builder: (context, constraints) => SingleChildScrollView(
+                  scrollDirection: Axis.horizontal,
+                  child: ConstrainedBox(
+                    constraints: BoxConstraints(minWidth: constraints.maxWidth),
+                    child: Text(
+                      presence,
+                      textAlign: TextAlign.center,
+                      style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                        color: online ? scheme.primary : scheme.onSurfaceVariant,
+                      ),
+                    ),
                   ),
                 ),
               ),
@@ -153,6 +163,22 @@ class ContactProfileScreen extends StatelessWidget {
               context,
               username: peer.username,
               serverName: peer.displayName,
+            ),
+          ),
+          // Off for every chat until it is switched on here, so a chat with a
+          // parent or a colleague never mentions anniversaries or streaks.
+          Material(
+            color: Theme.of(context).colorScheme.surface,
+            borderRadius: BorderRadius.circular(AppRadius.card),
+            child: SwitchListTile(
+              key: const Key('couple-details-switch'),
+              secondary: const Icon(Icons.favorite_outline_rounded),
+              title: const Text('Couple details'),
+              subtitle: const Text(
+                'Anniversary and streak, in this chat, on this phone only',
+              ),
+              value: state.coupleDetailsEnabled(conv.id),
+              onChanged: (on) => state.setCoupleDetailsEnabled(conv.id, on),
             ),
           ),
           _ActionTile(

@@ -24,3 +24,39 @@ AnniversaryCountdown? anniversaryCountdown(String? raw, {DateTime? from}) {
   }
   return AnniversaryCountdown(days: next.difference(today).inDays);
 }
+
+/// Wording for the chat menu's anniversary entry.
+class CoupleMenuLabel {
+  const CoupleMenuLabel({required this.title, required this.subtitle});
+
+  final String title;
+  final String subtitle;
+}
+
+/// Does this chat offer the anniversary entry at all?
+///
+/// Every one-to-one chat does, whether or not it has been switched on — a chat
+/// that has never been asked is the one that needs a way to answer. Group chats
+/// have no couple to speak of.
+bool offersCoupleDetails(String conversationType) => conversationType == 'dm';
+
+/// Names the menu entry after what it does while it is switched off, so a chat
+/// with a parent in it shows nothing more suggestive than a date reminder.
+CoupleMenuLabel coupleMenuLabel({
+  required bool enabled,
+  required int streakDays,
+  AnniversaryCountdown? countdown,
+}) {
+  if (!enabled) {
+    return const CoupleMenuLabel(
+      title: 'Anniversary and streak',
+      subtitle: 'Off',
+    );
+  }
+  return CoupleMenuLabel(
+    title: streakDays > 0
+        ? 'Couple details · $streakDays-day streak'
+        : 'Couple details',
+    subtitle: countdown?.label ?? 'On',
+  );
+}
