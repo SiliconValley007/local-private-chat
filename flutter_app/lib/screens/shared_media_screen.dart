@@ -8,6 +8,8 @@ import '../models.dart';
 import '../theme.dart';
 import '../time_format.dart';
 import '../widgets/attachments.dart';
+import '../widgets/doodle_attachment.dart';
+import '../widgets/video_attachment.dart';
 
 /// WhatsApp-style Media / Docs / Links gallery for one conversation.
 ///
@@ -131,17 +133,19 @@ class _SharedMediaScreenState extends State<SharedMediaScreen>
 
   void _showInChat(int messageId) => Navigator.of(context).pop(messageId);
 
-  ChatMessage _asMessage(SharedItem item, {required String type}) => ChatMessage(
-    id: item.messageId,
-    conversationId: widget.conversation.id,
-    senderId: item.senderId,
-    type: type,
-    body: item.body,
-    mediaName: item.mediaName,
-    mediaSize: item.mediaSize,
-    mediaMime: item.mediaMime,
-    createdAt: item.createdAt,
-  );
+  ChatMessage _asMessage(SharedItem item, {required String type}) =>
+      ChatMessage(
+        id: item.messageId,
+        conversationId: widget.conversation.id,
+        senderId: item.senderId,
+        type: type,
+        body: item.body,
+        mediaName: item.mediaName,
+        mediaSize: item.mediaSize,
+        mediaMime: item.mediaMime,
+        mediaDurationMs: item.mediaDurationMs,
+        createdAt: item.createdAt,
+      );
 
   Future<void> _openLink(String url) async {
     final uri = Uri.tryParse(url);
@@ -163,15 +167,33 @@ class _SharedMediaScreenState extends State<SharedMediaScreen>
   }
 
   Future<void> _viewMedia(SharedItem item) async {
+    final isVideo = item.type == 'video';
+    final isDoodle = item.type == 'doodle';
     await Navigator.of(context).push(
       MaterialPageRoute(
-        builder: (_) => ImageViewerScreen(
-          message: _asMessage(item, type: 'image'),
-          onShowInChat: () {
+        builder: (_) {
+          void showInChat() {
             Navigator.of(context).pop(); // close viewer
             _showInChat(item.messageId);
-          },
-        ),
+          }
+
+          if (isVideo) {
+            return VideoViewerScreen(
+              message: _asMessage(item, type: 'video'),
+              onShowInChat: showInChat,
+            );
+          }
+          if (isDoodle) {
+            return DoodleViewerScreen(
+              message: _asMessage(item, type: 'doodle'),
+              onShowInChat: showInChat,
+            );
+          }
+          return ImageViewerScreen(
+            message: _asMessage(item, type: 'image'),
+            onShowInChat: showInChat,
+          );
+        },
       ),
     );
   }
@@ -198,8 +220,12 @@ class _SharedMediaScreenState extends State<SharedMediaScreen>
               ),
             if (item.kind == 'media')
               ListTile(
-                leading: const Icon(Icons.fullscreen_rounded),
-                title: const Text('View'),
+                leading: Icon(
+                  item.type == 'video'
+                      ? Icons.play_arrow_rounded
+                      : Icons.fullscreen_rounded,
+                ),
+                title: Text(item.type == 'video' ? 'Play' : 'View'),
                 onTap: () => Navigator.pop(sheetContext, 'view'),
               ),
             ListTile(
@@ -402,17 +428,68 @@ class _MediaGrid extends StatelessWidget {
                 return GestureDetector(
                   onTap: () => onTap(item),
                   onLongPress: () => onLongPress(item),
-                  child: Image.network(
-                    state.api.mediaUrl(item.messageId),
-                    headers: headers,
-                    fit: BoxFit.cover,
-                    errorBuilder: (_, _, _) => ColoredBox(
-                      color: Theme.of(
-                        context,
-                      ).colorScheme.surfaceContainerHighest,
-                      child: const Icon(Icons.broken_image_outlined),
-                    ),
-                  ),
+                  child: item.type == 'video'
+                      ? Stack(
+                          fit: StackFit.expand,
+                          children: [
+                            ColoredBox(
+                              color: Colors.black87,
+                              child: Image.network(
+                                state.api.mediaThumbnailUrl(item.messageId),
+                                headers: headers,
+                                fit: BoxFit.cover,
+                                errorBuilder: (_, _, _) =>
+                                    const SizedBox.shrink(),
+                              ),
+                            ),
+                            ColoredBox(
+                              color: Colors.black.withValues(alpha: 0.18),
+                            ),
+                            Center(
+                              child: Icon(
+                                Icons.play_circle_outline_rounded,
+                                color: Colors.white.withValues(alpha: 0.92),
+                                size: 34,
+                              ),
+                            ),
+                            if (item.mediaDurationMs case final ms? when ms > 0)
+                              Positioned(
+                                right: 4,
+                                bottom: 4,
+                                child: Container(
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 5,
+                                    vertical: 1,
+                                  ),
+                                  decoration: BoxDecoration(
+                                    color: Colors.black.withValues(alpha: 0.6),
+                                    borderRadius: BorderRadius.circular(4),
+                                  ),
+                                  child: Text(
+                                    formatClipDuration(
+                                      Duration(milliseconds: ms),
+                                    ),
+                                    style: const TextStyle(
+                                      color: Colors.white,
+                                      fontSize: 10,
+                                      fontWeight: FontWeight.w600,
+                                    ),
+                                  ),
+                                ),
+                              ),
+                          ],
+                        )
+                      : Image.network(
+                          state.api.mediaUrl(item.messageId),
+                          headers: headers,
+                          fit: BoxFit.cover,
+                          errorBuilder: (_, _, _) => ColoredBox(
+                            color: Theme.of(
+                              context,
+                            ).colorScheme.surfaceContainerHighest,
+                            child: const Icon(Icons.broken_image_outlined),
+                          ),
+                        ),
                 );
               }, childCount: group.items.length),
             ),

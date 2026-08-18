@@ -82,7 +82,7 @@ def reset_user(username: str, new_password: str | None) -> int:
         user.password_hash = hash_password(new_password)
         db.commit()
         print(f"Password reset for @{user.username} (id={user.id}).")
-        print("They can sign in with the new password immediately — no restart needed.")
+        print("They can sign in with the new password immediately - no restart needed.")
     return 0
 
 

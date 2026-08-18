@@ -87,7 +87,7 @@ class _ServerSetupScreenState extends State<ServerSetupScreen> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(title: const Text('Server settings')),
-      body: Padding(
+      body: SingleChildScrollView(
         padding: const EdgeInsets.all(24),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -136,9 +136,134 @@ class _ServerSetupScreenState extends State<ServerSetupScreen> {
               onPressed: _saving ? null : _resetDefault,
               child: const Text('Reset to default'),
             ),
+            const Divider(height: 40),
+            const _TailscaleAutomationCard(),
           ],
         ),
       ),
+    );
+  }
+}
+
+class _StatusLine extends StatelessWidget {
+  const _StatusLine({required this.icon, required this.text});
+
+  final IconData icon;
+  final String text;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Row(
+      children: [
+        Icon(icon, size: 16, color: theme.colorScheme.onSurfaceVariant),
+        const SizedBox(width: 8),
+        Expanded(
+          child: Text(
+            text,
+            style: theme.textTheme.bodySmall?.copyWith(
+              color: theme.colorScheme.onSurfaceVariant,
+              height: 1.4,
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+/// The two switches that decide how far Local Chat may drive Tailscale.
+class _TailscaleAutomationCard extends StatelessWidget {
+  const _TailscaleAutomationCard();
+
+  @override
+  Widget build(BuildContext context) {
+    final state = context.watch<AppState>();
+    final prefs = state.tailscalePrefs;
+    final theme = Theme.of(context);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          'TAILSCALE',
+          style: theme.textTheme.labelSmall?.copyWith(
+            fontWeight: FontWeight.w800,
+            letterSpacing: 0.8,
+            color: theme.colorScheme.onSurfaceVariant,
+          ),
+        ),
+        const SizedBox(height: 4),
+        SwitchListTile(
+          contentPadding: EdgeInsets.zero,
+          value: prefs.autoConnect,
+          onChanged: (value) =>
+              state.setTailscalePrefs(prefs.copyWith(autoConnect: value)),
+          title: const Text('Connect when the app opens'),
+          subtitle: const Text(
+            'Asks the Tailscale app to connect on launch, on resume, and when a '
+            'notification opens a chat.',
+          ),
+        ),
+        SwitchListTile(
+          contentPadding: EdgeInsets.zero,
+          value: prefs.autoDisconnectOnExit,
+          onChanged: (value) => state.setTailscalePrefs(
+            prefs.copyWith(autoDisconnectOnExit: value),
+          ),
+          title: const Text('Disconnect when the app is closed'),
+          subtitle: const Text(
+            'Only when Local Chat switched Tailscale on. A tunnel you turned on '
+            'yourself is left alone.',
+          ),
+        ),
+        const SizedBox(height: 4),
+        _StatusLine(
+          icon: state.tailscaleStartedByApp
+              ? Icons.check_circle_outline_rounded
+              : Icons.info_outline_rounded,
+          text: state.tailscaleStartedByApp
+              ? 'Local Chat turned Tailscale on, so closing the app will turn '
+                    'it off.'
+              : 'Tailscale is not Local Chat\'s to switch off, so it will be '
+                    'left running.',
+        ),
+        if (state.tailscaleAutoConnectPaused) ...[
+          const SizedBox(height: 6),
+          _StatusLine(
+            icon: Icons.pause_circle_outline_rounded,
+            text:
+                'You disconnected Tailscale here, so the app will not '
+                'reconnect it until you ask or reopen the app.',
+          ),
+        ],
+        const SizedBox(height: 12),
+        OutlinedButton.icon(
+          onPressed: () async {
+            final messenger = ScaffoldMessenger.of(context);
+            final sent = await state.disconnectTailscaleNow();
+            messenger.showSnackBar(
+              SnackBar(
+                content: Text(
+                  sent
+                      ? 'Asked Tailscale to disconnect.'
+                      : 'Could not reach the Tailscale app.',
+                ),
+              ),
+            );
+          },
+          icon: const Icon(Icons.link_off_rounded, size: 18),
+          label: const Text('Disconnect Tailscale now'),
+        ),
+        const SizedBox(height: 12),
+        Text(
+          'Tailscale owns the VPN, so these are requests to it. Keep its battery '
+          'usage Unrestricted, or Android may ignore them.',
+          style: theme.textTheme.bodySmall?.copyWith(
+            color: theme.colorScheme.onSurfaceVariant,
+            height: 1.4,
+          ),
+        ),
+      ],
     );
   }
 }

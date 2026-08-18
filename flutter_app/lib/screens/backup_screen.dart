@@ -22,6 +22,31 @@ class _BackupScreenState extends State<BackupScreen> {
   bool _busy = false;
   String? _status;
   bool _obscure = true;
+  String? _lastBackupAt;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) => _loadMeta());
+  }
+
+  Future<void> _loadMeta() async {
+    final state = context.read<AppState>();
+    try {
+      final blob = await state.backup.downloadFromServer();
+      final raw = blob['updated_at'];
+      if (!mounted || raw == null || raw.isEmpty) return;
+      final parsed = DateTime.tryParse(raw)?.toLocal();
+      setState(() {
+        _lastBackupAt = parsed == null
+            ? raw
+            : '${parsed.year}-${parsed.month.toString().padLeft(2, '0')}-${parsed.day.toString().padLeft(2, '0')} '
+                  '${parsed.hour.toString().padLeft(2, '0')}:${parsed.minute.toString().padLeft(2, '0')}';
+      });
+    } catch (_) {
+      // No backup yet is fine.
+    }
+  }
 
   @override
   void dispose() {
@@ -60,6 +85,7 @@ class _BackupScreenState extends State<BackupScreen> {
         messagesByConv: state.messagesByConv,
         localContacts: state.localContacts,
         contactAliases: state.contactAliases,
+        starredMessageIds: state.starredIds,
       );
       setState(() => _status = 'Encrypting on this device…');
       final enc = await state.backup.encrypt(
@@ -118,6 +144,31 @@ class _BackupScreenState extends State<BackupScreen> {
       setState(() => _status = 'Enter the password you used for the backup.');
       return;
     }
+    final when = _lastBackupAt;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Restore backup?'),
+        content: Text(
+          when == null
+              ? 'This replaces local chat data with the encrypted backup from the server.'
+              : 'Last server backup was $when.\n\n'
+                    'This replaces local chat data with that backup.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Restore'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+
     final state = context.read<AppState>();
     final me = state.me;
     if (me == null) return;
@@ -144,14 +195,66 @@ class _BackupScreenState extends State<BackupScreen> {
       if (mounted) {
         setState(() {
           final names = summary['names'] as int? ?? 0;
+          final stars = summary['stars'] as int? ?? 0;
           _status =
               'Restored ${summary['contacts']} contacts, ${summary['messages']} messages'
               '${names > 0 ? ', $names renamed ${names == 1 ? 'person' : 'people'}' : ''}'
+              '${stars > 0 ? ', $stars starred ${stars == 1 ? 'message' : 'messages'}' : ''}'
               '${(summary['dms'] as int) > 0 ? ', reopened ${summary['dms']} DMs' : ''}.';
         });
       }
     } catch (e) {
       setState(() => _status = 'Restore failed. ${friendlyMessage(e)}');
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  Future<void> _verifyBackup() async {
+    final pwd = _password.text;
+    if (pwd.isEmpty) {
+      setState(() => _status = 'Enter the backup password to verify.');
+      return;
+    }
+    final state = context.read<AppState>();
+    setState(() {
+      _busy = true;
+      _status = 'Downloading ciphertext…';
+    });
+    try {
+      final blob = await state.backup.downloadFromServer();
+      setState(() => _status = 'Checking password & headers…');
+      final data = await state.backup.decrypt(
+        password: pwd,
+        ciphertextB64: blob['ciphertext_b64']!,
+        saltB64: blob['salt_b64']!,
+        nonceB64: blob['nonce_b64']!,
+      );
+      final convs = (data['conversations'] as List?)?.length ?? 0;
+      final msgs =
+          (data['messages'] as List?)?.length ??
+          (data['messages_by_conv'] as Map?)?.values.fold<int>(
+            0,
+            (sum, v) => sum + ((v as List?)?.length ?? 0),
+          ) ??
+          0;
+      if (mounted) {
+        setState(() {
+          _status =
+              'Backup OK — password works. Export has $convs chats'
+              '${msgs > 0 ? ' and about $msgs messages' : ''}. Nothing was restored.';
+          final raw = blob['updated_at'];
+          if (raw != null && raw.isNotEmpty) {
+            final parsed = DateTime.tryParse(raw)?.toLocal();
+            _lastBackupAt = parsed == null
+                ? raw
+                : '${parsed.year}-${parsed.month.toString().padLeft(2, '0')}-${parsed.day.toString().padLeft(2, '0')} '
+                      '${parsed.hour.toString().padLeft(2, '0')}:${parsed.minute.toString().padLeft(2, '0')}';
+          }
+        });
+      }
+    } catch (e) {
+      setState(() => _status = 'Verify failed. ${friendlyMessage(e)}');
     } finally {
       if (mounted) setState(() => _busy = false);
     }
@@ -189,13 +292,23 @@ class _BackupScreenState extends State<BackupScreen> {
               borderRadius: BorderRadius.circular(18),
             ),
             child: Text(
-              'Chats are encrypted on this phone with your password before upload. '
-              'Your private server and Firestore only store ciphertext — never message text.',
+              'Encryption keys and your backup password stay on your phones. '
+              'Your private server stores ciphertext only — it cannot read chats. '
+              'Optional Firestore mirror is the same ciphertext, never plaintext.',
               style: Theme.of(
                 context,
               ).textTheme.bodyMedium?.copyWith(height: 1.4),
             ),
           ),
+          if (_lastBackupAt != null) ...[
+            const SizedBox(height: 12),
+            Text(
+              'Last server backup: $_lastBackupAt',
+              style: Theme.of(
+                context,
+              ).textTheme.bodySmall?.copyWith(color: scheme.onSurfaceVariant),
+            ),
+          ],
           const SizedBox(height: 20),
           TextField(
             controller: _password,
@@ -237,6 +350,12 @@ class _BackupScreenState extends State<BackupScreen> {
             onPressed: _busy ? null : () => _restore(fromFirestore: true),
             icon: const Icon(Icons.cloud_download_outlined),
             label: const Text('Restore from Firestore'),
+          ),
+          const SizedBox(height: 10),
+          OutlinedButton.icon(
+            onPressed: _busy ? null : _verifyBackup,
+            icon: const Icon(Icons.verified_user_outlined),
+            label: const Text('Verify backup'),
           ),
           const SizedBox(height: 10),
           TextButton.icon(

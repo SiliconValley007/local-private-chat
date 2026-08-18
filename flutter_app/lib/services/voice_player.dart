@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:audioplayers/audioplayers.dart';
 import 'package:flutter/foundation.dart';
 
@@ -8,6 +10,7 @@ class VoicePlaybackState {
     this.playing = false,
     this.position = Duration.zero,
     this.duration,
+    this.speed = 1.0,
   });
 
   /// Message whose voice note is loaded, or null when nothing is playing.
@@ -15,6 +18,7 @@ class VoicePlaybackState {
   final bool playing;
   final Duration position;
   final Duration? duration;
+  final double speed;
 
   bool isFor(int id) => messageId == id;
 
@@ -29,12 +33,14 @@ class VoicePlaybackState {
     bool? playing,
     Duration? position,
     Duration? duration,
+    double? speed,
   }) {
     return VoicePlaybackState(
       messageId: messageId ?? this.messageId,
       playing: playing ?? this.playing,
       position: position ?? this.position,
       duration: duration ?? this.duration,
+      speed: speed ?? this.speed,
     );
   }
 }
@@ -43,6 +49,22 @@ class VoicePlaybackState {
 /// one instead of layering two recordings on top of each other.
 class VoicePlayer extends ValueNotifier<VoicePlaybackState> {
   VoicePlayer._() : super(const VoicePlaybackState()) {
+    // stayAwake keeps the clip going when the screen turns off.
+    unawaited(
+      _player.setReleaseMode(ReleaseMode.stop).then((_) {
+        return _player.setAudioContext(
+          AudioContext(
+            android: const AudioContextAndroid(
+              isSpeakerphoneOn: false,
+              stayAwake: true,
+              contentType: AndroidContentType.speech,
+              usageType: AndroidUsageType.media,
+              audioFocus: AndroidAudioFocus.gain,
+            ),
+          ),
+        );
+      }),
+    );
     _player.onDurationChanged.listen((d) {
       value = value.copyWith(duration: d);
     });
@@ -50,13 +72,15 @@ class VoicePlayer extends ValueNotifier<VoicePlaybackState> {
       value = value.copyWith(position: p);
     });
     _player.onPlayerComplete.listen((_) {
-      value = const VoicePlaybackState();
+      value = VoicePlaybackState(speed: value.speed);
     });
   }
 
   static final VoicePlayer instance = VoicePlayer._();
 
   final AudioPlayer _player = AudioPlayer();
+
+  static const speeds = <double>[1.0, 1.5, 2.0];
 
   /// Plays [path] for [messageId], pausing/resuming when it is already loaded.
   Future<void> toggle(int messageId, String path) async {
@@ -71,8 +95,20 @@ class VoicePlayer extends ValueNotifier<VoicePlaybackState> {
       return;
     }
     await _player.stop();
-    value = VoicePlaybackState(messageId: messageId, playing: true);
+    value = VoicePlaybackState(
+      messageId: messageId,
+      playing: true,
+      speed: value.speed,
+    );
+    await _player.setPlaybackRate(value.speed);
     await _player.play(DeviceFileSource(path));
+  }
+
+  Future<void> cycleSpeed() async {
+    final idx = speeds.indexOf(value.speed);
+    final next = speeds[(idx < 0 ? 0 : idx + 1) % speeds.length];
+    await _player.setPlaybackRate(next);
+    value = value.copyWith(speed: next);
   }
 
   Future<void> seekTo(int messageId, double fraction) async {
@@ -87,6 +123,6 @@ class VoicePlayer extends ValueNotifier<VoicePlaybackState> {
 
   Future<void> stop() async {
     await _player.stop();
-    value = const VoicePlaybackState();
+    value = VoicePlaybackState(speed: value.speed);
   }
 }

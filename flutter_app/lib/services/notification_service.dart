@@ -4,12 +4,29 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 
 import '../navigation.dart';
-import 'contacts_store.dart';
+import '../call_identity.dart';
+import '../nudge_log.dart';
 import 'conversation_prefs_store.dart';
+import 'pending_call_store.dart';
 
 const _channelId = 'local_chat_messages';
 const _channelName = 'Messages';
 const _channelDescription = 'New chat messages';
+
+const _callChannelId = 'local_chat_calls';
+const _callChannelName = 'Calls';
+const _callChannelDescription = 'Incoming voice and video calls';
+
+/// Stable notification id for the active incoming call alert.
+const incomingCallNotificationId = 900001;
+
+/// All chat alerts share one group so Android bundles them under a single
+/// header instead of listing each chat separately.
+const _groupKey = 'local_chat_messages';
+
+/// Id of the separate badge notification used by builds up to 1.3.x. Kept only
+/// so an upgrade can clear the leftover.
+const _legacyBadgeId = 0;
 
 /// Runs in its own isolate when a push arrives while the app is backgrounded or
 /// killed, so everything it needs must be initialised here from scratch.
@@ -27,10 +44,24 @@ class NotificationService {
   bool _localReady = false;
   bool firebaseReady = false;
 
+  /// Unread total shown as the launcher badge on the next chat alert.
+  int _badgeCount = 0;
+
+  bool _legacyBadgeCleared = false;
+
   void Function(int conversationId)? _onOpenConversation;
+
+  /// Opens the call UI for a pending incoming call notification tap.
+  void Function(PendingCall call)? _onOpenCall;
+
+  /// Foreground/background push arrived; app should restore the call session.
+  void Function(PendingCall call)? onIncomingCallPush;
 
   /// Called when FCM rotates our token, so the server can be told the new one.
   void Function(String token)? onTokenRefresh;
+
+  /// Foreground message push arrived; reconcile the transcript from the server.
+  void Function(int conversationId)? onForegroundMessagePush;
 
   /// Sets up local notifications. Safe to call from a background isolate: it
   /// never asks for permission and never touches the UI.
@@ -40,7 +71,12 @@ class NotificationService {
     await _plugin.initialize(
       const InitializationSettings(android: android),
       onDidReceiveNotificationResponse: (resp) {
-        final id = int.tryParse(resp.payload ?? '');
+        final payload = resp.payload ?? '';
+        if (payload.startsWith('call:')) {
+          _routeToPendingCall(payload.substring(5));
+          return;
+        }
+        final id = int.tryParse(payload);
         if (id != null) _routeToConversation(id);
       },
     );
@@ -56,13 +92,29 @@ class NotificationService {
             importance: Importance.high,
           ),
         );
+    await _plugin
+        .resolvePlatformSpecificImplementation<
+          AndroidFlutterLocalNotificationsPlugin
+        >()
+        ?.createNotificationChannel(
+          const AndroidNotificationChannel(
+            _callChannelId,
+            _callChannelName,
+            description: _callChannelDescription,
+            importance: Importance.max,
+            playSound: true,
+            enableVibration: true,
+          ),
+        );
     _localReady = true;
   }
 
   Future<void> init({
     void Function(int conversationId)? onOpenConversation,
+    void Function(PendingCall call)? onOpenCall,
   }) async {
     _onOpenConversation = onOpenConversation;
+    _onOpenCall = onOpenCall;
     await _ensureLocalNotifications();
 
     final androidPlugin = _plugin
@@ -74,8 +126,13 @@ class NotificationService {
     // Opened from a notification while the app was not running.
     final launch = await _plugin.getNotificationAppLaunchDetails();
     if (launch?.didNotificationLaunchApp ?? false) {
-      final id = int.tryParse(launch?.notificationResponse?.payload ?? '');
-      if (id != null) pendingOpenConversationId = id;
+      final payload = launch?.notificationResponse?.payload ?? '';
+      if (payload.startsWith('call:')) {
+        pendingOpenCallId = payload.substring(5);
+      } else {
+        final id = int.tryParse(payload);
+        if (id != null) pendingOpenConversationId = id;
+      }
     }
 
     try {
@@ -105,8 +162,24 @@ class NotificationService {
   }
 
   void _openFromPush(RemoteMessage msg) {
-    final cid = _conversationIdFrom(msg.data);
+    final data = msg.data;
+    if ('${data['type'] ?? ''}' == 'call.incoming') {
+      final callId = '${data['call_id'] ?? ''}';
+      if (callId.isNotEmpty) {
+        _routeToPendingCall(callId);
+      }
+      return;
+    }
+    final cid = _conversationIdFrom(data);
     if (cid != null) _routeToConversation(cid);
+  }
+
+  Future<void> _routeToPendingCall(String callId) async {
+    pendingOpenCallId = callId;
+    final stored = await PendingCallStore.instance.load();
+    if (stored != null && stored.callId == callId) {
+      _onOpenCall?.call(stored);
+    }
   }
 
   void _routeToConversation(int conversationId) {
@@ -126,14 +199,69 @@ class NotificationService {
     }
   }
 
-  /// Shows a message notification. [body] stays on this device, so it may hold
-  /// a real preview; pushes from the server never carry message content.
-  Future<void> showIncomingMessage({
+  Future<String> _callTitleFromData(Map<String, dynamic> data) async {
+    return resolveCallerDisplayName(
+      username: '${data['caller_username'] ?? ''}',
+      serverName: '${data['caller_name'] ?? ''}',
+    );
+  }
+
+  /// High-priority incoming call alert (notification-only, no full-screen intent).
+  Future<void> showIncomingCall({
+    required String callId,
     required int conversationId,
     required String title,
-    String body = 'New message',
+    required bool isVideo,
   }) async {
     await _ensureLocalNotifications();
+    final body = isVideo ? 'Incoming video call' : 'Incoming voice call';
+    await _plugin.show(
+      incomingCallNotificationId,
+      title,
+      body,
+      NotificationDetails(
+        android: AndroidNotificationDetails(
+          _callChannelId,
+          _callChannelName,
+          channelDescription: _callChannelDescription,
+          importance: Importance.max,
+          priority: Priority.max,
+          category: AndroidNotificationCategory.call,
+          fullScreenIntent: false,
+          ongoing: true,
+          autoCancel: false,
+          playSound: true,
+          enableVibration: true,
+          ticker: body,
+        ),
+      ),
+      payload: 'call:$callId',
+    );
+  }
+
+  Future<void> cancelIncomingCall() async {
+    try {
+      await _ensureLocalNotifications();
+      await _plugin.cancel(incomingCallNotificationId);
+    } catch (e) {
+      debugPrint('Could not clear call notification: $e');
+    }
+  }
+
+  /// Posts the one notification a chat is allowed to have.
+  ///
+  /// Deliberately private and deliberately narrow: callers choose a fixed
+  /// phrase, never free text. That is what keeps message content out of the
+  /// notification shade no matter which code path raises the alert.
+  Future<void> _showChatAlert({
+    required int conversationId,
+    required String title,
+    required String body,
+  }) async {
+    await _ensureLocalNotifications();
+    // The launcher badge rides on this notification's number, so there is no
+    // second "N unread messages" notification competing with it.
+    final badge = _badgeCount;
     await _plugin.show(
       conversationId,
       title,
@@ -146,13 +274,41 @@ class NotificationService {
           importance: Importance.high,
           priority: Priority.high,
           category: AndroidNotificationCategory.message,
-          groupKey: 'local_chat_$conversationId',
-          styleInformation: BigTextStyleInformation(body),
+          // One shared group so several chats bundle under a single header,
+          // the way WhatsApp stacks its chats.
+          groupKey: _groupKey,
+          number: badge > 0 ? badge : null,
         ),
       ),
       payload: '$conversationId',
     );
   }
+
+  /// Alerts that a chat has a new message, without ever saying what it says.
+  ///
+  /// There is no parameter for the text on purpose. The body is always the
+  /// fixed phrase "New message": message content never leaves the chat screen,
+  /// so a notification cannot leak it on a lock screen or in a screenshot.
+  Future<void> showIncomingMessage({
+    required int conversationId,
+    required String title,
+  }) => _showChatAlert(
+    conversationId: conversationId,
+    title: title,
+    body: 'New message',
+  );
+
+  /// Alerts that someone sent a nudge. [action] is one of the app's own fixed
+  /// phrases ("waved at you"), never anything a person typed.
+  Future<void> showNudge({
+    required int conversationId,
+    required String title,
+    String action = 'nudged you',
+  }) => _showChatAlert(
+    conversationId: conversationId,
+    title: title,
+    body: action,
+  );
 
   /// Removes the tray notification for one chat.
   ///
@@ -168,66 +324,72 @@ class NotificationService {
   }
 
   Future<void> showFromPushData(Map<String, dynamic> data) async {
+    if ('${data['type'] ?? ''}' == 'call.incoming') {
+      final pending = PendingCall.fromPushData(data);
+      if (pending.callId.isEmpty || pending.conversationId <= 0) return;
+      await PendingCallStore.instance.save(pending);
+      final prefs = await ConversationPrefsStore.load();
+      if (prefs[pending.conversationId]?.muted ?? false) return;
+      final title = await _callTitleFromData(data);
+      await showIncomingCall(
+        callId: pending.callId,
+        conversationId: pending.conversationId,
+        title: title,
+        isVideo: pending.media == 'video',
+      );
+      onIncomingCallPush?.call(pending);
+      return;
+    }
     final cid = _conversationIdFrom(data);
     if (cid == null) return;
     final prefs = await ConversationPrefsStore.load();
     if (prefs[cid]?.muted ?? false) return;
     final sender = await notificationTitleFromData(data);
-    await showIncomingMessage(
-      conversationId: cid,
-      title: sender,
-    );
+    // A nudge is an attention poke, not a message, so it says so rather than
+    // the generic "New message" a real message falls back to.
+    if ('${data['type'] ?? ''}' == 'chat.nudge') {
+      final variant = NudgeVariant.parse(data['variant'] as String?);
+      await showNudge(
+        conversationId: cid,
+        title: sender,
+        action: '${variant.verb} you',
+      );
+      return;
+    }
+    if ('${data['type'] ?? ''}' == 'message.new') {
+      onForegroundMessagePush?.call(cid);
+    }
+    await showIncomingMessage(conversationId: cid, title: sender);
   }
 
   /// Resolves the push sender through this phone's private address book.
   /// Public for a focused unit test; no UI or Firebase instance is required.
   Future<String> notificationTitleFromData(Map<String, dynamic> data) async {
-    final username = '${data['sender_username'] ?? ''}'.trim();
-    final serverName = '${data['sender_name'] ?? ''}'.trim();
-    var sender = serverName;
-    if (username.isNotEmpty) {
-      // This works in the background isolate too: aliases are deliberately
-      // device-local and are available without the UI or chat server.
-      final aliases = await ContactsStore().aliases();
-      sender = aliases[username] ?? serverName;
-    }
-    return sender.isEmpty ? 'Local Chat' : sender;
+    return resolveCallerDisplayName(
+      username: '${data['sender_username'] ?? ''}',
+      serverName: '${data['sender_name'] ?? ''}',
+      fallback: 'Local Chat',
+    );
   }
 
-  /// Updates the launcher unread hint via a silent summary notification.
+  /// Records the unread total for the launcher badge.
   ///
-  /// Many Android launchers (Samsung, Xiaomi, etc.) show a badge from the
-  /// notification count / number. Unsupported launchers simply show nothing.
+  /// This posts nothing of its own. Earlier builds raised a second, silent
+  /// "N unread messages" notification for the badge, which meant one incoming
+  /// message produced two entries in the shade. The count now rides as the
+  /// `number` on the chat's own notification instead, so a message is always
+  /// exactly one notification. Launchers that cannot read a number simply show
+  /// their usual dot.
   Future<void> setAppBadgeCount(int count) async {
+    _badgeCount = count < 0 ? 0 : count;
     try {
       await _ensureLocalNotifications();
-      const summaryId = 0;
-      if (count <= 0) {
-        await _plugin.cancel(summaryId);
-        return;
+      // Clear the standalone badge notification left behind by an older
+      // install, otherwise it would linger forever with a stale count.
+      if (!_legacyBadgeCleared) {
+        _legacyBadgeCleared = true;
+        await _plugin.cancel(_legacyBadgeId);
       }
-      await _plugin.show(
-        summaryId,
-        'Local Chat',
-        count == 1 ? '1 unread message' : '$count unread messages',
-        NotificationDetails(
-          android: AndroidNotificationDetails(
-            _channelId,
-            _channelName,
-            channelDescription: _channelDescription,
-            importance: Importance.low,
-            priority: Priority.low,
-            number: count,
-            onlyAlertOnce: true,
-            playSound: false,
-            enableVibration: false,
-            category: AndroidNotificationCategory.message,
-            groupKey: 'local_chat_badge',
-            // Keep it as a quiet indicator, not a loud alert.
-            silent: true,
-          ),
-        ),
-      );
     } catch (e) {
       debugPrint('Badge update skipped: $e');
     }

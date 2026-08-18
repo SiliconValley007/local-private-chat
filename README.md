@@ -12,21 +12,76 @@ Inspired by the deployment model of [local-drive](https://github.com/SiliconVall
 
 - Register / login (username + password), persistent sessions
 - 1:1 DMs and group chats
-- Text, images, files, and voice notes
-- **Big emoji** — an emoji-only message is drawn large and bubble-free, like WhatsApp
+- Text, images, **videos**, files, and voice notes
+- **Display pictures** — set your own photo; everyone on the server sees it. Tap any photo to open it full screen, pinch to zoom, and share it
+- **Server storage at a glance** when attaching — free space on the Windows or
+  Termux device hosting Local Chat, with early and critical low-space warnings
+- **Send up to 50 photos or videos at once** from an in-app Recent media grid
+  (camera shortcut included); review, reorder, remove, and caption the selection
+  before sending. A batch caption belongs to its first item; documents stay on
+  the separate file picker
+- **Videos show a first-frame preview and play in the app** — tap to watch
+  (streamed, with seeking), then save or share only if you want to keep it
+- **Low-bandwidth by design** — gzipped JSON, kept-alive probes, coalesced inbox refreshes, and no auto-downloading of video
+- **Nudge** — double-tap the chat to buzz the other phone with a floating wave, no message logged
+- **Bubbles hug their text**, so a two-word reply gets a two-word bubble, like WhatsApp
+- **Big emoji** — an emoji-only message is drawn large and bubble-free, like WhatsApp,
+  and a single emoji pops in when it lands (tap to replay)
+- **Every emoji renders** — the app carries Noto Color Emoji, so the newest ones are
+  not the empty boxes a phone's own font would draw
+- **End-to-end encryption for direct chats** — X25519 key exchange, AES-GCM message bodies; the server only ever stores an opaque token. Auto-negotiated on open, transparent to search and previews (which stay on your phone)
+- **Message reactions** — long-press for a WhatsApp-style emoji bar or pick any emoji; tallies show under the bubble
+- **Starred messages** — private, server-synced stars for text and every
+  attachment type; the list updates immediately on star/unstar
+- **Delete for everyone or for me**, and **edit** within 15 minutes of sending
+- **Disappearing messages** per chat — off / 24 hours / 7 days / 90 days
+- **Nudge flavours** — wave, poke, hug, or kiss, each with its own buzz and floating glyph; **per-chat nudge history** (Chat ⋮ → Nudge history) keeps every nudge off the transcript with explicit sent/received copy and local aliases
+- **Live doodles** — draw ephemeral strokes over an open chat (color, brush, undo/redo, clear); peers see them live over the WebSocket; optional **Send** flattens the canvas to a transparent PNG `Drawing` message that stars, replies, and exports like any attachment
+- **Realtime transcript sync** — incremental `after_id` fetch plus merge-based loading so WebSocket rows, reconnect/resume, and foreground FCM never lose messages to a stale HTTP page; optimistic sends dedupe by client id
+- **Couple details (DMs)** — an unobtrusive overflow-menu view for the message
+  streak and recurring anniversary countdown, plus a private partner mood
+- **Shared chat wallpapers** — any member sets one image and everyone in the chat sees it, with a dim slider
+- **Owner-safe server cleanup** — review “My uploads”, select what to remove,
+  and reclaim server space without exposing or deleting another user’s files
+- **Rich text in bubbles** — bold, italic, strike, `` `code` ``, fenced code blocks with copy, and `||spoilers||`
+- **Pinned messages** in a chat — sticky banner with jump-to-message
+- **Search all messages** from the inbox, with sender / media / date filters
+- **Per-chat drafts** restored when you reopen a conversation
+- **Voice notes** with waveform, 1× / 1.5× / 2× speed, and background-friendly playback
+- **Media viewers** with Hero transition and swipe-down to dismiss; optional Wi‑Fi-only video saves
+- **Voice and video calls** — WebRTC over Tailscale; incoming calls use a high-priority
+  heads-up notification (not a lock-screen takeover), local aliases appear in
+  call alerts, ring/ringback and vibration follow the call phase, and voice
+  calls can switch between earpiece, speaker, and Bluetooth
+- **One authoritative call log** — one row per call, with outcome, duration, and
+  who ended an answered call; inbox previews never expose call JSON
+- **Privacy onboarding** — short first-run tips about your server, Tailscale, and no cloud account
 - **Reply / quote**, **edit**, and **delete** (tombstone) for messages
-- Delivery and read receipts, typing, online presence
+- Delivery and read receipts (monotonic — a read on a newer message ticks every
+  older one, so a dropped socket frame cannot leave a stale single tick), with
+  the latest outgoing status also shown in the Chats list; typing, online /
+  last-seen presence, and partner mood as secondary text
+- **Profile screens** — edit your photo, display name, and mood in one place;
+  contact profiles keep private aliases, real identity, full last-seen, shared
+  media, and call actions together
 - **Search** people, last-message text in the inbox, and messages inside a chat
 - **Pin** chats and **mute** notifications per conversation (device-local)
 - **Export chat** as a shareable plain-text file
 - **Clickable links** in messages (opens in the browser; no silent preview fetch)
 - **Unread badge** on the app icon (where the launcher supports it)
 - **Reconnecting** banner in the inbox when the WebSocket drops
-- **Tailscale gate** — app waits if the private server is unreachable
-- **Add people** — username search, local contacts (device-only), QR invite (`localchat://user/...`)
+- **Tailscale gate** — app waits if the private server is unreachable; asks Tailscale to connect on open (including from a notification), switches it back off when the app is closed, and offers Connect / Open buttons
+- **Share into Local Chat from any app** — Local Chat appears in Android's share
+  sheet for links, text, photos, videos, and documents; pick a chat (or a new
+  one) and the share is sent as a message, captioned when it came with text
+- **Add people** — username search, local contacts (device-only), QR invite, and
+  invite links that carry the server address
+  (`localchat://user/DDas?server=http://100.x.y.z:8000`) so a fresh phone is
+  pointed at your server instead of having to be set up by hand. Scan it, paste
+  it from the clipboard, or just tap the link. Tailscale access is still required
 - **Rename people** — give anyone a name only you see; saved on the phone and inside the encrypted backup
-- **Notifications** — local alerts when a chat is not open; optional FCM data-only wake-ups (no message body)
-- **Encrypted backup / restore** — AES-GCM on-device, ciphertext on private server + optional Firestore mirror
+- **Notifications** — exactly one alert per chat, showing only who wrote, never what they wrote (on the socket and over FCM alike); optional FCM data-only wake-ups
+- **Encrypted backup / restore** — AES-GCM on-device, ciphertext on private server + optional Firestore mirror; verify without restoring (format v3 includes starred message ids)
 - **Appearance** — system / light / dark, remembered on the phone
 - **Change password** in the app; admin can reset forgotten logins with `reset_password.py`
 - **Media, links, and docs** gallery per chat (WhatsApp-style) with jump back to the message
@@ -35,7 +90,7 @@ Inspired by the deployment model of [local-drive](https://github.com/SiliconVall
 
 **Ready for:** private chat across different networks via Tailscale (or same LAN), with the server device online and Tailscale Connected.
 
-**Not a full WhatsApp replacement:** no voice/video calls, no Status/stories; live messages are stored in plaintext on your private server device. Traffic is plain HTTP inside your Tailscale/LAN mesh. **Do not expose port 8000 to the public internet.** Backups are client-encrypted so cloud storage never sees chat plaintext.
+**Not a full WhatsApp replacement:** no Status/stories; live messages are stored in plaintext on your private server device (DM bodies can be E2E). Traffic is plain HTTP inside your Tailscale/LAN mesh. **Do not expose port 8000 to the public internet.** Backups are client-encrypted so cloud storage never sees chat plaintext. Calls prefer a direct Tailscale path (no TURN server in this build).
 
 ---
 
@@ -245,6 +300,15 @@ netsh advfirewall firewall add rule name="LocalChat" dir=in action=allow protoco
 
 For Tailscale-only clients, the Tailscale interface is enough; still keep `HOST=0.0.0.0` (default).
 
+The startup banner is deliberately plain ASCII. A Windows console on a legacy
+code page cannot encode a character such as an em dash, and the resulting
+`UnicodeEncodeError` killed the server before uvicorn ever started — printing a
+nicer dash is not worth a server that will not boot on someone else's PC.
+
+`run.py` also checks the port itself before handing over to uvicorn, which
+swallows the bind error and logs its own one-liner. That is why "Port 8000 is
+already in use", with the commands to find the offender, now actually appears.
+
 ### Run tests and lint
 
 ```powershell
@@ -252,7 +316,7 @@ cd server
 .\.venv\Scripts\activate
 pip install -r requirements.txt -r requirements-dev.txt
 pytest -v
-pylint app run.py tests
+pylint app run.py reset_password.py tests
 ```
 
 Install `requirements.txt` **inside the venv** — `firebase-admin` lives there, and the IDE reports
@@ -282,7 +346,7 @@ flutter build apk --release
 APK: `flutter_app\build\app\outputs\flutter-apk\app-release.apk`  
 Or the smaller phone build: `app-arm64-v8a-release.apk`.
 
-Release builds use the debug signing key (fine for private / GitHub Releases sideloading, not Play Store).
+Release builds are signed with the keystore named in `android/key.properties` (never committed). Without that file — a fresh clone, someone else's machine — the build still succeeds using the debug key. Keep the keystore: an APK signed with a different key will not install over an existing one.
 
 ### First launch on each client phone
 
@@ -300,11 +364,54 @@ The gate screen names the actual problem instead of always blaming Tailscale. `C
 |--------------------|---------------|
 | Health check answers | Nothing — you go straight to your chats |
 | No non-loopback address at all | **This phone is offline** — turn on Wi-Fi or data |
-| No `100.64.0.0/10` address, server is a Tailscale IP | **Tailscale is not connected** — open Tailscale, connect |
+| No `100.64.0.0/10` address, server is a Tailscale IP | **Tailscale is not connected** — Connect Tailscale / Open Tailscale |
 | Tailscale address present, health check fails | **Chat server is not running** — start `python run.py` on the server phone |
 | Saved URL isn't a valid address | **Server address looks wrong** — with a shortcut to change it |
 
 Each state lists numbered steps and shows the address it tried, so "connect to Tailscale" never appears while Tailscale is already up.
+
+**Soft auto-connect (Android):** when the server URL is a Tailscale `100.x` address, Local Chat sends Tailscale's `CONNECT_VPN` broadcast on cold start, on resume, and when a notification opens the app (same path). That is the same intent Tasker uses — it asks Tailscale to connect; it cannot grant VPN permission or sign the user in. The gate also has **Connect Tailscale** (broadcast + short poll) and **Open Tailscale app** for the cases where the OEM killed Tailscale's process. Keep Tailscale's battery usage **Unrestricted** so the receiver stays alive.
+
+The health check is the only proof of "working", and a fresh VPN interface can exist a second or two before it actually routes. So while the link is coming up the gate shows a neutral **Connecting privately…** screen rather than guessing — the old build briefly claimed "Chat server is not running" and then corrected itself on the next poll. Checks also run every 3s while the link is down (12s once it is up), so the app unlocks as soon as the tunnel is usable, and **Open Tailscale app** appears if it takes longer than 5s.
+
+**Auto-disconnect on close.** Server settings has two switches (both on by default):
+
+| Switch | What it does |
+|--------|--------------|
+| Connect when the app opens | The soft auto-connect described above |
+| Disconnect when the app is closed | Sends `DISCONNECT_VPN` when Local Chat is closed for good |
+
+The tunnel is only switched off when **Local Chat is what switched it on** — a tunnel you enabled yourself (or one another app needs) is left running. Server settings spells out which case you are in, and has **Disconnect Tailscale now** for a manual drop.
+
+Ownership is an explicit native-backed state machine. Android records
+`pendingConnect` atomically *before* broadcasting `CONNECT_VPN`; a later health
+check promotes it to `owned` only when routing was down at the request and then
+appears. Native preferences remain authoritative after the Dart isolate or
+process dies, and an owned disconnect that was interrupted is retried on the
+next launch instead of being reclassified as a pre-existing tunnel.
+
+| What the check sees | Who owns the tunnel |
+|---------------------|---------------------|
+| Tunnel down | Nobody — a stale claim is released here |
+| Came up after our pending `CONNECT_VPN`, having been unrouted when we asked | Ours |
+| Up, and native state already records it as owned | Still ours, including after process loss |
+| Up, and we never asked — or it was already up when we asked | Yours; it survives the app closing |
+
+The connect and ownership predicates now use the same routing evidence. This
+fixes the regression where Local Chat sent the connect request after a
+`serverDown` result but never opened an ownership claim, so closing the app left
+behind the tunnel it had actually raised. A tunnel already routing before the
+request is never adopted.
+
+**Disconnect Tailscale now** also pauses auto-connect for the rest of the session. Without that pause the health poll — which runs every 3s while the server is unreachable — asked Tailscale to reconnect a second later, so the button looked like it did nothing and the app silently re-claimed the tunnel. Tapping **Connect Tailscale**, or reopening the app, resumes automatic connecting.
+
+Because swiping the app away kills the Dart isolate mid-broadcast, the disconnect is sent by native code: `MainActivity.onDestroy` (guarded by `isFinishing`, so rotation is not an exit) plus an `ExitWatcherService` declared `stopWithTask="false"`, which is the one reliable "swiped from Recents" signal. The service is re-started on every resume, since Android stops background services a while after an app leaves the foreground and a stopped service would never hear the callback. Every decision is logged under the `TailscaleExit` tag:
+
+```powershell
+adb logcat -s TailscaleExit
+```
+
+FCM notifications are unaffected: pushes arrive over ordinary internet, not the tunnel, and tapping one reconnects Tailscale on the way in.
 
 ### Notifications (privacy mode 1a)
 
@@ -321,6 +428,8 @@ A server-rendered FCM `notification` block cannot read private storage on the re
 
 ### Attachments
 
+- **Attach → Gallery** opens an in-app Recent grid (multi-select, camera shortcut).
+  Documents still use the system file picker.
 - Photos show an inline preview in the bubble; tap to open full screen (pinch to zoom), with **save** and **share** in the app bar.
 - Files show a coloured type badge, name and size; tap downloads once and opens with the phone's own app for that type.
 - Voice notes play inline with a scrubbable progress bar; only one plays at a time.
@@ -328,13 +437,46 @@ A server-rendered FCM `notification` block cannot read private storage on the re
 - Downloads are cached under the app's support directory, so a photo is fetched from the server only once.
 - Chat ⋮ → **Media, links, and docs** opens a WhatsApp-style gallery (Media / Docs / Links tabs, grouped by month). Items load from the server index — whether or not you saved them locally. **Show in chat** (long-press, or the chat icon) jumps back to the exact bubble.
 
+### Calls
+
+- Voice and video calls run over WebRTC on the Tailscale mesh (no TURN in this build).
+- Background / locked phone: a **Calls** notification channel heads-up alert — tap to open the in-app call UI (no full-screen lock-screen intent).
+- Caller shows **Trying to reach…** until delivery, then **Ringing…** and a
+  ringback tone only after the callee acknowledges `call.ringing`. Incoming
+  calls use the system ringtone and vibration. No socket and no registered push
+  destination produces a bounded unavailable/Tailscale message, not a silent
+  indefinite screen.
+- Missed or interrupted invites are recovered from a short-lived pending-call store when the app returns online.
+- Call notifications resolve the recipient's private saved alias, just like
+  message notifications.
+- Voice defaults to earpiece, video to speaker; the in-call route control offers
+  earpiece, speaker, and Bluetooth when Android reports them.
+- The server finalizes each call exactly once. Transcript rows include outcome,
+  connected duration, and who ended an answered call; remote hangup closes the
+  call screen instead of leaving a black spinner.
+
+### Starred messages
+
+- Long-press any text, photo, video, voice note, or file → **Star** /
+  **Unstar**. Stars are private to you and stored on the server.
+- Inbox ⋮ → **Starred messages** lists newest-starred-first; tap to open the chat and jump to the bubble.
+- The starred screen is live: starring or unstarring in a chat updates it
+  immediately without leaving and reopening the screen.
+- Soft-deleted messages keep a tombstone in the starred list; hide-for-me removes the star.
+- Encrypted backups (format **v3**) include `starred_message_ids` and re-apply them on restore.
+
 ### Appearance and chat position
 
 - Inbox ⋮ → **Appearance** → System / Light / Dark (saved on the phone until uninstall)
 - Chat surfaces, cards, fields, sheets, dialogs, bubbles, and the composer use theme-aware colours
-- Opening a conversation waits for its messages, then pins the transcript to the newest message
+- A conversation opens *anchored* on its newest message: the transcript is built bottom-up (a reversed list), so offset zero **is** the newest bubble and there is no catch-up scroll to watch. A late image decode, a restored draft or a loaded older page all grow the list away from that anchor instead of moving it.
 - Swipe a bubble right (or long-press → Reply) to quote and reply, WhatsApp-style; tap a quote to jump back
-- Opening the keyboard shifts the transcript up with it, so the newest bubbles never hide behind it
+- Starting a reply raises the keyboard straight away — swiping is already a decision to type, so there is no second tap on the field. Focus is asked for after the frame that inserts the draft bar (the reply fires mid-swipe, while the composer is still moving down a slot), and the keyboard is then requested from the platform outright: Android will happily hold focus in a field with the IME hidden, and `requestFocus` is a no-op when the field is focused already — after you dismissed the keyboard with the back button, say
+- Opening the keyboard shifts the transcript up with it, so the newest bubbles never hide behind it — the bottom anchor does this on its own, with no offset arithmetic to get wrong. Replying to an older message keeps that message in view instead of jumping to the bottom
+- A message arriving while you are reading history holds your place: the new bubble is added at the anchor, and the offset moves by exactly how much the list grew. The geometry lives in `flutter_app/lib/chat_scroll.dart` and is covered by `test/chat_scroll_test.dart`
+- Android Back from any chat always resets to the Chats list, including chats
+  opened from search, stars, notifications, or shared media; notification taps
+  cannot stack duplicate chat routes.
 
 ### Emoji-only messages
 
@@ -348,6 +490,31 @@ Skin tones, joined sequences (`👨‍👩‍👧‍👦`), flags, and keycaps c
 emoji each — the same as what the eye sees. The detection lives in
 `flutter_app/lib/emoji.dart` and is covered by `test/emoji_test.dart`.
 
+A **single** emoji now uses a bounded Google Messages-inspired procedural
+effect: squash/stretch launch, overshoot and settle, a glow pulse, and
+short-lived radial particles tuned for hearts, kisses, and celebrations. Two
+or more emoji read as a sentence rather than a reaction, so they stay still.
+The entrance plays once per message — keyed by client id, so a sent
+message does not bounce again when the server id lands, and scrolling back over
+a chat does not set old emoji off — and a tap replays it. Phones set to reduce
+motion get the emoji without the bounce. See
+`flutter_app/lib/widgets/animated_emoji.dart` and
+`test/emoji_rendering_test.dart`.
+
+### Emoji that the phone's own font does not know
+
+A phone only knows the emoji its Android version shipped with, so anything newer
+arrived as an empty box — while the keyboard still offered it, because Gboard
+draws its own glyphs and never asks the app's fonts. The app therefore carries
+**Noto Color Emoji** (`flutter_app/assets/fonts/NotoColorEmoji.ttf`, a CBDT
+colour-bitmap font Impeller renders on Android) and lists it as the fallback
+behind every text style in the theme — so the composer, the bubbles, the chat
+list previews and every dialog resolve the same glyph on every phone. It costs
+about 10 MB in the APK, which is the price of an emoji looking like an emoji.
+
+Notification text is drawn by Android, not by the app, so a very new emoji can
+still show as a box there.
+
 ### Renaming people
 
 Usernames and self-chosen display names are often useless ("Faye" tells you nothing), so any person can be renamed on your own phone:
@@ -359,7 +526,7 @@ Usernames and self-chosen display names are often useless ("Faye" tells you noth
 
 The name you pick replaces theirs everywhere on that phone — chat list, chat header, group bubbles and notification titles — while their real name stays visible as `@username · really Faye` so you can still tell who they are. Clearing the field, or **Use real name**, restores what they chose.
 
-Names live in `SharedPreferences` (`contact_aliases_v1`) next to your local contacts, are never sent to the server as plaintext, and travel inside the encrypted backup (`contact_aliases`, backup format v2), so restoring on a new phone brings them back. Restores of older v1 backups still work — they simply carry no names.
+Names live in `SharedPreferences` (`contact_aliases_v1`) next to your local contacts, are never sent to the server as plaintext, and travel inside the encrypted backup (`contact_aliases`, backup format v2+), so restoring on a new phone brings them back. Restores of older v1 backups still work — they simply carry no names.
 
 ### Times and "last seen"
 
@@ -409,7 +576,7 @@ Chat history is unchanged.
 1. Inbox ⋮ → **Backup & restore**
 2. Choose a strong backup password (used only on-device for AES-GCM)
 3. Ciphertext is stored on your private server (`PUT /api/backup`) and optionally mirrored to Firestore (`encrypted_backups/{username}`)
-4. Restore decrypts on-device, restores local contacts **and the names you gave people**, reopens DMs, and hydrates cached history
+4. Restore decrypts on-device, restores local contacts **and the names you gave people**, re-stars messages from format v3 backups, reopens DMs, and hydrates cached history
 
 Firestore never receives plaintext. You can also share the encrypted `.json` file from the backup screen.
 
@@ -424,6 +591,44 @@ cd flutter_app
 flutter analyze
 flutter test
 ```
+
+### Manual device checklist (release)
+
+On both client phones:
+
+1. **Tailscale ownership** — test app-owned disconnected→connected→close and
+   pre-existing-connected→open→close; only the first tunnel must disconnect.
+   Repeat after swiping Local Chat from Recents and after a process restart.
+2. **Calls** — place audio + video foreground/background/locked; verify local
+   alias in the alert, ringtone/vibration, ringback only after Ringing, no black
+   hangup screen, one transcript row, correct ended-by text, and
+   earpiece/speaker/Bluetooth routing. Test reject/cancel/no-answer/offline.
+3. **Gallery/captions** — review, reorder, remove, and caption single/multiple
+   photos, videos, and documents; only the first batch item gets the caption.
+4. **Bottom/navigation** — a photo-heavy chat opens on the newest bubble;
+   keyboard, older pages, and late image loads do not move it; every chat Back
+   path lands on Chats.
+5. **Stars** — star/unstar text and every attachment type; the open starred
+   screen updates immediately; backup restore re-applies stars (v3).
+6. **Inbox/profile** — latest outgoing clock/single/double/read ticks match the
+   chat; self and contact profiles edit/show the right identity; long last-seen
+   text scrolls horizontally.
+7. **Presence** — typing replaces inbox preview and chat subtitle; online /
+   last-seen / mood priority; typing clears after ~4s or socket drop.
+8. **Emoji** — send a brand-new emoji (for example 🫩): it renders in composer
+   and bubble; one emoji plays glow/particles once and on tap, two remain still.
+9. **Nudge history** — send and receive each variant; Chat ⋮ → **Nudge history**
+   shows `You …` vs `<alias> … you` (groups name the sender); foreground and
+   background alerts use the exact verb (wave/poke/hug/kiss).
+10. **Realtime sync** — with a chat open, send from the other phone while the
+    WebSocket drops (airplane mode briefly) or after a stale load; the bubble
+    appears without leaving/reopening. Repeat after resume from background and
+    after a foreground FCM while the chat is open.
+11. **Doodles** — start a live session: peer sees strokes in real time; undo,
+    clear, and cancel end the overlay; **Send** posts a `Drawing` bubble that
+    previews as Drawing in inbox/stars/quotes; star/reply/delete behave like
+    photos. Doodle mode disables double-tap nudge; unavailable copy shows when
+    the socket is down.
 
 ---
 
@@ -440,15 +645,18 @@ flutter test
 | GET | `/api/conversations` | Inbox |
 | POST | `/api/conversations/dm` | `{user_id}` |
 | POST | `/api/conversations/groups` | `{title, member_ids}` |
-| GET | `/api/conversations/{id}/messages` | History |
+| GET | `/api/conversations/{id}/messages` | History; optional `after_id` for incremental sync |
+| GET | `/api/conversations/{id}/nudges` | Paginated nudge history (not in transcript) |
 | GET | `/api/conversations/{id}/shared` | Media / Docs / Links index |
 | POST | `/api/conversations/{id}/messages` | Send text |
-| POST | `/api/conversations/{id}/media` | Multipart upload |
+| POST | `/api/conversations/{id}/media` | Multipart upload (`type=doodle` for PNG drawings) |
 | GET | `/api/media/{message_id}` | Download media |
 | POST | `/api/conversations/{id}/read` | Mark read |
 | POST | `/api/devices` | Register FCM token |
 | PUT/GET | `/api/backup` | Ciphertext only |
-| WS | `/ws?token=<jwt>` | Realtime events |
+| GET | `/api/messages/starred` | Private starred messages (newest star first) |
+| PUT/DELETE | `/api/messages/{id}/star` | Star / unstar |
+| WS | `/ws?token=<jwt>` | Realtime events (messages, nudges, live doodles, call signaling + `call.ringing`) |
 
 ### Error responses
 
@@ -464,9 +672,19 @@ and unexpected 500s) into that one shape, so the app can display `detail` as-is.
 Unexpected errors are logged in full on the server and reduced to a calm sentence
 for the client.
 
+A rejected token on the WebSocket is a special case: the app signs the user out
+on close code **4401** and would otherwise retry a dead token forever behind a
+"Reconnecting…" banner. Refusing the connection before the handshake makes the
+server answer plain HTTP 403 instead, which carries no close code at all, so
+`/ws` accepts the socket and *then* closes it with 4401. Both halves of that
+contract are tested (`tests/test_integration_ws.py`,
+`flutter_app/test/realtime_auth_test.dart`).
+
 ---
 
 ## GitHub Releases (APK + Windows server)
+
+**Current app version:** `1.7.1+24` (nudge history, merge-based realtime sync, live + persistent doodles).
 
 Prebuilt downloads are meant for people who do not want to compile anything.
 
@@ -577,8 +795,21 @@ Chat/
     reset_password.py            Admin password reset (on the server host)
   flutter_app/                   Flutter Android client
     android/app/google-services.json.example
+    assets/fonts/NotoColorEmoji.ttf         Bundled emoji font, behind every style
     lib/emoji.dart               Emoji-only detection for big-emoji bubbles
+    lib/chat_scroll.dart         Reversed-transcript geometry (bottom anchor)
+    lib/widgets/animated_emoji.dart         Single-emoji entrance, once per message
+    lib/nudge_log.dart               Nudge history formatting and variants
+    lib/doodle_stroke.dart           Pure doodle stroke/session models
+    lib/message_merge.dart           Merge-based transcript reconciliation
+    lib/services/doodle_controller.dart   Live doodle relay batching
+    lib/services/doodle_export.dart  Bounded PNG flatten for sent drawings
+    lib/widgets/doodle_overlay.dart  Ephemeral live doodle UI
+    lib/widgets/doodle_attachment.dart    Persistent drawing bubble
+    lib/screens/nudge_history_screen.dart Per-chat nudge log
     lib/screens/shared_media_screen.dart   Media / Docs / Links gallery
+    lib/services/tailscale_assist.dart     CONNECT_VPN / DISCONNECT_VPN requests
+    android/.../TailscaleExit.kt           Disconnects the tunnel on app exit
   tools/
     generate_icons.py
     build_release.ps1            APKs + Windows server zip + server-update.zip
@@ -589,7 +820,7 @@ Chat/
 
 ## Out of scope (later)
 
-Voice/video calls, Status/stories, full E2E for live server storage, Play Store signing.
+Status/stories, full E2E for live server storage, Play Store signing, lock-screen full-screen call UI.
 
 ### "Tailscale IP not detected on this device"
 

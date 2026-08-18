@@ -7,8 +7,10 @@ import 'app_state.dart';
 import 'navigation.dart';
 import 'screens/auth_screen.dart';
 import 'screens/inbox_screen.dart';
+import 'screens/privacy_onboarding_screen.dart';
 import 'screens/tailscale_gate_screen.dart';
 import 'services/notification_service.dart';
+import 'services/privacy_onboarding_store.dart';
 import 'services/theme_store.dart';
 import 'theme.dart';
 
@@ -51,8 +53,33 @@ class LocalChatApp extends StatelessWidget {
   }
 }
 
-class _Root extends StatelessWidget {
+class _Root extends StatefulWidget {
   const _Root();
+
+  @override
+  State<_Root> createState() => _RootState();
+}
+
+class _RootState extends State<_Root> {
+  bool? _onboardingDone;
+  int? _checkedForUserId;
+
+  Future<void> _loadOnboardingFlag(int? userId) async {
+    if (userId == null) {
+      setState(() {
+        _onboardingDone = true;
+        _checkedForUserId = null;
+      });
+      return;
+    }
+    if (_checkedForUserId == userId && _onboardingDone != null) return;
+    final done = await PrivacyOnboardingStore.isDone();
+    if (!mounted) return;
+    setState(() {
+      _onboardingDone = done;
+      _checkedForUserId = userId;
+    });
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -73,7 +100,30 @@ class _Root extends StatelessWidget {
     if (!state.isLoggedIn) {
       child = const AuthScreen();
     } else {
-      child = const InboxScreen();
+      // Kick the flag load once per signed-in user.
+      final uid = state.me?.id;
+      if (_checkedForUserId != uid || _onboardingDone == null) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          _loadOnboardingFlag(uid);
+        });
+      }
+      if (_onboardingDone == false) {
+        child = PrivacyOnboardingScreen(
+          onFinished: () => setState(() => _onboardingDone = true),
+        );
+      } else if (_onboardingDone == null) {
+        child = Scaffold(
+          body: Container(
+            alignment: Alignment.center,
+            decoration: BoxDecoration(
+              gradient: appBackgroundGradient(Theme.of(context).colorScheme),
+            ),
+            child: const CircularProgressIndicator(),
+          ),
+        );
+      } else {
+        child = const InboxScreen();
+      }
     }
 
     return TailscaleGateScreen(child: child);

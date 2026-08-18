@@ -29,10 +29,11 @@ class BackupService {
     required Map<int, List<ChatMessage>> messagesByConv,
     required List<LocalContact> localContacts,
     required Map<String, String> contactAliases,
+    Set<int> starredMessageIds = const {},
   }) async {
     return {
-      // 2 added contact_aliases; restores of version 1 backups still work.
-      'version': 2,
+      // 2 added contact_aliases; 3 added starred_message_ids.
+      'version': 3,
       'exported_at': DateTime.now().toUtc().toIso8601String(),
       'user': {
         'id': me.id,
@@ -65,12 +66,15 @@ class BackupService {
               'type': m.type,
               'body': m.body,
               'media_name': m.mediaName,
+              'media_mime': m.mediaMime,
+              'media_size': m.mediaSize,
               'created_at': m.createdAt.toUtc().toIso8601String(),
             },
       ],
       'local_contacts': localContacts.map((c) => c.toJson()).toList(),
       // The names you gave people, so a restored phone shows them too.
       'contact_aliases': contactAliases,
+      'starred_message_ids': starredMessageIds.toList()..sort(),
     };
   }
 

@@ -63,6 +63,9 @@ class UserOut(BaseModel):
     display_name: str
     last_seen_at: UtcDatetime | None = None
     is_online: bool = False
+    has_avatar: bool = False
+    avatar_version: int | None = None
+    mood: str | None = None
 
     model_config = {"from_attributes": True}
 
@@ -91,6 +94,8 @@ class MemberOut(BaseModel):
     display_name: str
     role: str
     is_online: bool = False
+    has_avatar: bool = False
+    avatar_version: int | None = None
 
 
 class MessagePreview(BaseModel):
@@ -101,6 +106,9 @@ class MessagePreview(BaseModel):
     created_at: UtcDatetime
     # Lets the chat list show "invoice.pdf" instead of a generic "File".
     media_name: str | None = None
+    # Viewer-relative ticks for the sender's latest message: 0 sent, 1 delivered,
+    # 2 read. Omitted when the latest message is from someone else.
+    receipt_level: int | None = None
 
 
 class ConversationOut(BaseModel):
@@ -112,6 +120,12 @@ class ConversationOut(BaseModel):
     unread_count: int = 0
     updated_at: UtcDatetime
     members: list[MemberOut] = Field(default_factory=list)
+    wallpaper_version: int | None = None
+    wallpaper_dim: float | None = None
+    has_wallpaper: bool = False
+    disappear_after_seconds: int | None = None
+    anniversary_on: str | None = None
+    streak_days: int = 0
 
 
 class SendMessageRequest(BaseModel):
@@ -148,6 +162,13 @@ class ReceiptOut(BaseModel):
     read_at: UtcDatetime | None = None
 
 
+class ReactionAggOut(BaseModel):
+    emoji: str
+    count: int
+    reacted_by_me: bool = False
+    user_ids: list[int] = Field(default_factory=list)
+
+
 class MessageOut(BaseModel):
     id: int
     conversation_id: int
@@ -157,14 +178,86 @@ class MessageOut(BaseModel):
     media_name: str | None = None
     media_size: int | None = None
     media_mime: str | None = None
+    media_duration_ms: int | None = None
     client_id: str | None = None
     created_at: UtcDatetime
     edited_at: UtcDatetime | None = None
     deleted_at: UtcDatetime | None = None
+    expires_at: UtcDatetime | None = None
     reply_to: QuotedMessage | None = None
     receipts: list[ReceiptOut] = Field(default_factory=list)
+    reactions: list[ReactionAggOut] = Field(default_factory=list)
+    # Present on starred-list responses so the client can page the list.
+    star_id: int | None = None
 
     model_config = {"from_attributes": True}
+
+
+class NudgeOut(BaseModel):
+    nudge_id: str
+    conversation_id: int
+    sender_id: int
+    sender_name: str
+    sender_username: str
+    variant: str
+    at: UtcDatetime
+
+
+class ReactionRequest(BaseModel):
+    emoji: str = Field(min_length=1, max_length=16)
+
+
+_DISAPPEARING_ALLOWED = frozenset({86400, 604800, 7776000})
+
+
+class DisappearingRequest(BaseModel):
+    disappear_after_seconds: int | None = None
+
+    @field_validator("disappear_after_seconds")
+    @classmethod
+    def validate_disappearing(cls, v: int | None) -> int | None:
+        if v is not None and v not in _DISAPPEARING_ALLOWED:
+            raise ValueError("Invalid disappearing timer.")
+        return v
+
+
+class WallpaperDimRequest(BaseModel):
+    dim: float = Field(ge=0.0, le=0.8)
+
+
+class AnniversaryRequest(BaseModel):
+    anniversary_on: str | None = None
+
+    @field_validator("anniversary_on")
+    @classmethod
+    def validate_anniversary(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        if not re.match(r"^\d{4}-\d{2}-\d{2}$", v):
+            raise ValueError("anniversary_on must be YYYY-MM-DD.")
+        return v
+
+
+class MoodRequest(BaseModel):
+    mood: str | None = Field(default=None, max_length=40)
+
+
+class DisplayNameRequest(BaseModel):
+    display_name: str = Field(min_length=1, max_length=80)
+
+    @field_validator("display_name")
+    @classmethod
+    def validate_display_name(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("Display name cannot be blank.")
+        return v
+
+
+class CallLogRequest(BaseModel):
+    media: str = Field(default="audio", max_length=16)
+    outcome: str = Field(min_length=1, max_length=32)
+    duration_secs: int | None = Field(default=None, ge=0)
 
 
 class DeliveredRequest(BaseModel):
@@ -184,7 +277,30 @@ class SharedItemOut(BaseModel):
     media_name: str | None = None
     media_size: int | None = None
     media_mime: str | None = None
+    media_duration_ms: int | None = None
     body: str | None = None
     url: str | None = None
     created_at: UtcDatetime
     sender_id: int
+
+
+class OwnedMediaOut(BaseModel):
+    """One attachment the signed-in user can reclaim from server storage."""
+
+    message_id: int
+    conversation_id: int
+    conversation_title: str
+    type: str
+    media_name: str | None = None
+    media_size: int
+    media_mime: str | None = None
+    created_at: UtcDatetime
+
+
+class DeleteOwnedMediaRequest(BaseModel):
+    message_ids: list[int] = Field(min_length=1, max_length=500)
+
+
+class DeleteOwnedMediaOut(BaseModel):
+    deleted: int
+    reclaimed_bytes: int

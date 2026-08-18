@@ -82,7 +82,9 @@ int emojiOnlyCount(String? text) {
     }
 
     final isBase = _isEmojiBase(cp) || (hasKeycap && _isKeycapBase(cp));
-    if (!isBase) return 0; // A single ordinary letter makes this a text message.
+    if (!isBase) {
+      return 0; // A single ordinary letter makes this a text message.
+    }
 
     if (_isRegionalIndicator(cp)) {
       if (openFlag) {

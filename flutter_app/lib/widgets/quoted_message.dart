@@ -1,22 +1,11 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../models.dart';
+import '../message_preview.dart';
 
 /// One-line summary of a quoted message, e.g. "Photo", a filename, or its text.
-String quotedSummary(QuotedMessage quote) {
-  final text = quote.body?.trim() ?? '';
-  switch (quote.type) {
-    case 'image':
-      return text.isEmpty ? 'Photo' : 'Photo · $text';
-    case 'voice':
-      return 'Voice message';
-    case 'file':
-      final name = quote.mediaName?.trim() ?? '';
-      return name.isEmpty ? 'File' : name;
-    default:
-      return text.isEmpty ? 'Message' : text;
-  }
-}
+String quotedSummary(QuotedMessage quote) => quotedMessagePreview(quote);
 
 IconData? quotedIcon(QuotedMessage quote) => switch (quote.type) {
   'image' => Icons.photo_camera_rounded,
@@ -155,6 +144,7 @@ class _SwipeToReplyState extends State<SwipeToReply>
     // Fire once while the finger is still down, like WhatsApp's haptic tick.
     if (!_fired && next >= _triggerAt) {
       _fired = true;
+      HapticFeedback.lightImpact();
       widget.onReply();
     }
     setState(() => _offset = next);
@@ -164,9 +154,10 @@ class _SwipeToReplyState extends State<SwipeToReply>
     _fired = false;
     if (_offset == 0) return;
     final from = _offset;
-    final animation = Tween<double>(begin: from, end: 0).animate(
-      CurvedAnimation(parent: _spring, curve: Curves.easeOutCubic),
-    );
+    final animation = Tween<double>(
+      begin: from,
+      end: 0,
+    ).animate(CurvedAnimation(parent: _spring, curve: Curves.easeOutCubic));
     void tick() => setState(() => _offset = animation.value);
     animation.addListener(tick);
     _spring.forward(from: 0).whenComplete(() {
@@ -208,10 +199,7 @@ class _SwipeToReplyState extends State<SwipeToReply>
                 ),
               ),
             ),
-          Transform.translate(
-            offset: Offset(_offset, 0),
-            child: widget.child,
-          ),
+          Transform.translate(offset: Offset(_offset, 0), child: widget.child),
         ],
       ),
     );

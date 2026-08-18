@@ -6,6 +6,7 @@ import shutil
 import socket
 import struct
 import subprocess
+import sys
 
 import uvicorn
 from app.config import HOST, PORT
@@ -173,6 +174,21 @@ def local_ip() -> str:
     return preferred_client_ip()
 
 
+def _harden_console() -> None:
+    """Never let an unprintable character stop the server from starting.
+
+    A Windows console on a legacy code page (cp1252) cannot encode characters
+    such as an em dash, and the resulting UnicodeEncodeError killed the process
+    before uvicorn ever ran. The banner is plain ASCII for that reason; this is
+    the belt to that braces.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, OSError, ValueError):
+            pass
+
+
 def _print_banner() -> None:
     addresses = discover_ipv4_addresses()
     primary = preferred_client_ip(addresses)
@@ -181,43 +197,64 @@ def _print_banner() -> None:
 
     print("=" * 60)
     print(" Local Chat is starting")
-    print(f" Listening on {HOST}:{PORT} (all interfaces — LAN + Tailscale)")
+    print(f" Listening on {HOST}:{PORT} (all interfaces - LAN + Tailscale)")
     print(f" API docs on this device: http://127.0.0.1:{PORT}/docs")
     print()
     if ts:
-        print(" Tailscale (use this when phones are not on the same Wi‑Fi):")
+        print(" Tailscale (use this when phones are not on the same Wi-Fi):")
         for addr in ts:
             print(f"   http://{addr}:{PORT}")
             print(f"   ws://{addr}:{PORT}/ws?token=<jwt>")
     else:
         print(" Tailscale IP not detected on this device.")
-        print("   The server still accepts Tailscale traffic — this is only about")
+        print("   The server still accepts Tailscale traffic - this is only about")
         print("   printing the address, and Android hides it from Termux.")
         print("   Open the Tailscale app, confirm it says Connected, and use the")
         print(f"   100.x.x.x address it shows: http://100.x.x.x:{PORT}")
     if lan:
-        print(" LAN / other adapters (same Wi‑Fi only):")
+        print(" LAN / other adapters (same Wi-Fi only):")
         for addr in lan:
             print(f"   http://{addr}:{PORT}")
     print()
-    print(" Flutter app → Set server URL to:")
+    print(" Flutter app -> Set server URL to:")
     print(f"   http://{primary}:{PORT}")
     print(" Close this window (or press CTRL+C) to stop.")
     print("=" * 60)
 
 
+def port_is_free(host: str, port: int) -> bool:
+    """True when the server could bind host:port right now."""
+    bind_host = "" if host == "0.0.0.0" else host
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        try:
+            probe.bind((bind_host, port))
+        except OSError:
+            return False
+    return True
+
+
+def _print_port_in_use() -> None:
+    print()
+    print(f"ERROR: Port {PORT} is already in use.")
+    print("Another Local Chat (or other app) is still running.")
+    print("Fix: close that process, or find it with:")
+    print(f"  netstat -ano | findstr :{PORT}")
+    print(f"  (Termux/Linux: lsof -i :{PORT}  or  ss -ltnp | grep {PORT})")
+    print("Then stop that process and try again.")
+
+
 if __name__ == "__main__":
+    _harden_console()
+    # Checked up front: uvicorn swallows the bind error and logs a one-line
+    # traceback of its own, so this advice never reached the screen.
+    if not port_is_free(HOST, PORT):
+        _print_port_in_use()
+        raise SystemExit(1)
     _print_banner()
     try:
         uvicorn.run("app.main:app", host=HOST, port=PORT, reload=False)
     except OSError as exc:
         if getattr(exc, "winerror", None) == 10048 or getattr(exc, "errno", None) in (98, 10048):
-            print()
-            print(f"ERROR: Port {PORT} is already in use.")
-            print("Another Local Chat (or other app) is still running.")
-            print("Fix: close that process, or find it with:")
-            print(f"  netstat -ano | findstr :{PORT}")
-            print("  (Termux/Linux: lsof -i :{PORT}  or  ss -ltnp | grep {PORT})")
-            print("Then stop that process and try again.")
+            _print_port_in_use()
             raise SystemExit(1) from exc
         raise

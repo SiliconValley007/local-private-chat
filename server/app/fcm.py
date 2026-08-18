@@ -127,3 +127,49 @@ def send_message_push(
             # One failed device must not block the remaining recipients.
             logger.warning("FCM send failed for a token", exc_info=True)
     return PushResult(sent, invalid)
+
+
+def send_call_incoming_push(
+    tokens: list[str],
+    *,
+    conversation_id: int,
+    call_id: str,
+    caller_id: int,
+    caller_name: str,
+    caller_username: str,
+    media: str = "audio",
+) -> PushResult:
+    """Wake offline members for an incoming call (metadata only)."""
+    return send_message_push(
+        tokens,
+        data={
+            "type": "call.incoming",
+            "conversation_id": str(conversation_id),
+            "call_id": call_id,
+            "caller_id": str(caller_id),
+            "caller_name": caller_name,
+            "caller_username": caller_username,
+            "media": media,
+        },
+    )
+
+
+def send_reaction_push(
+    tokens: list[str],
+    *,
+    conversation_id: int,
+    message_id: int,
+    actor_id: int,
+    actor_name: str,
+) -> PushResult:
+    """Notify offline members that someone reacted (metadata only)."""
+    return send_message_push(
+        tokens,
+        data={
+            "type": "reaction.updated",
+            "conversation_id": str(conversation_id),
+            "message_id": str(message_id),
+            "actor_id": str(actor_id),
+            "actor_name": actor_name,
+        },
+    )

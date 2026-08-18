@@ -30,6 +30,10 @@ String initialsFor(String name) {
 }
 
 /// Circular avatar with initials, plus an optional presence dot.
+///
+/// When [imageUrl] is set the photo is shown instead of initials; if it fails
+/// to load or is still loading, the gradient initials show through, so the
+/// avatar never collapses to a blank circle.
 class Avatar extends StatelessWidget {
   const Avatar({
     super.key,
@@ -38,6 +42,8 @@ class Avatar extends StatelessWidget {
     this.radius = 24,
     this.online,
     this.badge,
+    this.imageUrl,
+    this.imageHeaders,
   });
 
   final String name;
@@ -52,10 +58,45 @@ class Avatar extends StatelessWidget {
   /// Small glyph drawn instead of initials, used for group avatars.
   final IconData? badge;
 
+  /// Profile picture URL; null keeps the gradient-initials look.
+  final String? imageUrl;
+
+  /// Auth headers for the (bearer-protected) avatar request.
+  final Map<String, String>? imageHeaders;
+
   @override
   Widget build(BuildContext context) {
     final colors = avatarPalette(seed);
     final dotSize = radius * 0.5;
+
+    final fallback = badge != null
+        ? Icon(badge, color: Colors.white, size: radius * 0.9)
+        : Text(
+            initialsFor(name),
+            style: TextStyle(
+              color: Colors.white,
+              fontWeight: FontWeight.w800,
+              fontSize: radius * 0.72,
+              letterSpacing: 0.2,
+            ),
+          );
+
+    Widget content = fallback;
+    if (imageUrl != null) {
+      content = ClipOval(
+        child: Image.network(
+          imageUrl!,
+          headers: imageHeaders,
+          width: radius * 2,
+          height: radius * 2,
+          fit: BoxFit.cover,
+          gaplessPlayback: true,
+          errorBuilder: (_, _, _) => Center(child: fallback),
+          loadingBuilder: (context, child, progress) =>
+              progress == null ? child : Center(child: fallback),
+        ),
+      );
+    }
 
     return SizedBox(
       width: radius * 2,
@@ -80,17 +121,7 @@ class Avatar extends StatelessWidget {
                 offset: const Offset(0, 4),
               ),
             ),
-            child: badge != null
-                ? Icon(badge, color: Colors.white, size: radius * 0.9)
-                : Text(
-                    initialsFor(name),
-                    style: TextStyle(
-                      color: Colors.white,
-                      fontWeight: FontWeight.w800,
-                      fontSize: radius * 0.72,
-                      letterSpacing: 0.2,
-                    ),
-                  ),
+            child: content,
           ),
           if (online == true)
             Positioned(

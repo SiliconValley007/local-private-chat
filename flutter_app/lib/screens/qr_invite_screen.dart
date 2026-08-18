@@ -11,11 +11,13 @@ class QrInviteScreen extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final me = context.watch<AppState>().me;
+    final state = context.watch<AppState>();
+    final me = state.me;
     if (me == null) {
       return const Scaffold(body: Center(child: Text('Not signed in')));
     }
-    final uri = AppConfig.inviteUri(me.username);
+    final server = state.api.baseUrl;
+    final uri = AppConfig.inviteUri(me.username, serverUrl: server);
     final scheme = Theme.of(context).colorScheme;
 
     return Scaffold(
@@ -24,7 +26,9 @@ class QrInviteScreen extends StatelessWidget {
         padding: const EdgeInsets.all(24),
         children: [
           Text(
-            'Friends scan this to add you — no phone numbers, no cloud contacts.',
+            'Friends scan this — or open the copied link on their phone — to add '
+            'you and point their app at this server. No phone numbers, no cloud '
+            'contacts.',
             style: Theme.of(
               context,
             ).textTheme.bodyMedium?.copyWith(color: scheme.onSurfaceVariant),
@@ -85,6 +89,38 @@ class QrInviteScreen extends StatelessWidget {
             },
             icon: const Icon(Icons.copy_rounded),
             label: const Text('Copy invite link'),
+          ),
+          const SizedBox(height: 16),
+          Container(
+            padding: const EdgeInsets.all(14),
+            decoration: BoxDecoration(
+              color: scheme.surfaceContainerHighest,
+              borderRadius: BorderRadius.circular(14),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Server in this invite',
+                  style: Theme.of(context).textTheme.labelLarge,
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  server == null || server.isEmpty ? 'Not set' : server,
+                  style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                    color: scheme.onSurfaceVariant,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  'Your friend still needs Tailscale on their phone and access to '
+                  'this tailnet — the invite only saves them typing the address.',
+                  style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                    color: scheme.onSurfaceVariant,
+                  ),
+                ),
+              ],
+            ),
           ),
         ],
       ),

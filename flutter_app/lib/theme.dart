@@ -1,6 +1,32 @@
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 
+/// Emoji font carried inside the app, used behind every other family.
+///
+/// A phone only knows the emoji its Android version shipped with, so a newer
+/// one arrives as an empty box even though the keyboard offered it — Gboard
+/// draws its own glyphs and never asks the app's fonts. Listing this bundled
+/// font as the fallback means the composer, the bubbles and the previews all
+/// resolve the same glyph, on every phone.
+const List<String> emojiFontFallback = <String>['NotoColorEmoji'];
+
+/// Text style for a run of emoji, with the bundled font behind it.
+TextStyle emojiTextStyle({required double fontSize, double height = 1.18}) {
+  return TextStyle(
+    fontSize: fontSize,
+    height: height,
+    fontFamilyFallback: emojiFontFallback,
+  );
+}
+
+/// Puts the bundled emoji font behind every style in [base].
+///
+/// Naming a family explicitly stops Android from reaching for its own emoji
+/// font, so this is what keeps emoji visible in the composer, the bubbles, the
+/// chat list previews and every dialog that inherits from the theme.
+TextTheme withEmojiFallback(TextTheme base) =>
+    base.apply(fontFamilyFallback: emojiFontFallback);
+
 /// Corner radii used across the app, so every surface feels part of one family.
 class AppRadius {
   const AppRadius._();
@@ -76,21 +102,23 @@ LinearGradient appBackgroundGradient(ColorScheme scheme) {
 
 ThemeData buildAppTheme({Brightness brightness = Brightness.light}) {
   final dark = brightness == Brightness.dark;
-  final base = ColorScheme.fromSeed(
-    seedColor: AppColors.brand,
-    brightness: brightness,
-  ).copyWith(
-    primary: dark ? const Color(0xFF4DD6B2) : AppColors.brand,
-    tertiary: AppColors.accent,
-    surface: dark ? const Color(0xFF151E1B) : Colors.white,
-  );
+  final base =
+      ColorScheme.fromSeed(
+        seedColor: AppColors.brand,
+        brightness: brightness,
+      ).copyWith(
+        primary: dark ? const Color(0xFF4DD6B2) : AppColors.brand,
+        tertiary: AppColors.accent,
+        surface: dark ? const Color(0xFF151E1B) : Colors.white,
+      );
 
-  final text = GoogleFonts.plusJakartaSansTextTheme(
-    dark ? ThemeData.dark().textTheme : ThemeData.light().textTheme,
-  ).apply(
-    bodyColor: base.onSurface,
-    displayColor: base.onSurface,
-  );
+  // Plus Jakarta Sans has no emoji of its own, so the bundled emoji font goes
+  // behind it before any colours are applied.
+  final text = withEmojiFallback(
+    GoogleFonts.plusJakartaSansTextTheme(
+      dark ? ThemeData.dark().textTheme : ThemeData.light().textTheme,
+    ),
+  ).apply(bodyColor: base.onSurface, displayColor: base.onSurface);
 
   return ThemeData(
     useMaterial3: true,
@@ -131,9 +159,7 @@ ThemeData buildAppTheme({Brightness brightness = Brightness.light}) {
         borderRadius: BorderRadius.circular(AppRadius.field),
       ),
       titleTextStyle: text.titleMedium?.copyWith(fontWeight: FontWeight.w700),
-      subtitleTextStyle: text.bodySmall?.copyWith(
-        color: base.onSurfaceVariant,
-      ),
+      subtitleTextStyle: text.bodySmall?.copyWith(color: base.onSurfaceVariant),
     ),
     inputDecorationTheme: InputDecorationTheme(
       filled: true,
@@ -204,9 +230,7 @@ ThemeData buildAppTheme({Brightness brightness = Brightness.light}) {
     ),
     snackBarTheme: SnackBarThemeData(
       behavior: SnackBarBehavior.floating,
-      backgroundColor: dark
-          ? const Color(0xFF2A3E38)
-          : const Color(0xFF15302A),
+      backgroundColor: dark ? const Color(0xFF2A3E38) : const Color(0xFF15302A),
       contentTextStyle: text.bodyMedium?.copyWith(color: Colors.white),
       shape: RoundedRectangleBorder(
         borderRadius: BorderRadius.circular(AppRadius.field),

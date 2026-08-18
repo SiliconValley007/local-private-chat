@@ -20,6 +20,15 @@ jose_hidden = collect_submodules("jose")
 # passlib resolves its bcrypt backend lazily, so the handlers need naming.
 passlib_hidden = collect_submodules("passlib")
 
+# Push notifications. firebase-admin and Google's auth stack load plenty of
+# modules by name at runtime, so without this the exe starts but quietly logs
+# "FCM disabled: firebase-admin not installed" and no phone is ever woken.
+firebase_datas, firebase_binaries, firebase_hidden = collect_all("firebase_admin")
+google_auth_datas, google_auth_binaries, google_auth_hidden = collect_all("google.auth")
+oauth2_datas, oauth2_binaries, oauth2_hidden = collect_all("google.oauth2")
+api_core_datas, api_core_binaries, api_core_hidden = collect_all("google.api_core")
+grpc_datas, grpc_binaries, grpc_hidden = collect_all("grpc")
+
 hiddenimports = sorted(
     set(
         fastapi_hidden
@@ -27,7 +36,17 @@ hiddenimports = sorted(
         + uvicorn_hidden
         + pydantic_hidden
         + jose_hidden
+        # The server hashes passwords too: without these the exe dies on the
+        # first import of app.auth with "No module named passlib.handlers.bcrypt".
+        + passlib_hidden
+        + firebase_hidden
+        + google_auth_hidden
+        + oauth2_hidden
+        + api_core_hidden
+        + grpc_hidden
         + [
+            "bcrypt",
+            "passlib.handlers.bcrypt",
             "uvicorn.logging",
             "uvicorn.loops",
             "uvicorn.loops.auto",
@@ -43,14 +62,36 @@ hiddenimports = sorted(
             "app.db",
             "app.models",
             "app.fcm",
+            "firebase_admin.messaging",
+            "firebase_admin.credentials",
             "multipart",
             "email_validator",
         ]
     )
 )
 
-datas = fastapi_datas + starlette_datas + uvicorn_datas + pydantic_datas
-binaries = fastapi_binaries + starlette_binaries + uvicorn_binaries + pydantic_binaries
+datas = (
+    fastapi_datas
+    + starlette_datas
+    + uvicorn_datas
+    + pydantic_datas
+    + firebase_datas
+    + google_auth_datas
+    + oauth2_datas
+    + api_core_datas
+    + grpc_datas
+)
+binaries = (
+    fastapi_binaries
+    + starlette_binaries
+    + uvicorn_binaries
+    + pydantic_binaries
+    + firebase_binaries
+    + google_auth_binaries
+    + oauth2_binaries
+    + api_core_binaries
+    + grpc_binaries
+)
 
 a = Analysis(
     ["run.py"],

@@ -8,14 +8,18 @@ final _urlPattern = RegExp(
   caseSensitive: false,
 );
 
+/// Sentence punctuation that follows a URL rather than belonging to it.
+///
+/// Same set the server trims when building the Links gallery, so a link reads
+/// the same in both places.
+final _trailingPunctuation = RegExp(r'[.,;)\]!?]+$');
+
+String _withoutTrailingPunctuation(String url) =>
+    url.replaceFirst(_trailingPunctuation, '');
+
 /// Text that turns URLs into tappable links. No network fetch — privacy-safe.
 class LinkifiedText extends StatelessWidget {
-  const LinkifiedText(
-    this.text, {
-    super.key,
-    this.style,
-    this.linkStyle,
-  });
+  const LinkifiedText(this.text, {super.key, this.style, this.linkStyle});
 
   final String text;
   final TextStyle? style;
@@ -36,9 +40,14 @@ class LinkifiedText extends StatelessWidget {
     var start = 0;
     for (final match in _urlPattern.allMatches(text)) {
       if (match.start > start) {
-        spans.add(TextSpan(text: text.substring(start, match.start), style: base));
+        spans.add(
+          TextSpan(text: text.substring(start, match.start), style: base),
+        );
       }
-      final url = match.group(0)!;
+      final matched = match.group(0)!;
+      // A full stop after a link is part of the sentence: leave it out of the
+      // tap target, or the browser is handed "example.com/page." and fails.
+      final url = _withoutTrailingPunctuation(matched);
       spans.add(
         TextSpan(
           text: url,
@@ -51,6 +60,9 @@ class LinkifiedText extends StatelessWidget {
             },
         ),
       );
+      if (url.length < matched.length) {
+        spans.add(TextSpan(text: matched.substring(url.length), style: base));
+      }
       start = match.end;
     }
     if (start < text.length) {
@@ -74,6 +86,6 @@ List<String> extractUrls(String? text) {
   if (text == null || text.isEmpty) return const [];
   return [
     for (final match in _urlPattern.allMatches(text))
-      match.group(0)!.replaceFirst(RegExp(r'[.,);!\]]+$'), ''),
+      _withoutTrailingPunctuation(match.group(0)!),
   ];
 }

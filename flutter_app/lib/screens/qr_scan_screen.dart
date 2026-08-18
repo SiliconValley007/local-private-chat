@@ -1,10 +1,9 @@
 import 'package:flutter/material.dart';
 import 'package:mobile_scanner/mobile_scanner.dart';
-import 'package:provider/provider.dart';
 
 import '../app_config.dart';
-import '../app_state.dart';
 import '../errors.dart';
+import '../invite_flow.dart';
 import '../models.dart';
 import '../widgets/error_banner.dart';
 
@@ -24,17 +23,15 @@ class _QrScanScreenState extends State<QrScanScreen> {
     if (capture.barcodes.isEmpty) return;
     final raw = capture.barcodes.first.rawValue;
     if (raw == null) return;
-    final username = AppConfig.usernameFromInvite(raw);
-    if (username == null) {
+    final invite = AppConfig.parseInvite(raw);
+    if (invite == null) {
       setState(() => _error = "That QR code isn't a Local Chat invite.");
       return;
     }
     _handled = true;
     try {
-      final state = context.read<AppState>();
-      final user = await state.resolveUsername(username);
-      final Conversation conv = await state.openDmWithUser(user);
-      if (mounted) Navigator.of(context).pop(conv);
+      final Conversation? conv = await acceptInvite(context, invite);
+      if (mounted && conv != null) Navigator.of(context).pop(conv);
     } catch (e) {
       _handled = false;
       setState(() => _error = friendlyMessage(e));

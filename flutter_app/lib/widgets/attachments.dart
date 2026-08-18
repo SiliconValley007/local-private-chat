@@ -46,17 +46,23 @@ String fileExtensionOf(ChatMessage msg) {
   final ext = fileExtensionOf(msg).toLowerCase();
   final mime = (msg.mediaMime ?? '').toLowerCase();
 
-  if (mime.startsWith('image/') || ['png', 'jpg', 'jpeg', 'gif', 'webp', 'heic'].contains(ext)) {
+  if (mime.startsWith('image/') ||
+      ['png', 'jpg', 'jpeg', 'gif', 'webp', 'heic'].contains(ext)) {
     return (icon: Icons.image_outlined, color: const Color(0xFF7C3AED));
   }
-  if (mime.startsWith('video/') || ['mp4', 'mkv', 'mov', 'avi', 'webm'].contains(ext)) {
+  if (mime.startsWith('video/') ||
+      ['mp4', 'mkv', 'mov', 'avi', 'webm'].contains(ext)) {
     return (icon: Icons.movie_outlined, color: const Color(0xFFDB2777));
   }
-  if (mime.startsWith('audio/') || ['mp3', 'm4a', 'wav', 'ogg', 'aac'].contains(ext)) {
+  if (mime.startsWith('audio/') ||
+      ['mp3', 'm4a', 'wav', 'ogg', 'aac'].contains(ext)) {
     return (icon: Icons.audiotrack_outlined, color: const Color(0xFF0891B2));
   }
   if (ext == 'pdf') {
-    return (icon: Icons.picture_as_pdf_outlined, color: const Color(0xFFDC2626));
+    return (
+      icon: Icons.picture_as_pdf_outlined,
+      color: const Color(0xFFDC2626),
+    );
   }
   if (['doc', 'docx', 'rtf', 'txt', 'md'].contains(ext)) {
     return (icon: Icons.description_outlined, color: const Color(0xFF2563EB));
@@ -70,14 +76,17 @@ String fileExtensionOf(ChatMessage msg) {
   if (['zip', 'rar', '7z', 'tar', 'gz', 'apk'].contains(ext)) {
     return (icon: Icons.folder_zip_outlined, color: const Color(0xFFCA8A04));
   }
-  return (icon: Icons.insert_drive_file_outlined, color: const Color(0xFF475569));
+  return (
+    icon: Icons.insert_drive_file_outlined,
+    color: const Color(0xFF475569),
+  );
 }
 
 void _report(BuildContext context, Object error) {
   if (!context.mounted) return;
-  ScaffoldMessenger.of(context).showSnackBar(
-    SnackBar(content: Text(friendlyMessage(error))),
-  );
+  ScaffoldMessenger.of(
+    context,
+  ).showSnackBar(SnackBar(content: Text(friendlyMessage(error))));
 }
 
 void _toast(BuildContext context, String message) {
@@ -108,9 +117,50 @@ mixin _DownloadState<T extends StatefulWidget> on State<T> {
   }
 }
 
-/// Open / save / share, the way a long-press on a WhatsApp attachment behaves.
-Future<void> showAttachmentActions(BuildContext context, ChatMessage msg) async {
+/// Open / save / share actions for attachment messages.
+enum AttachmentAction { open, save, share }
+
+bool messageHasAttachmentActions(ChatMessage msg) =>
+    !msg.isDeleted &&
+    (msg.type == 'image' ||
+        msg.type == 'video' ||
+        msg.type == 'doodle' ||
+        msg.type == 'voice' ||
+        msg.type == 'file');
+
+Future<void> runAttachmentAction(
+  BuildContext context,
+  ChatMessage msg,
+  AttachmentAction action,
+) async {
   final store = context.read<AppState>().media;
+  final cached = await store.cached(msg);
+  if (cached == null && context.mounted) {
+    _toast(context, 'Downloading ${msg.mediaName ?? 'attachment'}…');
+  }
+
+  try {
+    switch (action) {
+      case AttachmentAction.open:
+        await store.openExternally(msg);
+      case AttachmentAction.save:
+        final outcome = await store.saveToDevice(msg);
+        if (outcome == SaveOutcome.saved && context.mounted) {
+          _toast(context, 'Saved to your phone');
+        }
+      case AttachmentAction.share:
+        await store.share(msg);
+    }
+  } catch (error) {
+    if (context.mounted) _report(context, error);
+  }
+}
+
+/// Open / save / share, the way a long-press on a WhatsApp attachment behaves.
+Future<void> showAttachmentActions(
+  BuildContext context,
+  ChatMessage msg,
+) async {
   final scheme = Theme.of(context).colorScheme;
   final badge = fileBadge(msg);
 
@@ -139,9 +189,10 @@ Future<void> showAttachmentActions(BuildContext context, ChatMessage msg) async 
                             ?.copyWith(fontWeight: FontWeight.w700),
                       ),
                       Text(
-                        [fileExtensionOf(msg), formatFileSize(msg.mediaSize)]
-                            .where((part) => part.isNotEmpty)
-                            .join(' · '),
+                        [
+                          fileExtensionOf(msg),
+                          formatFileSize(msg.mediaSize),
+                        ].where((part) => part.isNotEmpty).join(' · '),
                         style: Theme.of(sheetContext).textTheme.bodySmall
                             ?.copyWith(color: scheme.onSurfaceVariant),
                       ),
@@ -175,26 +226,11 @@ Future<void> showAttachmentActions(BuildContext context, ChatMessage msg) async 
   );
 
   if (action == null || !context.mounted) return;
-  final cached = await store.cached(msg);
-  if (cached == null && context.mounted) {
-    _toast(context, 'Downloading ${msg.mediaName ?? 'attachment'}…');
-  }
-
-  try {
-    switch (action) {
-      case 'open':
-        await store.openExternally(msg);
-      case 'save':
-        final outcome = await store.saveToDevice(msg);
-        if (outcome == SaveOutcome.saved && context.mounted) {
-          _toast(context, 'Saved to your phone');
-        }
-      case 'share':
-        await store.share(msg);
-    }
-  } catch (error) {
-    if (context.mounted) _report(context, error);
-  }
+  await runAttachmentAction(context, msg, switch (action) {
+    'open' => AttachmentAction.open,
+    'save' => AttachmentAction.save,
+    _ => AttachmentAction.share,
+  });
 }
 
 class _FileGlyph extends StatelessWidget {
@@ -225,6 +261,7 @@ class ImageAttachment extends StatefulWidget {
     required this.message,
     required this.maxWidth,
     this.footer,
+    this.onLongPress,
   });
 
   final ChatMessage message;
@@ -232,6 +269,9 @@ class ImageAttachment extends StatefulWidget {
 
   /// Timestamp and ticks, drawn over the bottom of the photo.
   final Widget? footer;
+
+  /// Long-press opens the unified message action sheet.
+  final VoidCallback? onLongPress;
 
   @override
   State<ImageAttachment> createState() => _ImageAttachmentState();
@@ -259,26 +299,36 @@ class _ImageAttachmentState extends State<ImageAttachment> {
                     builder: (_) => ImageViewerScreen(message: widget.message),
                   ),
                 ),
-                onLongPress: () => showAttachmentActions(context, widget.message),
-                child: Image.network(
-                  state.api.mediaUrl(widget.message.id),
-                  key: ValueKey(_reloadKey),
-                  headers: {'Authorization': 'Bearer ${state.api.token}'},
-                  width: width,
-                  fit: BoxFit.cover,
-                  loadingBuilder: (context, child, progress) {
-                    if (progress == null) return child;
-                    final expected = progress.expectedTotalBytes;
-                    return _ImagePlaceholder(
-                      width: width,
-                      progress: expected == null
-                          ? null
-                          : progress.cumulativeBytesLoaded / expected,
-                    );
-                  },
-                  errorBuilder: (context, _, _) => _ImageFailed(
+                onLongPress: widget.onLongPress,
+                child: Hero(
+                  tag: 'media-hero-${widget.message.id}',
+                  // Fixed box so a loaded photo cannot grow or shrink the bubble
+                  // after the chat has already pinned itself to the bottom.
+                  child: SizedBox(
                     width: width,
-                    onRetry: () => setState(() => _reloadKey++),
+                    height: width * chatImageHeightRatio,
+                    child: Image.network(
+                      state.api.mediaUrl(widget.message.id),
+                      key: ValueKey(_reloadKey),
+                      headers: {'Authorization': 'Bearer ${state.api.token}'},
+                      width: width,
+                      height: width * chatImageHeightRatio,
+                      fit: BoxFit.cover,
+                      loadingBuilder: (context, child, progress) {
+                        if (progress == null) return child;
+                        final expected = progress.expectedTotalBytes;
+                        return _ImagePlaceholder(
+                          width: width,
+                          progress: expected == null
+                              ? null
+                              : progress.cumulativeBytesLoaded / expected,
+                        );
+                      },
+                      errorBuilder: (context, _, _) => _ImageFailed(
+                        width: width,
+                        onRetry: () => setState(() => _reloadKey++),
+                      ),
+                    ),
                   ),
                 ),
               ),
@@ -337,7 +387,7 @@ class _ImagePlaceholder extends StatelessWidget {
     final scheme = Theme.of(context).colorScheme;
     return Container(
       width: width,
-      height: width * 0.72,
+      height: width * chatImageHeightRatio,
       color: scheme.surfaceContainerHighest,
       alignment: Alignment.center,
       child: SizedBox(
@@ -362,7 +412,7 @@ class _ImageFailed extends StatelessWidget {
       onTap: onRetry,
       child: Container(
         width: width,
-        height: width * 0.72,
+        height: width * chatImageHeightRatio,
         color: scheme.surfaceContainerHighest,
         alignment: Alignment.center,
         child: Column(
@@ -372,9 +422,9 @@ class _ImageFailed extends StatelessWidget {
             const SizedBox(height: 6),
             Text(
               'Tap to retry',
-              style: Theme.of(context).textTheme.labelMedium?.copyWith(
-                color: scheme.onSurfaceVariant,
-              ),
+              style: Theme.of(
+                context,
+              ).textTheme.labelMedium?.copyWith(color: scheme.onSurfaceVariant),
             ),
           ],
         ),
@@ -384,7 +434,7 @@ class _ImageFailed extends StatelessWidget {
 }
 
 /// Full-screen photo with save and share, like tapping a photo in WhatsApp.
-class ImageViewerScreen extends StatelessWidget {
+class ImageViewerScreen extends StatefulWidget {
   const ImageViewerScreen({
     super.key,
     required this.message,
@@ -397,12 +447,22 @@ class ImageViewerScreen extends StatelessWidget {
   final VoidCallback? onShowInChat;
 
   @override
+  State<ImageViewerScreen> createState() => _ImageViewerScreenState();
+}
+
+class _ImageViewerScreenState extends State<ImageViewerScreen> {
+  double _drag = 0;
+
+  ChatMessage get message => widget.message;
+
+  @override
   Widget build(BuildContext context) {
     final state = context.read<AppState>();
     final caption = message.body?.trim() ?? '';
+    final opacity = (1.0 - (_drag.abs() / 280)).clamp(0.35, 1.0);
 
     return Scaffold(
-      backgroundColor: Colors.black,
+      backgroundColor: Colors.black.withValues(alpha: opacity),
       appBar: AppBar(
         backgroundColor: Colors.black,
         foregroundColor: Colors.white,
@@ -413,10 +473,10 @@ class ImageViewerScreen extends StatelessWidget {
           overflow: TextOverflow.ellipsis,
         ),
         actions: [
-          if (onShowInChat != null)
+          if (widget.onShowInChat != null)
             IconButton(
               tooltip: 'Show in chat',
-              onPressed: onShowInChat,
+              onPressed: widget.onShowInChat,
               icon: const Icon(Icons.chat_bubble_outline_rounded),
             ),
           IconButton(
@@ -434,19 +494,37 @@ class ImageViewerScreen extends StatelessWidget {
       body: Column(
         children: [
           Expanded(
-            child: InteractiveViewer(
-              minScale: 1,
-              maxScale: 4,
-              child: Center(
-                child: Image.network(
-                  state.api.mediaUrl(message.id),
-                  headers: {'Authorization': 'Bearer ${state.api.token}'},
-                  errorBuilder: (context, _, _) => const Padding(
-                    padding: EdgeInsets.all(24),
-                    child: Text(
-                      "This photo couldn't be loaded from the server.",
-                      style: TextStyle(color: Colors.white70),
-                      textAlign: TextAlign.center,
+            child: GestureDetector(
+              onVerticalDragUpdate: (d) => setState(() => _drag += d.delta.dy),
+              onVerticalDragEnd: (d) {
+                if (_drag.abs() > 120 ||
+                    (d.primaryVelocity != null &&
+                        d.primaryVelocity!.abs() > 700)) {
+                  Navigator.of(context).maybePop();
+                } else {
+                  setState(() => _drag = 0);
+                }
+              },
+              child: Transform.translate(
+                offset: Offset(0, _drag),
+                child: InteractiveViewer(
+                  minScale: 1,
+                  maxScale: 4,
+                  child: Center(
+                    child: Hero(
+                      tag: 'media-hero-${message.id}',
+                      child: Image.network(
+                        state.api.mediaUrl(message.id),
+                        headers: {'Authorization': 'Bearer ${state.api.token}'},
+                        errorBuilder: (context, _, _) => const Padding(
+                          padding: EdgeInsets.all(24),
+                          child: Text(
+                            "This photo couldn't be loaded from the server.",
+                            style: TextStyle(color: Colors.white70),
+                            textAlign: TextAlign.center,
+                          ),
+                        ),
+                      ),
                     ),
                   ),
                 ),
@@ -495,11 +573,13 @@ class FileAttachment extends StatefulWidget {
     required this.message,
     required this.maxWidth,
     this.onSurfaceColor,
+    this.onLongPress,
   });
 
   final ChatMessage message;
   final double maxWidth;
   final Color? onSurfaceColor;
+  final VoidCallback? onLongPress;
 
   @override
   State<FileAttachment> createState() => _FileAttachmentState();
@@ -544,7 +624,7 @@ class _FileAttachmentState extends State<FileAttachment>
       child: InkWell(
         borderRadius: BorderRadius.circular(AppRadius.field),
         onTap: _openOrDownload,
-        onLongPress: () => showAttachmentActions(context, widget.message),
+        onLongPress: widget.onLongPress,
         child: Padding(
           padding: const EdgeInsets.symmetric(vertical: 2),
           child: Row(
@@ -597,10 +677,12 @@ class VoiceAttachment extends StatefulWidget {
     super.key,
     required this.message,
     required this.accent,
+    this.onLongPress,
   });
 
   final ChatMessage message;
   final Color accent;
+  final VoidCallback? onLongPress;
 
   @override
   State<VoiceAttachment> createState() => _VoiceAttachmentState();
@@ -644,55 +726,85 @@ class _VoiceAttachmentState extends State<VoiceAttachment>
         final progress = playback.progressFor(widget.message.id);
         final elapsed = mine ? playback.position : null;
 
-        return SizedBox(
-          width: 214,
-          child: Row(
-            children: [
-              _RoundActionButton(
-                progress: downloadProgress,
-                icon: playing ? Icons.pause_rounded : Icons.play_arrow_rounded,
-                filled: true,
-                color: widget.accent,
-                onPressed: _toggle,
-              ),
-              const SizedBox(width: 10),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    LayoutBuilder(
-                      builder: (context, constraints) => GestureDetector(
-                        behavior: HitTestBehavior.opaque,
-                        onTapDown: (details) => VoicePlayer.instance.seekTo(
-                          widget.message.id,
-                          details.localPosition.dx / constraints.maxWidth,
-                        ),
-                        child: ClipRRect(
-                          borderRadius: BorderRadius.circular(AppRadius.pill),
-                          child: LinearProgressIndicator(
-                            value: progress,
-                            minHeight: 5,
-                            backgroundColor: widget.accent.withValues(
-                              alpha: 0.22,
+        return GestureDetector(
+          onLongPress: widget.onLongPress,
+          child: SizedBox(
+            width: 214,
+            child: Row(
+              children: [
+                _RoundActionButton(
+                  progress: downloadProgress,
+                  icon: playing
+                      ? Icons.pause_rounded
+                      : Icons.play_arrow_rounded,
+                  filled: true,
+                  color: widget.accent,
+                  onPressed: _toggle,
+                  onLongPress: widget.onLongPress,
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      LayoutBuilder(
+                        builder: (context, constraints) => GestureDetector(
+                          behavior: HitTestBehavior.opaque,
+                          onTapDown: (details) => VoicePlayer.instance.seekTo(
+                            widget.message.id,
+                            details.localPosition.dx / constraints.maxWidth,
+                          ),
+                          child: SizedBox(
+                            height: 28,
+                            child: CustomPaint(
+                              painter: _WaveformPainter(
+                                progress: progress,
+                                color: widget.accent,
+                                seed: widget.message.id,
+                              ),
+                              size: Size(constraints.maxWidth, 28),
                             ),
-                            valueColor: AlwaysStoppedAnimation(widget.accent),
                           ),
                         ),
                       ),
-                    ),
-                    const SizedBox(height: 5),
-                    Text(
-                      mine
-                          ? '${formatClipDuration(elapsed)} / ${formatClipDuration(playback.duration)}'
-                          : 'Voice message',
-                      style: Theme.of(context).textTheme.labelSmall?.copyWith(
-                        color: Theme.of(context).colorScheme.onSurfaceVariant,
+                      const SizedBox(height: 5),
+                      Row(
+                        children: [
+                          Expanded(
+                            child: Text(
+                              mine
+                                  ? '${formatClipDuration(elapsed)} / ${formatClipDuration(playback.duration)}'
+                                  : 'Voice message',
+                              style: Theme.of(context).textTheme.labelSmall
+                                  ?.copyWith(
+                                    color: Theme.of(
+                                      context,
+                                    ).colorScheme.onSurfaceVariant,
+                                  ),
+                            ),
+                          ),
+                          GestureDetector(
+                            onTap: () => VoicePlayer.instance.cycleSpeed(),
+                            child: Text(
+                              playback.speed == 1.0
+                                  ? '1x'
+                                  : playback.speed == 1.5
+                                  ? '1.5x'
+                                  : '2x',
+                              style: Theme.of(context).textTheme.labelSmall
+                                  ?.copyWith(
+                                    color: widget.accent,
+                                    fontWeight: FontWeight.w700,
+                                  ),
+                            ),
+                          ),
+                        ],
                       ),
-                    ),
-                  ],
+                    ],
+                  ),
                 ),
-              ),
-            ],
+              ],
+            ),
           ),
         );
       },
@@ -705,6 +817,7 @@ class _RoundActionButton extends StatelessWidget {
   const _RoundActionButton({
     required this.icon,
     required this.onPressed,
+    this.onLongPress,
     this.progress,
     this.filled = false,
     this.color,
@@ -712,6 +825,7 @@ class _RoundActionButton extends StatelessWidget {
 
   final IconData icon;
   final VoidCallback onPressed;
+  final VoidCallback? onLongPress;
   final double? progress;
   final bool filled;
   final Color? color;
@@ -731,6 +845,7 @@ class _RoundActionButton extends StatelessWidget {
         clipBehavior: Clip.antiAlias,
         child: InkWell(
           onTap: busy ? null : onPressed,
+          onLongPress: onLongPress,
           child: Center(
             child: busy
                 ? SizedBox(
@@ -752,4 +867,40 @@ class _RoundActionButton extends StatelessWidget {
       ),
     );
   }
+}
+
+/// Deterministic fake waveform so every voice note looks distinct without
+/// decoding PCM on the UI thread.
+class _WaveformPainter extends CustomPainter {
+  _WaveformPainter({
+    required this.progress,
+    required this.color,
+    required this.seed,
+  });
+
+  final double progress;
+  final Color color;
+  final int seed;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    const bars = 28;
+    final gap = size.width / bars;
+    final played = Paint()..color = color;
+    final rest = Paint()..color = color.withValues(alpha: 0.28);
+    for (var i = 0; i < bars; i++) {
+      final t = ((seed * 37 + i * 17) % 100) / 100.0;
+      final h = 4.0 + t * (size.height - 4);
+      final x = i * gap + gap * 0.2;
+      final rect = RRect.fromRectAndRadius(
+        Rect.fromLTWH(x, (size.height - h) / 2, gap * 0.55, h),
+        const Radius.circular(2),
+      );
+      canvas.drawRRect(rect, i / bars <= progress ? played : rest);
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _WaveformPainter old) =>
+      old.progress != progress || old.color != color || old.seed != seed;
 }

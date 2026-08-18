@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
@@ -43,6 +45,12 @@ class _TailscaleGateScreenState extends State<TailscaleGateScreen>
     final state = context.watch<AppState>();
     if (state.serverReachable) return widget.child;
 
+    // While the tunnel is still coming up, any diagnosis would be a guess — and
+    // "server is not running" was the wrong guess often enough to be annoying.
+    if (state.settling) {
+      return _ConnectingView(onOpenTailscale: state.openTailscaleApp);
+    }
+
     final check = state.serverCheck;
     final details = _GateDetails.forCheck(check);
     final theme = Theme.of(context);
@@ -72,13 +80,12 @@ class _TailscaleGateScreenState extends State<TailscaleGateScreen>
                     children: [
                       const SizedBox(height: 8),
                       FadeTransition(
-                        opacity: Tween(
-                          begin: 0.6,
-                          end: 1.0,
-                        ).animate(CurvedAnimation(
-                          parent: _pulse,
-                          curve: Curves.easeInOut,
-                        )),
+                        opacity: Tween(begin: 0.6, end: 1.0).animate(
+                          CurvedAnimation(
+                            parent: _pulse,
+                            curve: Curves.easeInOut,
+                          ),
+                        ),
                         child: _StatusBadge(
                           icon: details.icon,
                           color: details.accent(scheme),
@@ -102,17 +109,56 @@ class _TailscaleGateScreenState extends State<TailscaleGateScreen>
                         ),
                       ),
                       const SizedBox(height: 22),
-                      _StepsCard(title: details.stepsTitle, steps: details.steps),
+                      _StepsCard(
+                        title: details.stepsTitle,
+                        steps: details.steps,
+                      ),
                       const SizedBox(height: 22),
-                      FilledButton.icon(
-                        onPressed: state.checkingConnectivity
+                      if (details.showConnectTailscale) ...[
+                        FilledButton.icon(
+                          onPressed:
+                              state.connectingTailscale ||
+                                  state.checkingConnectivity
+                              ? null
+                              : () => _connectTailscale(state),
+                          icon: state.connectingTailscale
+                              ? const SizedBox(
+                                  width: 18,
+                                  height: 18,
+                                  child: CircularProgressIndicator(
+                                    strokeWidth: 2,
+                                  ),
+                                )
+                              : const Icon(Icons.vpn_key_rounded),
+                          label: Text(
+                            state.connectingTailscale
+                                ? 'Connecting Tailscale…'
+                                : 'Connect Tailscale',
+                          ),
+                        ),
+                        const SizedBox(height: 8),
+                        OutlinedButton.icon(
+                          onPressed: state.connectingTailscale
+                              ? null
+                              : () => _openTailscale(state),
+                          icon: const Icon(Icons.open_in_new_rounded, size: 18),
+                          label: const Text('Open Tailscale app'),
+                        ),
+                        const SizedBox(height: 8),
+                      ],
+                      FilledButton.tonalIcon(
+                        onPressed:
+                            state.checkingConnectivity ||
+                                state.connectingTailscale
                             ? null
                             : state.refreshConnectivity,
                         icon: state.checkingConnectivity
                             ? const SizedBox(
                                 width: 18,
                                 height: 18,
-                                child: CircularProgressIndicator(strokeWidth: 2),
+                                child: CircularProgressIndicator(
+                                  strokeWidth: 2,
+                                ),
                               )
                             : const Icon(Icons.refresh_rounded),
                         label: Text(
@@ -130,7 +176,9 @@ class _TailscaleGateScreenState extends State<TailscaleGateScreen>
                         ),
                       ],
                       const SizedBox(height: 24),
-                      _AddressChip(address: check?.baseUrl ?? state.api.baseUrl),
+                      _AddressChip(
+                        address: check?.baseUrl ?? state.api.baseUrl,
+                      ),
                     ],
                   ),
                 ),
@@ -142,9 +190,125 @@ class _TailscaleGateScreenState extends State<TailscaleGateScreen>
     );
   }
 
+  Future<void> _connectTailscale(AppState state) async {
+    final messenger = ScaffoldMessenger.of(context);
+    final ok = await state.connectTailscaleAndWait();
+    if (!mounted) return;
+    if (ok) return;
+    final installed = await state.tailscale.isInstalled();
+    if (!mounted) return;
+    final message = !installed
+        ? 'Tailscale is not installed on this phone.'
+        : 'Still waiting for Tailscale. Open the Tailscale app, '
+              'confirm it says Connected, then come back.';
+    messenger.showSnackBar(SnackBar(content: Text(message)));
+  }
+
+  Future<void> _openTailscale(AppState state) async {
+    final opened = await state.openTailscaleApp();
+    if (!mounted) return;
+    if (!opened) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Could not open Tailscale. Is it installed?'),
+        ),
+      );
+    }
+  }
+
   void _openServerSettings() {
-    Navigator.of(context).push(
-      MaterialPageRoute(builder: (_) => const ServerSetupScreen()),
+    Navigator.of(
+      context,
+    ).push(MaterialPageRoute(builder: (_) => const ServerSetupScreen()));
+  }
+}
+
+/// Shown while Local Chat is still bringing the private link up.
+///
+/// Deliberately reason-free: it appears in the seconds after Tailscale is asked
+/// to connect, when the VPN interface may exist but is not routing yet.
+class _ConnectingView extends StatefulWidget {
+  const _ConnectingView({required this.onOpenTailscale});
+
+  final Future<bool> Function() onOpenTailscale;
+
+  @override
+  State<_ConnectingView> createState() => _ConnectingViewState();
+}
+
+class _ConnectingViewState extends State<_ConnectingView> {
+  Timer? _slowTimer;
+  bool _slow = false;
+
+  @override
+  void initState() {
+    super.initState();
+    // Only offer the manual escape hatch once this is genuinely taking a while.
+    _slowTimer = Timer(const Duration(seconds: 5), () {
+      if (mounted) setState(() => _slow = true);
+    });
+  }
+
+  @override
+  void dispose() {
+    _slowTimer?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final scheme = theme.colorScheme;
+    return Scaffold(
+      body: DecoratedBox(
+        decoration: BoxDecoration(gradient: appBackgroundGradient(scheme)),
+        child: SafeArea(
+          child: Center(
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 32),
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  const _StatusBadge(
+                    icon: Icons.vpn_lock_rounded,
+                    color: AppColors.brand,
+                  ),
+                  const SizedBox(height: 28),
+                  Text(
+                    'Connecting privately…',
+                    textAlign: TextAlign.center,
+                    style: theme.textTheme.headlineSmall?.copyWith(
+                      fontWeight: FontWeight.w800,
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  Text(
+                    'Bringing Tailscale up and reaching your server.',
+                    textAlign: TextAlign.center,
+                    style: theme.textTheme.bodyMedium?.copyWith(
+                      color: scheme.onSurfaceVariant,
+                      height: 1.5,
+                    ),
+                  ),
+                  const SizedBox(height: 26),
+                  const SizedBox(
+                    width: 120,
+                    child: LinearProgressIndicator(minHeight: 4),
+                  ),
+                  if (_slow) ...[
+                    const SizedBox(height: 26),
+                    OutlinedButton.icon(
+                      onPressed: () => widget.onOpenTailscale(),
+                      icon: const Icon(Icons.open_in_new_rounded, size: 18),
+                      label: const Text('Open Tailscale app'),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
     );
   }
 }
@@ -158,6 +322,7 @@ class _GateDetails {
     required this.steps,
     required this.body,
     this.showSettingsButton = false,
+    this.showConnectTailscale = false,
     this.isWarning = false,
   });
 
@@ -167,6 +332,7 @@ class _GateDetails {
   final String stepsTitle;
   final List<String> steps;
   final bool showSettingsButton;
+  final bool showConnectTailscale;
   final bool isWarning;
 
   Color accent(ColorScheme scheme) =>
@@ -184,7 +350,8 @@ class _GateDetails {
         return const _GateDetails(
           icon: Icons.link_off_rounded,
           title: 'Server address looks wrong',
-          body: "The address saved in the app isn't a valid server URL, "
+          body:
+              "The address saved in the app isn't a valid server URL, "
               'so there is nothing to connect to.',
           stepsTitle: 'How to fix it',
           steps: [
@@ -199,7 +366,8 @@ class _GateDetails {
         return const _GateDetails(
           icon: Icons.wifi_off_rounded,
           title: 'This phone is offline',
-          body: 'There is no Wi-Fi or mobile data connection. '
+          body:
+              'There is no Wi-Fi or mobile data connection. '
               'Tailscale needs a network underneath it to work.',
           stepsTitle: 'How to fix it',
           steps: [
@@ -214,7 +382,8 @@ class _GateDetails {
         return const _GateDetails(
           icon: Icons.dns_outlined,
           title: 'Chat server is not running',
-          body: 'Tailscale is working on this phone, but nothing answered at '
+          body:
+              'Tailscale is working on this phone, but nothing answered at '
               '{host}. The server phone needs to be awake and running Local Chat.',
           stepsTitle: 'On the server phone',
           steps: [
@@ -231,14 +400,19 @@ class _GateDetails {
         return const _GateDetails(
           icon: Icons.vpn_key_off_rounded,
           title: 'Tailscale is not connected',
-          body: "This phone doesn't have a Tailscale address yet, so it can't "
-              'reach your private server.',
+          body:
+              "This phone doesn't have a Tailscale address yet, so it can't "
+              'reach your private server. Local Chat already asked Tailscale '
+              'to connect — tap the button if it is still off.',
           stepsTitle: 'On this phone',
           steps: [
-            'Open the Tailscale app and sign in.',
-            'Switch the toggle to Connected.',
-            'Come back and tap Try again.',
+            'Tap "Connect Tailscale" below (works when Tailscale is installed '
+                'and already signed in).',
+            'If nothing changes, tap "Open Tailscale app" and switch it to '
+                'Connected.',
+            'Come back — this screen unlocks automatically.',
           ],
+          showConnectTailscale: true,
         );
     }
   }
@@ -359,9 +533,9 @@ class _AddressChip extends StatelessWidget {
           const SizedBox(width: 6),
           Text(
             address!,
-            style: Theme.of(context).textTheme.labelSmall?.copyWith(
-              color: scheme.onSurfaceVariant,
-            ),
+            style: Theme.of(
+              context,
+            ).textTheme.labelSmall?.copyWith(color: scheme.onSurfaceVariant),
           ),
         ],
       ),

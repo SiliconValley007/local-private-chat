@@ -47,6 +47,7 @@ def init_db() -> None:
 
     Base.metadata.create_all(bind=engine)
     _add_missing_columns()
+    _add_missing_indexes()
 
 
 # Columns added after the first release. ``create_all`` only creates missing
@@ -55,6 +56,18 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("messages", "reply_to_message_id", "INTEGER"),
     ("messages", "edited_at", "DATETIME"),
     ("messages", "deleted_at", "DATETIME"),
+    ("messages", "expires_at", "DATETIME"),
+    ("messages", "media_thumb_path", "TEXT"),
+    ("messages", "media_duration_ms", "INTEGER"),
+    ("users", "avatar_path", "TEXT"),
+    ("users", "avatar_updated_at", "DATETIME"),
+    ("users", "mood", "TEXT"),
+    ("conversations", "wallpaper_path", "TEXT"),
+    ("conversations", "wallpaper_dim", "REAL"),
+    ("conversations", "wallpaper_set_by", "INTEGER"),
+    ("conversations", "wallpaper_set_at", "DATETIME"),
+    ("conversations", "disappear_after_seconds", "INTEGER"),
+    ("conversations", "anniversary_on", "TEXT"),
 )
 
 
@@ -69,3 +82,22 @@ def _add_missing_columns() -> None:
                 conn.exec_driver_sql(
                     f"ALTER TABLE {table} ADD COLUMN {column} {column_type}"
                 )
+
+
+def _add_missing_indexes() -> None:
+    """Add safe partial indexes that cannot disturb legacy message retries."""
+    with engine.begin() as conn:
+        # Call logs are server-authored from signaling. Two terminal frames can
+        # arrive on different sockets at almost the same time, so the database
+        # is the final idempotency boundary rather than a race-prone read first.
+        # Older client-authored call rows have no ``call:`` client id and are
+        # intentionally outside this index.
+        conn.exec_driver_sql(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_call_log_client_id
+            ON messages(conversation_id, client_id)
+            WHERE type = 'call'
+              AND client_id IS NOT NULL
+              AND client_id LIKE 'call:%'
+            """
+        )

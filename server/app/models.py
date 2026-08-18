@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 
 from sqlalchemy import (
     DateTime,
+    Float,
     ForeignKey,
     Integer,
     String,
@@ -28,8 +29,13 @@ class User(Base):
     username: Mapped[str] = mapped_column(String(40), unique=True, nullable=False, index=True)
     password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
     display_name: Mapped[str] = mapped_column(String(80), nullable=False)
+    avatar_path: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    avatar_updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    mood: Mapped[str | None] = mapped_column(String(40), nullable=True)
 
     memberships: Mapped[list[ConversationMember]] = relationship(back_populates="user")
     messages: Mapped[list[Message]] = relationship(back_populates="sender")
@@ -44,6 +50,14 @@ class Conversation(Base):
     dm_key: Mapped[str | None] = mapped_column(String(64), unique=True, nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     created_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    wallpaper_path: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    wallpaper_dim: Mapped[float] = mapped_column(Float, default=0.25)
+    wallpaper_set_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    wallpaper_set_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    disappear_after_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    anniversary_on: Mapped[str | None] = mapped_column(String(10), nullable=True)
 
     members: Mapped[list[ConversationMember]] = relationship(
         back_populates="conversation", cascade="all, delete-orphan"
@@ -78,9 +92,13 @@ class Message(Base):
     type: Mapped[str] = mapped_column(String(16), nullable=False, default="text")
     body: Mapped[str | None] = mapped_column(Text, nullable=True)
     media_path: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    media_thumb_path: Mapped[str | None] = mapped_column(String(512), nullable=True)
     media_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     media_size: Mapped[int | None] = mapped_column(Integer, nullable=True)
     media_mime: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # Video length in milliseconds, captured on the client at upload time so the
+    # chat tile can show a duration badge without opening the file.
+    media_duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     client_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, index=True
@@ -94,6 +112,9 @@ class Message(Base):
     )
     # Soft delete — body is cleared, but the row stays so replies keep their place.
     deleted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    expires_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
 
@@ -110,6 +131,35 @@ class Message(Base):
     receipts: Mapped[list[MessageReceipt]] = relationship(
         back_populates="message", cascade="all, delete-orphan"
     )
+    reactions: Mapped[list[MessageReaction]] = relationship(
+        back_populates="message", cascade="all, delete-orphan"
+    )
+
+
+class MessageHide(Base):
+    __tablename__ = "message_hides"
+    __table_args__ = (UniqueConstraint("user_id", "message_id", name="uq_hide_user_msg"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
+    message_id: Mapped[int] = mapped_column(ForeignKey("messages.id"), nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    message: Mapped[Message] = relationship()
+
+
+class MessageReaction(Base):
+    __tablename__ = "message_reactions"
+    __table_args__ = (UniqueConstraint("message_id", "user_id", name="uq_react_msg_user"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    message_id: Mapped[int] = mapped_column(ForeignKey("messages.id"), nullable=False, index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
+    emoji: Mapped[str] = mapped_column(String(16), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    message: Mapped[Message] = relationship(back_populates="reactions")
+    user: Mapped[User] = relationship()
 
 
 class MessageReceipt(Base):
@@ -123,6 +173,67 @@ class MessageReceipt(Base):
     read_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     message: Mapped[Message] = relationship(back_populates="receipts")
+
+
+class MessagePin(Base):
+    """A message sticky-pinned at the top of a conversation (Telegram-style)."""
+
+    __tablename__ = "message_pins"
+    __table_args__ = (
+        UniqueConstraint("conversation_id", "message_id", name="uq_pin_conv_msg"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    conversation_id: Mapped[int] = mapped_column(
+        ForeignKey("conversations.id"), nullable=False, index=True
+    )
+    message_id: Mapped[int] = mapped_column(
+        ForeignKey("messages.id"), nullable=False, index=True
+    )
+    pinned_by: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
+    pinned_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    message: Mapped[Message] = relationship()
+    conversation: Mapped[Conversation] = relationship()
+    pinner: Mapped[User] = relationship()
+
+
+class MessageStar(Base):
+    """A private, per-user bookmark (WhatsApp-style starred messages)."""
+
+    __tablename__ = "message_stars"
+    __table_args__ = (
+        UniqueConstraint("user_id", "message_id", name="uq_star_user_msg"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
+    message_id: Mapped[int] = mapped_column(ForeignKey("messages.id"), nullable=False, index=True)
+    starred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    message: Mapped[Message] = relationship()
+    user: Mapped[User] = relationship()
+
+
+class NudgeEvent(Base):
+    """Persisted chat nudge — kept out of the normal message transcript."""
+
+    __tablename__ = "nudge_events"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    conversation_id: Mapped[int] = mapped_column(
+        ForeignKey("conversations.id"), nullable=False, index=True
+    )
+    sender_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id"), nullable=False, index=True
+    )
+    variant: Mapped[str] = mapped_column(String(16), nullable=False, default="wave")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, index=True
+    )
+
+    conversation: Mapped[Conversation] = relationship()
+    sender: Mapped[User] = relationship()
 
 
 class DeviceToken(Base):

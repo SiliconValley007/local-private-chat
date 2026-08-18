@@ -83,7 +83,9 @@ String formatListTimestamp(BuildContext context, DateTime when) {
   final local = when.toLocal();
   final now = DateTime.now();
   final sameDay =
-      local.year == now.year && local.month == now.month && local.day == now.day;
+      local.year == now.year &&
+      local.month == now.month &&
+      local.day == now.day;
   if (sameDay) return formatClockTime(context, when);
   if (now.difference(local).inDays < 7) return DateFormat.E().format(local);
   return DateFormat.MMMd().format(local);

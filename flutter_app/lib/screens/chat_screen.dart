@@ -10,35 +10,83 @@ import 'package:path_provider/path_provider.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:share_plus/share_plus.dart';
 
+import '../call_log.dart';
 import '../app_state.dart';
+import '../chat_navigation.dart';
+import '../chat_scroll.dart';
+import '../couple_details.dart';
+import '../doodle_stroke.dart';
 import '../emoji.dart';
 import '../errors.dart';
 import '../models.dart';
+import '../nudge_log.dart';
 import '../services/export_service.dart';
+import '../services/doodle_controller.dart';
+import '../services/doodle_export.dart';
+import '../services/media_picker_service.dart';
+import 'media_review_screen.dart';
+import '../services/reaction_freq_store.dart';
 import '../services/voice_player.dart';
+import '../services/draft_store.dart';
 import '../theme.dart';
 import '../time_format.dart';
+import '../widgets/animated_emoji.dart';
 import '../widgets/attachments.dart';
 import '../widgets/avatar.dart';
-import '../widgets/linkified_text.dart';
+import '../widgets/avatar_viewer.dart';
+import '../widgets/bubble_body.dart';
+import '../widgets/chat_background.dart';
+import '../widgets/doodle_attachment.dart';
+import '../widgets/doodle_overlay.dart';
+import '../widgets/rich_message_text.dart';
+import '../widgets/nudge_overlay.dart';
 import '../widgets/quoted_message.dart';
+import '../widgets/reaction_picker.dart';
+import '../widgets/receipt_ticks.dart';
 import '../widgets/rename_dialog.dart';
+import '../widgets/storage_strip.dart';
+import '../widgets/video_attachment.dart';
+import 'call_screen.dart';
+import 'contact_profile_screen.dart';
+import 'nudge_history_screen.dart';
 import 'shared_media_screen.dart';
 
 class ChatScreen extends StatefulWidget {
-  const ChatScreen({super.key, required this.conversation});
+  const ChatScreen({
+    super.key,
+    required this.conversation,
+    this.initialMessageId,
+  });
 
   final Conversation conversation;
+
+  /// When set, open by jumping to this message instead of anchoring at the end
+  /// (starred / search / shared-media "show in chat").
+  final int? initialMessageId;
 
   @override
   State<ChatScreen> createState() => _ChatScreenState();
 }
 
-class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
+class _ChatScreenState extends State<ChatScreen> {
   final _text = TextEditingController();
   final _searchQuery = TextEditingController();
   final _scroll = ScrollController();
   final _recorder = AudioRecorder();
+
+  /// Held here so replying can raise the keyboard the way WhatsApp does.
+  final _composerFocus = FocusNode();
+
+  /// Drives the wave animation when a nudge is sent or received here.
+  final _nudgeOverlay = NudgeOverlayController();
+  StreamSubscription<NudgeEvent>? _nudgeSub;
+  StreamSubscription<DoodleRelayUpdate>? _doodleSub;
+
+  bool _doodleMode = false;
+  bool _doodleSending = false;
+  Size? _doodleCanvasSize;
+  DoodleDrawController? _doodleDraw;
+  late final DoodleIncomingController _doodleIncoming;
 
   Timer? _typingStop;
   Timer? _recordTicker;
@@ -57,14 +105,12 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   int? _highlightedMessageId;
   Timer? _highlightTimer;
 
-  /// Tracks transcript growth so new messages can follow the bottom.
+  /// Set once the user closes the anniversary-day banner, so it stays gone for
+  /// this visit instead of springing back on every rebuild.
+  bool _anniversaryBannerDismissed = false;
+
+  /// Tracks transcript growth so arrivals can be told apart from older pages.
   int _knownMessageCount = 0;
-
-  /// Keyboard height last seen, so the transcript can shift by the difference.
-  double _lastBottomInset = 0;
-
-  /// True when the keyboard opened while the newest message was in view.
-  bool _keyboardShouldHoldBottom = false;
 
   @override
   void initState() {
@@ -72,62 +118,46 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     _appState = context.read<AppState>();
     _appState.setActiveConversation(widget.conversation.id);
     _scroll.addListener(_onScroll);
-    WidgetsBinding.instance.addObserver(this);
-    _openAtLatestMessage();
-  }
-
-  /// Keeps the messages above the keyboard instead of behind it.
-  ///
-  /// The transcript is anchored at the top, so shrinking the viewport hides
-  /// whatever sat at the bottom. Adding the height the keyboard just claimed to
-  /// the scroll offset slides the same messages back into view, the way every
-  /// other chat app behaves.
-  @override
-  void didChangeMetrics() {
-    super.didChangeMetrics();
-    // MediaQuery is only updated once the new metrics have been laid out.
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!mounted) return;
-      final inset = MediaQuery.viewInsetsOf(context).bottom;
-      final delta = inset - _lastBottomInset;
-      if (delta == 0) return;
-
-      if (_lastBottomInset == 0 && delta > 0) {
-        // Only snap to the newest message when it was already the one on
-        // screen; mid-history reading keeps its exact place instead.
-        _keyboardShouldHoldBottom = !_scroll.hasClients ||
-            _scroll.position.maxScrollExtent - _scroll.position.pixels < 48;
-      }
-      _lastBottomInset = inset;
-      if (inset == 0) {
-        _keyboardShouldHoldBottom = false;
-        return;
-      }
-      if (delta < 0 || !_scroll.hasClients) return;
-
-      final position = _scroll.position;
-      final target = _keyboardShouldHoldBottom
-          ? position.maxScrollExtent
-          : (position.pixels + delta).clamp(0.0, position.maxScrollExtent);
-      if (target != position.pixels) _scroll.jumpTo(target);
+    // A nudge that lands in this chat while it's open plays the wave here (the
+    // haptic already fired in AppState, for every screen).
+    _nudgeSub = _appState.nudges.listen((n) {
+      if (!mounted || n.conversationId != widget.conversation.id) return;
+      _nudgeOverlay.play(
+        glyph: n.variant.emoji,
+        caption: n.caption,
+      );
     });
+    _doodleIncoming = DoodleIncomingController(
+      conversationId: widget.conversation.id,
+    );
+    _doodleSub = _appState.doodleRelay.listen(_onDoodleRelay);
+    _appState.addListener(_onAppStateChanged);
+    _restoreDraft();
+    _openConversation();
   }
 
-  Future<void> _openAtLatestMessage() async {
+  Future<void> _restoreDraft() async {
+    final draft = await DraftStore.getDraft(widget.conversation.id);
+    if (!mounted || draft == null || draft.isEmpty) return;
+    _text.text = draft;
+    _text.selection = TextSelection.collapsed(offset: draft.length);
+  }
+
+  /// Loads history. The transcript is anchored at the newest message by the
+  /// reversed list itself, so only a jump to a specific message needs work.
+  Future<void> _openConversation() async {
     try {
       await _appState.loadMessages(widget.conversation.id, initial: true);
       if (!mounted) return;
-      // One jump after layout, followed by two safeguards for image previews or
-      // other children whose final height settles in a later frame.
-      _jumpToEnd(animate: false);
-      await Future<void>.delayed(const Duration(milliseconds: 80));
-      if (mounted) _jumpToEnd(animate: false);
-      await Future<void>.delayed(const Duration(milliseconds: 240));
-      if (mounted) _jumpToEnd(animate: false);
+      final target = widget.initialMessageId;
+      if (target != null) {
+        _openingConversation = false;
+        await _goToMessage(target);
+      }
     } catch (_) {
       // AppState already exposes load failures through its normal error UI.
     } finally {
-      _openingConversation = false;
+      if (mounted) _openingConversation = false;
     }
   }
 
@@ -136,12 +166,17 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     _typingStop?.cancel();
     _recordTicker?.cancel();
     _highlightTimer?.cancel();
+    _nudgeSub?.cancel();
+    _doodleSub?.cancel();
+    _appState.removeListener(_onAppStateChanged);
+    _endDoodleMode(sendEnd: false);
+    _nudgeOverlay.dispose();
     _appState.setActiveConversation(null);
     _appState.setTyping(widget.conversation.id, false);
     VoicePlayer.instance.stop();
-    WidgetsBinding.instance.removeObserver(this);
     _text.dispose();
     _searchQuery.dispose();
+    _composerFocus.dispose();
     _scroll.removeListener(_onScroll);
     _scroll.dispose();
     _recorder.dispose();
@@ -150,12 +185,16 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
   void _onScroll() {
     if (!_scroll.hasClients) return;
-    if (!_openingConversation && _scroll.position.pixels <= 40) {
+    final position = _scroll.position;
+
+    if (!_openingConversation &&
+        shouldLoadOlder(
+          pixels: position.pixels,
+          maxScrollExtent: position.maxScrollExtent,
+        )) {
       _appState.loadOlder(widget.conversation.id);
     }
-    final distanceFromBottom =
-        _scroll.position.maxScrollExtent - _scroll.position.pixels;
-    final shouldShow = distanceFromBottom > 320;
+    final shouldShow = shouldShowJumpToLatest(position.pixels);
     if (shouldShow != _showJumpToLatest) {
       setState(() => _showJumpToLatest = shouldShow);
     }
@@ -168,6 +207,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     _typingStop = Timer(const Duration(seconds: 2), () {
       state.setTyping(widget.conversation.id, false);
     });
+    unawaited(DraftStore.setDraft(widget.conversation.id, value));
   }
 
   void _showMessage(String message) {
@@ -194,6 +234,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     _text.clear();
     setState(() => _replyTo = null);
     state.setTyping(widget.conversation.id, false);
+    unawaited(DraftStore.clearDraft(widget.conversation.id));
+    HapticFeedback.lightImpact();
 
     // Not awaited before scrolling: sendText adds the message to the transcript
     // synchronously, so the chat can jump to it now instead of after the round
@@ -207,53 +249,165 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     await _guard(() => sending);
   }
 
+  /// Moves to the newest message, which in a reversed list is offset zero.
   void _jumpToEnd({bool animate = true}) {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!_scroll.hasClients) return;
-      final target = _scroll.position.maxScrollExtent;
       if (animate) {
         _scroll.animateTo(
-          target,
+          newestMessageOffset,
           duration: const Duration(milliseconds: 260),
           curve: Curves.easeOutCubic,
         );
       } else {
-        _scroll.jumpTo(target);
+        _scroll.jumpTo(newestMessageOffset);
       }
     });
   }
 
   bool get _isNearBottom {
     if (!_scroll.hasClients) return true;
-    return _scroll.position.maxScrollExtent - _scroll.position.pixels < 320;
+    return isAtNewest(_scroll.position.pixels);
   }
 
-  /// Keeps the newest message in view as the transcript grows, but only while
-  /// already at the bottom — nobody wants to be yanked out of older history.
+  /// Handles a transcript that grew.
+  ///
+  /// Reading the newest messages follows them down. Reading older history keeps
+  /// its place instead: an arrival is added at the anchored end, which pushes
+  /// everything else away from it, so the offset is moved by the same amount.
   void _followNewMessages(int messageCount) {
     if (messageCount == _knownMessageCount) return;
     final grew = messageCount > _knownMessageCount;
     _knownMessageCount = messageCount;
     if (!grew || _openingConversation) return;
-    if (_isNearBottom) _jumpToEnd(animate: false);
+    if (_isNearBottom) {
+      _jumpToEnd(animate: false);
+      return;
+    }
+    if (!_scroll.hasClients) return;
+    final extentBefore = _scroll.position.maxScrollExtent;
+    final pixelsBefore = _scroll.position.pixels;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || !_scroll.hasClients) return;
+      final position = _scroll.position;
+      final target = offsetAfterGrowth(
+        pixels: pixelsBefore,
+        extentDelta: position.maxScrollExtent - extentBefore,
+        maxScrollExtent: position.maxScrollExtent,
+      );
+      if (target != position.pixels) _scroll.jumpTo(target);
+    });
   }
 
-  Future<void> _upload(File file, String type) async {
-    final replyTo = _replyTo;
-    if (replyTo != null) setState(() => _replyTo = null);
+  void _jumpToLatestPressed() => _jumpToEnd(animate: true);
+
+  Future<void> _upload(
+    File file,
+    String type, {
+    String? caption,
+    ChatMessage? replyTo,
+  }) async {
+    final quote = replyTo ?? _replyTo;
+    if (_replyTo != null) setState(() => _replyTo = null);
     final sending = context.read<AppState>().uploadFile(
       conversationId: widget.conversation.id,
       file: file,
       type: type,
-      replyTo: replyTo,
+      caption: caption,
+      replyTo: quote,
     );
     _jumpToEnd(animate: false);
     await _guard(() => sending);
     _jumpToEnd(animate: false);
   }
 
+  /// Caps a batch, opens the review screen, then uploads with an optional caption.
+  Future<void> _reviewAndUpload(
+    List<File> files,
+    String defaultType, {
+    String? initialCaption,
+  }) async {
+    var batch = files;
+    if (batch.length > AppState.maxAttachmentsPerSend) {
+      batch = batch.sublist(0, AppState.maxAttachmentsPerSend);
+      _showMessage(
+        'You can send ${AppState.maxAttachmentsPerSend} at a time; '
+        'the first ${AppState.maxAttachmentsPerSend} were queued.',
+      );
+    }
+    final review = await MediaReviewScreen.open(
+      context,
+      files: batch,
+      defaultType: defaultType,
+      initialCaption: initialCaption,
+    );
+    if (review == null || !mounted || review.files.isEmpty) return;
+
+    final replyTo = _replyTo;
+    if (replyTo != null) setState(() => _replyTo = null);
+
+    if (review.files.length == 1) {
+      final file = review.files.first;
+      await _upload(
+        file,
+        AppState.attachmentTypeFor(file.path),
+        caption: review.caption,
+        replyTo: replyTo,
+      );
+      return;
+    }
+
+    final sending = _appState.uploadFiles(
+      conversationId: widget.conversation.id,
+      files: review.files,
+      type: defaultType,
+      typeOf: (file) => AppState.attachmentTypeFor(file.path),
+      caption: review.caption,
+      replyTo: replyTo,
+    );
+    _jumpToEnd(animate: false);
+    await _guard(() => sending);
+    if (mounted) _jumpToEnd(animate: false);
+  }
+
   void _startReply(ChatMessage message) {
     setState(() => _replyTo = message);
+    _raiseKeyboardForReply();
+  }
+
+  /// Double-tapping the chat background pokes the other side, Hike-style.
+  ///
+  /// The wave and buzz only play when the nudge actually goes out; a rapid
+  /// second tap is inside the cooldown and is swallowed silently rather than
+  /// buzzing for a poke the server will drop.
+  void _sendNudge() {
+    if (!_appState.sendChatNudge(widget.conversation.id)) return;
+    final record = _appState.nudgesByConv[widget.conversation.id]?.firstOrNull;
+    final caption = record != null ? _appState.nudgeCaptionFor(record) : null;
+    HapticFeedback.mediumImpact();
+    _nudgeOverlay.play(caption: caption);
+  }
+
+  /// Opens the keyboard for a reply the user started by swiping.
+  ///
+  /// Focus is asked for after the frame that inserts the draft bar, because the
+  /// reply fires mid-swipe and the composer moves down a slot as it appears.
+  ///
+  /// Focus alone is not enough on Android: the field can hold focus while the
+  /// IME stays hidden, which is what left the user tapping the field to type.
+  /// requestFocus is also a no-op when the field is already focused — after the
+  /// keyboard was dismissed with the back button, say. So the platform is asked
+  /// to show the keyboard outright, rather than assuming focus implies it.
+  void _raiseKeyboardForReply() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      _composerFocus.requestFocus();
+      // A beat later, so the field has attached to the platform input first.
+      Future<void>.delayed(const Duration(milliseconds: 60), () {
+        if (!mounted || !_composerFocus.hasFocus) return;
+        SystemChannels.textInput.invokeMethod<void>('TextInput.show');
+      });
+    });
   }
 
   /// Scrolls to a quoted message and flashes it.
@@ -283,8 +437,13 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
     if (!await _ensureVisible(messageId)) {
       if (_scroll.hasClients && messages.length > 1) {
-        final ratio = index / (messages.length - 1);
-        _scroll.jumpTo(ratio * _scroll.position.maxScrollExtent);
+        _scroll.jumpTo(
+          approximateOffsetForIndex(
+            index: index,
+            messageCount: messages.length,
+            maxScrollExtent: _scroll.position.maxScrollExtent,
+          ),
+        );
         await Future<void>.delayed(const Duration(milliseconds: 16));
         await _ensureVisible(messageId);
       }
@@ -293,9 +452,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
   Future<void> _openSharedMedia(Conversation conv) async {
     final messageId = await Navigator.of(context).push<int>(
-      MaterialPageRoute(
-        builder: (_) => SharedMediaScreen(conversation: conv),
-      ),
+      MaterialPageRoute(builder: (_) => SharedMediaScreen(conversation: conv)),
     );
     if (!mounted || messageId == null) return;
     await _goToMessage(messageId);
@@ -306,7 +463,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     if (target == null) return false;
     await Scrollable.ensureVisible(
       target,
-      alignment: 0.3,
+      // Centred, because alignment is measured from the leading edge and this
+      // list leads at the bottom; a third of the way up would sit oddly low.
+      alignment: 0.5,
       duration: const Duration(milliseconds: 220),
       curve: Curves.easeOutCubic,
     );
@@ -327,21 +486,33 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   GlobalKey _keyFor(int messageId) =>
       _messageKeys.putIfAbsent(messageId, GlobalKey.new);
 
-  Future<void> _pickImage(ImageSource source) async {
+  /// Camera capture — always a single shot, then the review step.
+  Future<void> _pickCameraImage() async {
     final picked = await ImagePicker().pickImage(
-      source: source,
+      source: ImageSource.camera,
       imageQuality: 85,
       maxWidth: 2048,
     );
     if (picked == null || !mounted) return;
-    await _upload(File(picked.path), 'image');
+    await _reviewAndUpload([File(picked.path)], 'image');
   }
 
-  Future<void> _pickFile() async {
-    final result = await FilePicker.platform.pickFiles();
-    final path = result?.files.single.path;
-    if (path == null || !mounted) return;
-    await _upload(File(path), 'file');
+  /// Recent gallery grid — mixed photos and videos, numbered multi-select.
+  Future<void> _pickGalleryMedia() async {
+    final picked = await MediaPickerService.pickChatAttachments(context);
+    if (picked == null || picked.isEmpty || !mounted) return;
+    await _reviewAndUpload(picked, 'image');
+  }
+
+  Future<void> _pickFiles() async {
+    final result = await FilePicker.platform.pickFiles(allowMultiple: true);
+    if (result == null || !mounted) return;
+    final files = [
+      for (final f in result.files)
+        if (f.path != null) File(f.path!),
+    ];
+    if (files.isEmpty) return;
+    await _reviewAndUpload(files, 'file');
   }
 
   Future<void> _openAttachmentSheet() async {
@@ -382,6 +553,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                   ),
                 ],
               ),
+              const SizedBox(height: 6),
+              // Space is shown here, at the moment of choosing what to send, so
+              // a big video can be reconsidered before it is on its way.
+              const StorageStrip(),
             ],
           ),
         ),
@@ -390,11 +565,11 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
     switch (choice) {
       case 'gallery':
-        await _pickImage(ImageSource.gallery);
+        await _pickGalleryMedia();
       case 'camera':
-        await _pickImage(ImageSource.camera);
+        await _pickCameraImage();
       case 'file':
-        await _pickFile();
+        await _pickFiles();
     }
   }
 
@@ -457,7 +632,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                     name: state.nameForMember(member),
                     seed: member.userId,
                     radius: 20,
-                    online: state.onlineByUser[member.userId] ?? member.isOnline,
+                    imageUrl: state.avatarUrlFor(member.userId),
+                    imageHeaders: state.api.imageAuthHeaders,
+                    online:
+                        state.onlineByUser[member.userId] ?? member.isOnline,
                   ),
                   title: Text(state.nameForMember(member)),
                   subtitle: Text(
@@ -467,8 +645,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                   ),
                   trailing: member.role == 'admin'
                       ? const Chip(label: Text('Admin'))
-                      : const Icon(Icons.drive_file_rename_outline_rounded,
-                          size: 18),
+                      : const Icon(
+                          Icons.drive_file_rename_outline_rounded,
+                          size: 18,
+                        ),
                   onTap: member.userId == state.me?.id
                       ? null
                       : () {
@@ -494,25 +674,57 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     return 'User';
   }
 
-  String _subtitleFor(Conversation conv, AppState state, bool typing) {
-    if (typing) return 'typing…';
+  String _subtitleFor(Conversation conv, AppState state) {
+    final typing = state.typingLabelFor(conv);
+    if (typing != null) return typing;
     if (conv.type == 'group') return '${conv.members.length} members';
     final peer = conv.peer;
     if (peer == null) return '';
     if (state.onlineByUser[peer.id] ?? peer.isOnline) return 'online';
     final seen = state.lastSeenByUser[peer.id] ?? peer.lastSeenAt;
-    if (seen == null) return 'offline';
+    if (seen == null) return '';
     return formatLastSeen(context, seen);
   }
 
-  Future<void> _renamePeer(Conversation conv) async {
-    final peer = conv.peer;
-    if (peer == null) return;
-    await showRenameContactDialog(
-      context,
-      username: peer.username,
-      serverName: peer.displayName,
+  String? _moodLine(Conversation conv, AppState state) {
+    // Mood is secondary: never replace typing/online/last-seen.
+    if (state.typingLabelFor(conv) != null) return null;
+    final mood = conv.peer?.mood?.trim();
+    if (mood == null || mood.isEmpty) return null;
+    return mood;
+  }
+
+  /// Shows the other person's (or the group's) photo full screen.
+  void _viewAvatar(Conversation conv, String title, AppState state) {
+    final isDm = conv.type == 'dm';
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => AvatarViewerScreen(
+          name: title,
+          seed: isDm ? (conv.peer?.id ?? conv.id) : conv.id,
+          imageUrl: isDm ? state.avatarUrlFor(conv.peer?.id) : null,
+          imageHeaders: state.api.imageAuthHeaders,
+        ),
+      ),
     );
+  }
+
+  Future<void> _openContactProfile(Conversation conv) async {
+    if (conv.type == 'group') {
+      _showGroupMembers(conv);
+      return;
+    }
+    final action = await Navigator.of(context).push<String>(
+      MaterialPageRoute(
+        builder: (_) => ContactProfileScreen(conversation: conv),
+      ),
+    );
+    if (!mounted || action == null) return;
+    if (action == 'voice') {
+      await _startCall(conv, video: false);
+    } else if (action == 'video') {
+      await _startCall(conv, video: true);
+    }
   }
 
   Future<void> _searchInChat(Conversation conv, String query) async {
@@ -592,6 +804,114 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     }
   }
 
+  void _onDoodleRelay(DoodleRelayUpdate update) {
+    if (!mounted || update.conversationId != widget.conversation.id) return;
+    _doodleIncoming.apply(update);
+  }
+
+  void _onAppStateChanged() {
+    if (!_appState.realtimeConnected) {
+      _doodleIncoming.clearOnDisconnect();
+    }
+  }
+
+  void _startDoodleMode() {
+    if (_doodleMode) return;
+    setState(() {
+      _doodleMode = true;
+      _doodleSending = false;
+      _doodleCanvasSize = null;
+      _doodleDraw = DoodleDrawController(
+        conversationId: widget.conversation.id,
+        send: _appState.realtime.send,
+      );
+    });
+  }
+
+  Future<void> _sendDoodle() async {
+    final draw = _doodleDraw;
+    if (draw == null || _doodleSending) return;
+    if (draw.session.visibleStrokes().isEmpty) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Draw something before sending.')),
+        );
+      }
+      return;
+    }
+    final canvas = _doodleCanvasSize;
+    if (canvas == null || canvas.width <= 0 || canvas.height <= 0) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Could not capture the drawing canvas.')),
+        );
+      }
+      return;
+    }
+    setState(() => _doodleSending = true);
+    File? tempFile;
+    try {
+      final png = await exportDoodlePng(
+        strokes: draw.session.visibleStrokes(),
+        canvasWidth: canvas.width,
+        canvasHeight: canvas.height,
+      );
+      final dir = await getTemporaryDirectory();
+      tempFile = File(
+        '${dir.path}/doodle_${DateTime.now().millisecondsSinceEpoch}.png',
+      );
+      await tempFile.writeAsBytes(png, flush: true);
+      await _appState.uploadFile(
+        conversationId: widget.conversation.id,
+        file: tempFile,
+        type: 'doodle',
+        replyTo: _replyTo,
+      );
+      if (_replyTo != null && mounted) {
+        setState(() => _replyTo = null);
+      }
+      _endDoodleMode(sendEnd: true, fromSend: true);
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(friendlyMessage(e))),
+        );
+      }
+    } finally {
+      if (tempFile != null) {
+        try {
+          if (await tempFile.exists()) await tempFile.delete();
+        } catch (_) {}
+      }
+      if (mounted) setState(() => _doodleSending = false);
+    }
+  }
+
+  void _endDoodleMode({required bool sendEnd, bool fromSend = false}) {
+    final draw = _doodleDraw;
+    if (draw != null) {
+      final available = doodleRelayAvailable(
+        realtimeConnected: _appState.realtimeConnected,
+      );
+      if (sendEnd) {
+        if (fromSend) {
+          draw.sendDrawing(relayAvailable: available);
+        } else {
+          draw.cancel(relayAvailable: available);
+        }
+      } else {
+        draw.dispose(relayAvailable: available);
+      }
+    }
+    _doodleDraw = null;
+    _doodleIncoming.clearOnDisconnect();
+    if (_doodleMode && mounted) {
+      setState(() => _doodleMode = false);
+    } else {
+      _doodleMode = false;
+    }
+  }
+
   Future<void> _onChatMenuSelected(String value, Conversation conv) async {
     final state = context.read<AppState>();
     switch (value) {
@@ -605,14 +925,366 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         await state.togglePin(conv.id);
       case 'mute':
         await state.toggleMute(conv.id);
-      case 'rename':
-        await _renamePeer(conv);
+      case 'wallpaper':
+        await _openWallpaperSheet(conv);
+      case 'nudge':
+        await _openNudgeSheet(conv);
+      case 'nudge_history':
+        if (!mounted) return;
+        await Navigator.push(
+          context,
+          MaterialPageRoute<void>(
+            builder: (_) => NudgeHistoryScreen(conversation: conv),
+          ),
+        );
+      case 'doodle':
+        _startDoodleMode();
+      case 'disappearing':
+        await _openDisappearingSheet(conv);
+      case 'anniversary':
+        await _pickAnniversary(conv);
+      case 'couple':
+        await _openCoupleDetails(conv);
+      case 'voice_call':
+        await _startCall(conv, video: false);
+      case 'video_call':
+        await _startCall(conv, video: true);
     }
   }
 
-  List<PopupMenuEntry<String>> _chatMenuItems(AppState state, Conversation conv) {
+  Future<void> _startCall(Conversation conv, {required bool video}) async {
+    final state = context.read<AppState>();
+    try {
+      await state.calls.startOutgoing(
+        conversationId: conv.id,
+        media: video ? 'video' : 'audio',
+        peerName: state.titleFor(conv),
+        peerUserId: conv.peer?.id,
+      );
+      if (!mounted) return;
+      await presentCallScreen(context);
+    } catch (e) {
+      if (mounted) _showMessage(friendlyMessage(e));
+    }
+  }
+
+  /// Lets the user pick a nudge flavour (wave, poke, hug, kiss) to send.
+  Future<void> _openNudgeSheet(Conversation conv) async {
+    final variant = await showModalBottomSheet<NudgeVariant>(
+      context: context,
+      showDragHandle: true,
+      builder: (sheetContext) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            for (final v in NudgeVariant.values)
+              ListTile(
+                leading: Text(v.emoji, style: const TextStyle(fontSize: 24)),
+                title: Text('${v.name[0].toUpperCase()}${v.name.substring(1)}'),
+                onTap: () => Navigator.pop(sheetContext, v),
+              ),
+            const SizedBox(height: 8),
+          ],
+        ),
+      ),
+    );
+    if (variant == null || !mounted) return;
+    if (_appState.sendChatNudge(conv.id, variant: variant.id)) {
+      final record = _appState.nudgesByConv[conv.id]?.firstOrNull;
+      final caption = record != null ? _appState.nudgeCaptionFor(record) : null;
+      variant.playHaptic();
+      _nudgeOverlay.play(glyph: variant.emoji, caption: caption);
+    } else {
+      _snack('Wait a moment before nudging again.');
+    }
+  }
+
+  void _snack(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text(message)));
+  }
+
+  /// WhatsApp-style disappearing-message presets.
+  Future<void> _openDisappearingSheet(Conversation conv) async {
+    final live = _appState.conversationById(conv.id) ?? conv;
+    final current = live.disappearAfterSeconds;
+    final choice = await showModalBottomSheet<int>(
+      context: context,
+      showDragHandle: true,
+      builder: (sheetContext) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Padding(
+              padding: EdgeInsets.fromLTRB(16, 0, 16, 8),
+              child: Align(
+                alignment: Alignment.centerLeft,
+                child: Text(
+                  'New messages will vanish after the chosen time for everyone.',
+                ),
+              ),
+            ),
+            for (final option in const [
+              (0, 'Off'),
+              (86400, '24 hours'),
+              (604800, '7 days'),
+              (7776000, '90 days'),
+            ])
+              ListTile(
+                title: Text(option.$2),
+                trailing: (current ?? 0) == option.$1
+                    ? const Icon(Icons.check_rounded)
+                    : null,
+                onTap: () => Navigator.pop(sheetContext, option.$1),
+              ),
+            const SizedBox(height: 8),
+          ],
+        ),
+      ),
+    );
+    if (choice == null || !mounted) return;
+    await _guard(
+      () => _appState.setDisappearing(conv.id, choice == 0 ? null : choice),
+    );
+  }
+
+  /// Sets or clears a DM's anniversary date.
+  Future<void> _pickAnniversary(Conversation conv) async {
+    final live = _appState.conversationById(conv.id) ?? conv;
+    final existing = live.anniversaryOn == null
+        ? null
+        : DateTime.tryParse(live.anniversaryOn!);
+    final now = DateTime.now();
+    final picked = await showDatePicker(
+      context: context,
+      initialDate: existing ?? now,
+      firstDate: DateTime(now.year - 100),
+      lastDate: DateTime(now.year + 100, 12, 31),
+      helpText: 'Select your anniversary',
+    );
+    if (!mounted) return;
+    if (picked == null) return;
+    final iso =
+        '${picked.year.toString().padLeft(4, '0')}-'
+        '${picked.month.toString().padLeft(2, '0')}-'
+        '${picked.day.toString().padLeft(2, '0')}';
+    await _guard(() => _appState.setAnniversary(conv.id, iso));
+  }
+
+  /// A gentle, dismissible strip shown only on the anniversary day itself.
+  /// Returns null on every other day so the transcript stays uncluttered.
+  Widget? _anniversaryBanner(Conversation conv) {
+    if (conv.type != 'dm' || _anniversaryBannerDismissed) return null;
+    final countdown = anniversaryCountdown(conv.anniversaryOn);
+    if (countdown == null || !countdown.isToday) return null;
+    final scheme = Theme.of(context).colorScheme;
+    return Material(
+      color: scheme.primaryContainer,
+      child: SafeArea(
+        bottom: false,
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(16, 8, 8, 8),
+          child: Row(
+            children: [
+              const Text('🎉', style: TextStyle(fontSize: 20)),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Text(
+                  'Happy anniversary!',
+                  style: TextStyle(
+                    color: scheme.onPrimaryContainer,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
+              IconButton(
+                tooltip: 'Dismiss',
+                icon: Icon(
+                  Icons.close_rounded,
+                  color: scheme.onPrimaryContainer,
+                ),
+                onPressed: () =>
+                    setState(() => _anniversaryBannerDismissed = true),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// Sticky header of pinned messages with a tap-to-jump action.
+  Widget? _pinsBanner(AppState state, Conversation conv) {
+    final pins = state.pinsByConv[conv.id];
+    if (pins == null || pins.isEmpty) return null;
+    final scheme = Theme.of(context).colorScheme;
+    final top = pins.first;
+    final preview = AppState.messagePreview(top);
+    final extra = pins.length - 1;
+    return Material(
+      color: scheme.surfaceContainerHighest,
+      child: InkWell(
+        onTap: () => _goToMessage(top.id),
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
+          child: Row(
+            children: [
+              Icon(Icons.push_pin_rounded, size: 18, color: scheme.primary),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      extra > 0 ? 'Pinned · +$extra more' : 'Pinned message',
+                      style: TextStyle(
+                        fontSize: 11,
+                        fontWeight: FontWeight.w700,
+                        color: scheme.primary,
+                      ),
+                    ),
+                    Text(
+                      preview,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(fontSize: 13, color: scheme.onSurface),
+                    ),
+                  ],
+                ),
+              ),
+              Icon(Icons.chevron_right_rounded, color: scheme.outline),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _openCoupleDetails(Conversation conv) async {
+    final live = _appState.conversationById(conv.id) ?? conv;
+    final countdown = anniversaryCountdown(live.anniversaryOn);
+    final action = await showModalBottomSheet<String>(
+      context: context,
+      showDragHandle: true,
+      builder: (sheetContext) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const ListTile(
+              leading: Icon(Icons.favorite_outline_rounded),
+              title: Text('Couple details'),
+            ),
+            if (live.streakDays > 0)
+              ListTile(
+                leading: const Text('🔥', style: TextStyle(fontSize: 22)),
+                title: Text('${live.streakDays}-day streak'),
+                subtitle: const Text(
+                  'A day counts when both of you send a message.',
+                ),
+              ),
+            ListTile(
+              leading: const Icon(Icons.event_rounded),
+              title: Text(
+                live.anniversaryOn == null
+                    ? 'Set anniversary'
+                    : countdown?.label ?? 'Anniversary',
+              ),
+              subtitle: live.anniversaryOn == null
+                  ? const Text('A private yearly month-and-day reminder')
+                  : Text(live.anniversaryOn!),
+              onTap: () => Navigator.pop(sheetContext, 'set'),
+            ),
+            if (live.anniversaryOn != null)
+              ListTile(
+                leading: const Icon(Icons.event_busy_outlined),
+                title: const Text('Clear anniversary'),
+                onTap: () => Navigator.pop(sheetContext, 'clear'),
+              ),
+          ],
+        ),
+      ),
+    );
+    if (!mounted) return;
+    if (action == 'set') {
+      await _pickAnniversary(live);
+    } else if (action == 'clear') {
+      await _guard(() => _appState.setAnniversary(live.id, null));
+    }
+  }
+
+  /// WhatsApp-style per-chat background: pick a photo, dim it, or clear it.
+  Future<void> _openWallpaperSheet(Conversation conv) async {
+    final choice = await showModalBottomSheet<String>(
+      context: context,
+      showDragHandle: true,
+      isScrollControlled: true,
+      // A Consumer keeps the dim slider and the Remove row in step as the
+      // wallpaper changes, so the sheet does not have to close to refresh.
+      builder: (sheetContext) => Consumer<AppState>(
+        builder: (_, state, _) {
+          final live = state.conversationById(conv.id) ?? conv;
+          final hasWallpaper = live.hasWallpaper;
+          return SafeArea(
+            child: Padding(
+              padding: const EdgeInsets.only(bottom: 12),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  ListTile(
+                    leading: const Icon(Icons.photo_library_rounded),
+                    title: Text(
+                      hasWallpaper ? 'Change wallpaper' : 'Choose from gallery',
+                    ),
+                    subtitle: const Text('Shared with everyone in this chat'),
+                    onTap: () => Navigator.pop(sheetContext, 'pick'),
+                  ),
+                  if (hasWallpaper) ...[
+                    ListTile(
+                      leading: const Icon(Icons.brightness_6_rounded),
+                      title: const Text('Dim'),
+                      subtitle: Slider(
+                        value: (live.wallpaperDim ?? 0.25).clamp(0.0, 0.8),
+                        max: 0.8,
+                        divisions: 8,
+                        label:
+                            '${((live.wallpaperDim ?? 0.25) * 100).round()}%',
+                        onChanged: (value) =>
+                            state.setChatWallpaperDim(conv.id, value),
+                      ),
+                    ),
+                    ListTile(
+                      leading: const Icon(Icons.delete_outline_rounded),
+                      title: const Text('Remove wallpaper'),
+                      onTap: () => Navigator.pop(sheetContext, 'remove'),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          );
+        },
+      ),
+    );
+    if (!mounted) return;
+    if (choice == 'remove') {
+      await _guard(() => _appState.clearChatWallpaper(conv.id));
+      return;
+    }
+    if (choice != 'pick') return;
+    final picked = await MediaPickerService.pickSingleGalleryImage(context);
+    if (picked == null || !mounted) return;
+    await _guard(() => _appState.setChatWallpaper(conv.id, picked));
+  }
+
+  List<PopupMenuEntry<String>> _chatMenuItems(
+    AppState state,
+    Conversation conv,
+  ) {
     final pinned = state.isPinned(conv.id);
     final muted = state.isMuted(conv.id);
+    final anniversary = anniversaryCountdown(conv.anniversaryOn);
     return [
       const PopupMenuItem(
         value: 'search',
@@ -665,24 +1337,82 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           title: Text(muted ? 'Unmute' : 'Mute'),
         ),
       ),
+      PopupMenuItem(
+        value: 'wallpaper',
+        child: ListTile(
+          dense: true,
+          contentPadding: EdgeInsets.zero,
+          leading: const Icon(Icons.wallpaper_rounded),
+          title: const Text('Wallpaper'),
+        ),
+      ),
+      PopupMenuItem(
+        value: 'nudge',
+        child: ListTile(
+          dense: true,
+          contentPadding: EdgeInsets.zero,
+          leading: const Icon(Icons.waving_hand_rounded),
+          title: const Text('Send a nudge'),
+        ),
+      ),
+      PopupMenuItem(
+        value: 'nudge_history',
+        child: ListTile(
+          dense: true,
+          contentPadding: EdgeInsets.zero,
+          leading: const Icon(Icons.history_rounded),
+          title: const Text('Nudge history'),
+        ),
+      ),
+      const PopupMenuItem(
+        value: 'doodle',
+        child: ListTile(
+          dense: true,
+          contentPadding: EdgeInsets.zero,
+          leading: Icon(Icons.draw_rounded),
+          title: Text('Draw on chat'),
+        ),
+      ),
+      PopupMenuItem(
+        value: 'disappearing',
+        child: ListTile(
+          dense: true,
+          contentPadding: EdgeInsets.zero,
+          leading: const Icon(Icons.timer_outlined),
+          title: const Text('Disappearing messages'),
+          subtitle: Text(_disappearingLabel(conv.disappearAfterSeconds)),
+        ),
+      ),
       if (conv.type == 'dm')
         PopupMenuItem(
-          value: 'rename',
+          value: 'couple',
           child: ListTile(
             dense: true,
             contentPadding: EdgeInsets.zero,
-            leading: const Icon(Icons.drive_file_rename_outline_rounded),
+            leading: const Icon(Icons.favorite_outline_rounded),
             title: Text(
-              state.hasCustomName(conv.peer?.username)
-                  ? 'Change name'
-                  : 'Rename this person',
+              conv.streakDays > 0
+                  ? 'Couple details · ${conv.streakDays}-day streak'
+                  : 'Couple details',
             ),
-            subtitle: conv.peer == null
-                ? null
-                : Text('Really ${conv.peer!.displayName}'),
+            subtitle: anniversary == null ? null : Text(anniversary.label),
           ),
         ),
     ];
+  }
+
+  /// Human label for a disappearing timer, matching WhatsApp's presets.
+  static String _disappearingLabel(int? seconds) {
+    switch (seconds) {
+      case 86400:
+        return '24 hours';
+      case 604800:
+        return '7 days';
+      case 7776000:
+        return '90 days';
+      default:
+        return 'Off';
+    }
   }
 
   @override
@@ -694,161 +1424,276 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     )!;
     final messages = state.messagesByConv[conv.id] ?? const <ChatMessage>[];
     _followNewMessages(messages.length);
-    final typing = (state.typingUsers[conv.id] ?? const {}).isNotEmpty;
     final online = conv.type == 'dm' && conv.peer != null
         ? (state.onlineByUser[conv.peer!.id] ?? false)
         : null;
     final scheme = Theme.of(context).colorScheme;
     final title = state.titleFor(conv);
+    final presence = _subtitleFor(conv, state);
+    final mood = _moodLine(conv, state);
+    final typing = (state.typingUsers[conv.id] ?? const {}).isNotEmpty;
 
-    return Scaffold(
-      backgroundColor: AppColors.chatCanvasFor(context),
-      appBar: AppBar(
-        leading: _searching
-            ? IconButton(
-                tooltip: 'Cancel search',
-                icon: const Icon(Icons.arrow_back_rounded),
-                onPressed: () => setState(() {
-                  _searching = false;
-                  _searchQuery.clear();
-                }),
-              )
-            : null,
-        titleSpacing: _searching ? 0 : null,
-        title: _searching
-            ? TextField(
-                controller: _searchQuery,
-                autofocus: true,
-                textInputAction: TextInputAction.search,
-                decoration: const InputDecoration(
-                  hintText: 'Search in chat',
-                  border: InputBorder.none,
-                  isDense: true,
+    return PopScope(
+      canPop: false,
+      onPopInvokedWithResult: (didPop, _) {
+        if (didPop) return;
+        popChatToInbox(Navigator.of(context));
+      },
+      child: Scaffold(
+        backgroundColor: AppColors.chatCanvasFor(context),
+        appBar: AppBar(
+          leading: _searching
+              ? IconButton(
+                  tooltip: 'Cancel search',
+                  icon: const Icon(Icons.arrow_back_rounded),
+                  onPressed: () => setState(() {
+                    _searching = false;
+                    _searchQuery.clear();
+                  }),
+                )
+              : IconButton(
+                  tooltip: 'Back to chats',
+                  icon: const Icon(Icons.arrow_back_rounded),
+                  onPressed: () => popChatToInbox(Navigator.of(context)),
                 ),
-                onSubmitted: (value) => _searchInChat(conv, value),
-              )
-            : InkWell(
-                onTap: conv.type == 'group'
-                    ? () => _showGroupMembers(conv)
-                    : () => _renamePeer(conv),
-                child: Row(
-                  children: [
-                    Avatar(
-                      name: title,
-                      seed: conv.type == 'dm'
-                          ? (conv.peer?.id ?? conv.id)
-                          : conv.id,
-                      radius: 19,
-                      online: online,
-                      badge: conv.type == 'group' ? Icons.group_rounded : null,
-                    ),
-                    const SizedBox(width: 12),
-                    Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(
-                            title,
-                            style: const TextStyle(
-                              fontSize: 16.5,
-                              fontWeight: FontWeight.w700,
-                            ),
-                            overflow: TextOverflow.ellipsis,
-                          ),
-                          Text(
-                            _subtitleFor(conv, state, typing),
-                            style: TextStyle(
-                              fontSize: 12,
-                              fontWeight: FontWeight.w500,
-                              color: typing
-                                  ? scheme.primary
-                                  : (online == true
-                                        ? AppColors.online
-                                        : scheme.onSurfaceVariant),
-                            ),
-                            overflow: TextOverflow.ellipsis,
-                          ),
-                        ],
+          titleSpacing: _searching ? 0 : null,
+          title: _searching
+              ? TextField(
+                  controller: _searchQuery,
+                  autofocus: true,
+                  textInputAction: TextInputAction.search,
+                  decoration: const InputDecoration(
+                    hintText: 'Search in chat',
+                    border: InputBorder.none,
+                    isDense: true,
+                  ),
+                  onSubmitted: (value) => _searchInChat(conv, value),
+                )
+              : InkWell(
+                  onTap: () => _openContactProfile(conv),
+                  child: Row(
+                    children: [
+                      GestureDetector(
+                        // The photo itself opens full screen; the name beside it
+                        // opens the contact profile.
+                        onTap: () => _viewAvatar(conv, title, state),
+                        child: Avatar(
+                          name: title,
+                          seed: conv.type == 'dm'
+                              ? (conv.peer?.id ?? conv.id)
+                              : conv.id,
+                          radius: 19,
+                          online: online,
+                          badge: conv.type == 'group'
+                              ? Icons.group_rounded
+                              : null,
+                          imageUrl: conv.type == 'dm'
+                              ? state.avatarUrlFor(conv.peer?.id)
+                              : null,
+                          imageHeaders: state.api.imageAuthHeaders,
+                        ),
                       ),
-                    ),
-                  ],
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              title,
+                              style: const TextStyle(
+                                fontSize: 16.5,
+                                fontWeight: FontWeight.w700,
+                              ),
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                            if (presence.isNotEmpty || mood != null)
+                              AnimatedSize(
+                                duration: const Duration(milliseconds: 180),
+                                curve: Curves.easeOut,
+                                alignment: Alignment.topLeft,
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    if (presence.isNotEmpty)
+                                      AnimatedSwitcher(
+                                        duration: const Duration(
+                                          milliseconds: 180,
+                                        ),
+                                        child: Semantics(
+                                          key: ValueKey(presence),
+                                          label: presence,
+                                          child: SingleChildScrollView(
+                                            scrollDirection: Axis.horizontal,
+                                            child: Text(
+                                              presence,
+                                              style: TextStyle(
+                                                fontSize: 12.5,
+                                                color:
+                                                    presence == 'typing…' ||
+                                                        presence.endsWith(
+                                                          'are typing…',
+                                                        )
+                                                    ? scheme.primary
+                                                    : scheme.onSurfaceVariant,
+                                              ),
+                                            ),
+                                          ),
+                                        ),
+                                      ),
+                                    if (mood != null)
+                                      Text(
+                                        mood,
+                                        style: TextStyle(
+                                          fontSize: 11.5,
+                                          color: scheme.onSurfaceVariant
+                                              .withValues(alpha: 0.9),
+                                          fontStyle: FontStyle.italic,
+                                        ),
+                                        overflow: TextOverflow.ellipsis,
+                                      ),
+                                  ],
+                                ),
+                              ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+          actions: [
+            if (_searching)
+              IconButton(
+                tooltip: 'Search',
+                icon: const Icon(Icons.search_rounded),
+                onPressed: () => _searchInChat(conv, _searchQuery.text),
+              )
+            else ...[
+              if (conv.type == 'dm') ...[
+                IconButton(
+                  tooltip: 'Voice call',
+                  onPressed: () => _startCall(conv, video: false),
+                  icon: const Icon(Icons.call_rounded),
+                ),
+                IconButton(
+                  tooltip: 'Video call',
+                  onPressed: () => _startCall(conv, video: true),
+                  icon: const Icon(Icons.videocam_rounded),
+                ),
+              ],
+              if (conv.type == 'group')
+                IconButton(
+                  tooltip: 'Members',
+                  onPressed: () => _showGroupMembers(conv),
+                  icon: const Icon(Icons.info_outline_rounded),
+                ),
+              PopupMenuButton<String>(
+                tooltip: 'More',
+                position: PopupMenuPosition.under,
+                onSelected: (value) => _onChatMenuSelected(value, conv),
+                itemBuilder: (_) => _chatMenuItems(state, conv),
+              ),
+            ],
+          ],
+        ),
+        body: Column(
+          children: [
+            ?_anniversaryBanner(conv),
+            ?_pinsBanner(state, conv),
+            Expanded(
+              child: ChatBackground(
+                imageUrl: state.wallpaperUrlFor(conv.id),
+                headers: state.api.imageAuthHeaders,
+                dim: state.wallpaperDimFor(conv.id),
+                // Double-tap anywhere on the transcript to nudge. Translucent so
+                // single taps, long-press menus, swipe-to-reply and scrolling all
+                // still reach the messages underneath.
+                child: GestureDetector(
+                  behavior: HitTestBehavior.translucent,
+                  onDoubleTap: _doodleMode ? null : _sendNudge,
+                  child: Stack(
+                    children: [
+                      if (messages.isEmpty)
+                        _EmptyConversation(title: title)
+                      else
+                        _MessageList(
+                          controller: _scroll,
+                          messages: messages,
+                          conversation: conv,
+                          meId: state.me?.id,
+                          typing: typing,
+                          senderNameOf: (id) => _senderName(state, conv, id),
+                          highlightedMessageId: _highlightedMessageId,
+                          keyFor: _keyFor,
+                          onReply: _startReply,
+                          onQuoteTap: _goToMessage,
+                        ),
+                      if (_showJumpToLatest)
+                        Positioned(
+                          right: 16,
+                          bottom: 12,
+                          child: _JumpToLatestButton(
+                            onTap: _jumpToLatestPressed,
+                          ),
+                        ),
+                      Positioned.fill(
+                        child: NudgeOverlay(controller: _nudgeOverlay),
+                      ),
+                      if (_doodleMode && _doodleDraw != null)
+                        Positioned.fill(
+                          child: DoodleOverlay(
+                            draw: _doodleDraw!,
+                            incoming: _doodleIncoming,
+                            relayAvailable: doodleRelayAvailable(
+                              realtimeConnected: state.realtimeConnected,
+                            ),
+                            onCancel: () => _endDoodleMode(sendEnd: true),
+                            onSend: _sendDoodle,
+                            onClose: () => _endDoodleMode(sendEnd: true),
+                            sending: _doodleSending,
+                            onCanvasSize: (size) => _doodleCanvasSize = size,
+                          ),
+                        ),
+                    ],
+                  ),
                 ),
               ),
-        actions: [
-          if (_searching)
-            IconButton(
-              tooltip: 'Search',
-              icon: const Icon(Icons.search_rounded),
-              onPressed: () => _searchInChat(conv, _searchQuery.text),
-            )
-          else ...[
-            if (conv.type == 'group')
-              IconButton(
-                tooltip: 'Members',
-                onPressed: () => _showGroupMembers(conv),
-                icon: const Icon(Icons.info_outline_rounded),
+            ),
+            if (state.isUploadingMedia)
+              _UploadProgressBar(
+                done: state.mediaUploadDone,
+                total: state.mediaUploadTotal,
               ),
-            PopupMenuButton<String>(
-              tooltip: 'More',
-              position: PopupMenuPosition.under,
-              onSelected: (value) => _onChatMenuSelected(value, conv),
-              itemBuilder: (_) => _chatMenuItems(state, conv),
+            // Keys matter here. Inserting the draft bar above the composer shifts
+            // the composer down a slot, and without keys Flutter rebuilds it from
+            // scratch: the text field loses its platform input connection, so the
+            // keyboard stays shut even though the field holds focus.
+            if (_replyTo != null)
+              ReplyDraftBar(
+                key: const ValueKey('reply-draft'),
+                quote: QuotedMessage.fromMessage(_replyTo!),
+                senderName: _replyTo!.senderId == state.me?.id
+                    ? 'You'
+                    : _senderName(state, conv, _replyTo!.senderId),
+                accent: _replyTo!.senderId == state.me?.id
+                    ? AppColors.brand
+                    : senderColor(_replyTo!.senderId),
+                onCancel: () => setState(() => _replyTo = null),
+              ),
+            _Composer(
+              key: const ValueKey('composer'),
+              controller: _text,
+              focusNode: _composerFocus,
+              recording: _recording,
+              recordedFor: _recorded,
+              onChanged: _onTypingChanged,
+              onSend: _send,
+              onAttach: _openAttachmentSheet,
+              onStartRecording: _startRecording,
+              onStopRecording: () => _finishRecording(send: true),
+              onCancelRecording: () => _finishRecording(send: false),
             ),
           ],
-        ],
-      ),
-      body: Column(
-        children: [
-          Expanded(
-            child: Stack(
-              children: [
-                if (messages.isEmpty)
-                  _EmptyConversation(title: title)
-                else
-                  _MessageList(
-                    controller: _scroll,
-                    messages: messages,
-                    conversation: conv,
-                    meId: state.me?.id,
-                    typing: typing,
-                    senderNameOf: (id) => _senderName(state, conv, id),
-                    highlightedMessageId: _highlightedMessageId,
-                    keyFor: _keyFor,
-                    onReply: _startReply,
-                    onQuoteTap: _goToMessage,
-                  ),
-                if (_showJumpToLatest)
-                  Positioned(
-                    right: 16,
-                    bottom: 12,
-                    child: _JumpToLatestButton(onTap: () => _jumpToEnd()),
-                  ),
-              ],
-            ),
-          ),
-          if (_replyTo != null)
-            ReplyDraftBar(
-              quote: QuotedMessage.fromMessage(_replyTo!),
-              senderName: _replyTo!.senderId == state.me?.id
-                  ? 'You'
-                  : _senderName(state, conv, _replyTo!.senderId),
-              accent: _replyTo!.senderId == state.me?.id
-                  ? AppColors.brand
-                  : senderColor(_replyTo!.senderId),
-              onCancel: () => setState(() => _replyTo = null),
-            ),
-          _Composer(
-            controller: _text,
-            recording: _recording,
-            recordedFor: _recorded,
-            onChanged: _onTypingChanged,
-            onSend: _send,
-            onAttach: _openAttachmentSheet,
-            onStartRecording: _startRecording,
-            onStopRecording: () => _finishRecording(send: true),
-            onCancelRecording: () => _finishRecording(send: false),
-          ),
-        ],
+        ),
       ),
     );
   }
@@ -887,14 +1732,27 @@ class _MessageList extends StatelessWidget {
   Widget build(BuildContext context) {
     return ListView.builder(
       controller: controller,
+      // Built bottom-up: the newest message is the anchor, so opening a chat
+      // needs no catch-up scroll and a late-loading image cannot shift it.
+      reverse: true,
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
-      itemCount: messages.length + (typing ? 1 : 0),
+      itemCount: transcriptItemCount(
+        messageCount: messages.length,
+        typing: typing,
+      ),
       itemBuilder: (context, index) {
-        if (index == messages.length) return const _TypingBubble();
+        final messageIndex = transcriptMessageIndex(
+          itemIndex: index,
+          messageCount: messages.length,
+          typing: typing,
+        );
+        if (messageIndex == null) return const _TypingBubble();
 
-        final msg = messages[index];
-        final previous = index == 0 ? null : messages[index - 1];
-        final next = index == messages.length - 1 ? null : messages[index + 1];
+        final msg = messages[messageIndex];
+        final previous = messageIndex == 0 ? null : messages[messageIndex - 1];
+        final next = messageIndex == messages.length - 1
+            ? null
+            : messages[messageIndex + 1];
         final mine = msg.senderId == meId;
 
         final startsDay =
@@ -913,7 +1771,7 @@ class _MessageList extends StatelessWidget {
             Padding(
               key: keyFor(msg.id),
               padding: EdgeInsets.only(top: firstOfRun ? 8 : 2),
-              child:               SwipeToReply(
+              child: SwipeToReply(
                 // Pending messages have no server id yet, so there is nothing
                 // for the other side to quote.
                 enabled: !msg.pending && msg.id > 0 && !msg.isDeleted,
@@ -977,13 +1835,26 @@ class _MessageRow extends StatelessWidget {
   final VoidCallback? onQuoteTap;
   final VoidCallback? onReply;
 
-  Future<void> _showActions(BuildContext context) async {
-    if (message.isDeleted) return;
+  /// This account's current reaction on the message, or null.
+  String? get _myReaction {
+    for (final r in message.reactions) {
+      if (r.reactedByMe) return r.emoji;
+    }
+    return null;
+  }
 
+  Future<void> _showActions(BuildContext context) async {
+    if (message.isDeleted || message.isCallLog) return;
+
+    final state = context.read<AppState>();
+    final meId = state.me?.id;
     final isText = message.type == 'text';
     final canCopy = isText && (message.body ?? '').trim().isNotEmpty;
-    final canEdit = mine && isText;
-    final canDelete = mine && isText;
+    // Editing is only offered inside the 15-minute trust window.
+    final canEdit = message.canEdit(meId);
+    final hasAttachActions = messageHasAttachmentActions(message);
+    // Delete for everyone is the sender's (or a group admin's) call; delete for
+    // me is always available so anyone can clear their own view.
 
     final action = await showModalBottomSheet<String>(
       context: context,
@@ -992,6 +1863,35 @@ class _MessageRow extends StatelessWidget {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
+            // WhatsApp-style quick reaction row at the top of the sheet.
+            Padding(
+              padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
+              child: ReactionBar(
+                myEmoji: _myReaction,
+                onPick: (emoji) => Navigator.pop(sheetContext, 'react:$emoji'),
+                onMore: () => Navigator.pop(sheetContext, 'react:more'),
+              ),
+            ),
+            const Divider(height: 1),
+            if (hasAttachActions) ...[
+              ListTile(
+                leading: const Icon(Icons.open_in_new_rounded),
+                title: const Text('Open'),
+                onTap: () => Navigator.pop(sheetContext, 'attach:open'),
+              ),
+              ListTile(
+                leading: const Icon(Icons.download_rounded),
+                title: const Text('Save to phone'),
+                subtitle: const Text('Choose where to keep this file'),
+                onTap: () => Navigator.pop(sheetContext, 'attach:save'),
+              ),
+              ListTile(
+                leading: const Icon(Icons.share_outlined),
+                title: const Text('Share'),
+                onTap: () => Navigator.pop(sheetContext, 'attach:share'),
+              ),
+              const Divider(height: 1),
+            ],
             if (onReply != null)
               ListTile(
                 leading: const Icon(Icons.reply_rounded),
@@ -1010,19 +1910,73 @@ class _MessageRow extends StatelessWidget {
                 title: const Text('Edit'),
                 onTap: () => Navigator.pop(sheetContext, 'edit'),
               ),
-            if (canDelete)
-              ListTile(
-                leading: const Icon(Icons.delete_outline_rounded),
-                title: const Text('Delete'),
-                onTap: () => Navigator.pop(sheetContext, 'delete'),
+            ListTile(
+              leading: Icon(
+                state.isMessagePinned(conversationId, message.id)
+                    ? Icons.push_pin_rounded
+                    : Icons.push_pin_outlined,
               ),
+              title: Text(
+                state.isMessagePinned(conversationId, message.id)
+                    ? 'Unpin'
+                    : 'Pin',
+              ),
+              onTap: () => Navigator.pop(
+                sheetContext,
+                state.isMessagePinned(conversationId, message.id)
+                    ? 'unpin'
+                    : 'pin',
+              ),
+            ),
+            ListTile(
+              leading: Icon(
+                state.isMessageStarred(message.id)
+                    ? Icons.star_rounded
+                    : Icons.star_outline_rounded,
+              ),
+              title: Text(
+                state.isMessageStarred(message.id) ? 'Unstar' : 'Star',
+              ),
+              onTap: () => Navigator.pop(
+                sheetContext,
+                state.isMessageStarred(message.id) ? 'unstar' : 'star',
+              ),
+            ),
+            ListTile(
+              leading: const Icon(Icons.delete_outline_rounded),
+              title: const Text('Delete'),
+              onTap: () => Navigator.pop(sheetContext, 'delete'),
+            ),
             const SizedBox(height: 8),
           ],
         ),
       ),
     );
 
-    if (!context.mounted) return;
+    if (action == null || !context.mounted) return;
+
+    if (action.startsWith('attach:')) {
+      final kind = action.substring('attach:'.length);
+      await runAttachmentAction(context, message, switch (kind) {
+        'open' => AttachmentAction.open,
+        'save' => AttachmentAction.save,
+        _ => AttachmentAction.share,
+      });
+      return;
+    }
+
+    if (action.startsWith('react:')) {
+      final choice = action.substring('react:'.length);
+      if (choice == 'more') {
+        final picked = await showReactionPicker(context);
+        if (picked != null && context.mounted) {
+          await _react(context, picked);
+        }
+      } else {
+        await _react(context, choice);
+      }
+      return;
+    }
 
     switch (action) {
       case 'reply':
@@ -1030,14 +1984,68 @@ class _MessageRow extends StatelessWidget {
       case 'copy':
         await Clipboard.setData(ClipboardData(text: message.body ?? ''));
         if (context.mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('Copied')),
-          );
+          ScaffoldMessenger.of(
+            context,
+          ).showSnackBar(const SnackBar(content: Text('Copied')));
         }
       case 'edit':
         await _editMessage(context);
+      case 'pin':
+        try {
+          await context.read<AppState>().pinMessage(message);
+        } catch (e) {
+          if (context.mounted) {
+            ScaffoldMessenger.of(
+              context,
+            ).showSnackBar(SnackBar(content: Text(friendlyMessage(e))));
+          }
+        }
+      case 'unpin':
+        try {
+          await context.read<AppState>().unpinMessage(message);
+        } catch (e) {
+          if (context.mounted) {
+            ScaffoldMessenger.of(
+              context,
+            ).showSnackBar(SnackBar(content: Text(friendlyMessage(e))));
+          }
+        }
+      case 'star':
+        try {
+          await context.read<AppState>().starMessage(message);
+        } catch (e) {
+          if (context.mounted) {
+            ScaffoldMessenger.of(
+              context,
+            ).showSnackBar(SnackBar(content: Text(friendlyMessage(e))));
+          }
+        }
+      case 'unstar':
+        try {
+          await context.read<AppState>().unstarMessage(message);
+        } catch (e) {
+          if (context.mounted) {
+            ScaffoldMessenger.of(
+              context,
+            ).showSnackBar(SnackBar(content: Text(friendlyMessage(e))));
+          }
+        }
       case 'delete':
         await _deleteMessage(context);
+    }
+  }
+
+  Future<void> _react(BuildContext context, String emoji) async {
+    try {
+      await context.read<AppState>().toggleReaction(message, emoji);
+      HapticFeedback.selectionClick();
+      unawaited(ReactionFreqStore.record(emoji));
+    } catch (e) {
+      if (context.mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(friendlyMessage(e))));
+      }
     }
   }
 
@@ -1079,39 +2087,57 @@ class _MessageRow extends StatelessWidget {
       );
     } catch (e) {
       if (context.mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text(friendlyMessage(e))),
-        );
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(friendlyMessage(e))));
       }
     }
   }
 
   Future<void> _deleteMessage(BuildContext context) async {
-    final confirmed = await showDialog<bool>(
+    // Delete for everyone is only meaningful for your own messages (the server
+    // also allows a group admin, but the common case is your own text). Delete
+    // for me is always available.
+    final scope = await showModalBottomSheet<String>(
       context: context,
-      builder: (dialogContext) => AlertDialog(
-        title: const Text('Delete message?'),
-        content: const Text('This message will be removed for everyone.'),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(dialogContext, false),
-            child: const Text('Cancel'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(dialogContext, true),
-            child: const Text('Delete'),
-          ),
-        ],
+      showDragHandle: true,
+      builder: (sheetContext) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            if (mine)
+              ListTile(
+                leading: const Icon(Icons.delete_forever_rounded),
+                title: const Text('Delete for everyone'),
+                onTap: () => Navigator.pop(sheetContext, 'everyone'),
+              ),
+            ListTile(
+              leading: const Icon(Icons.delete_outline_rounded),
+              title: const Text('Delete for me'),
+              onTap: () => Navigator.pop(sheetContext, 'me'),
+            ),
+            ListTile(
+              leading: const Icon(Icons.close_rounded),
+              title: const Text('Cancel'),
+              onTap: () => Navigator.pop(sheetContext),
+            ),
+            const SizedBox(height: 8),
+          ],
+        ),
       ),
     );
-    if (confirmed != true || !context.mounted) return;
+    if (scope == null || !context.mounted) return;
     try {
-      await context.read<AppState>().deleteMessage(conversationId, message);
+      await context.read<AppState>().deleteMessage(
+        conversationId,
+        message,
+        scope: scope,
+      );
     } catch (e) {
       if (context.mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text(friendlyMessage(e))),
-        );
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(friendlyMessage(e))));
       }
     }
   }
@@ -1120,7 +2146,18 @@ class _MessageRow extends StatelessWidget {
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
     final maxWidth = MediaQuery.of(context).size.width * 0.76;
-    final isPhoto = message.type == 'image' && !message.isDeleted;
+
+    // Call logs sit centred like WhatsApp's "Video call · 21 secs", not in a
+    // left/right bubble.
+    if (message.isCallLog) {
+      return _CallLogTile(message: message);
+    }
+    // Photos, videos, and drawings use edge-to-edge tiles; doodles stay bubble-free.
+    final isMediaTile =
+        (message.type == 'image' || message.type == 'video') &&
+        !message.isDeleted;
+    final isDoodleTile = message.type == 'doodle' && !message.isDeleted;
+    final isEdgeTile = isMediaTile || isDoodleTile;
 
     final footer = Row(
       mainAxisSize: MainAxisSize.min,
@@ -1128,15 +2165,15 @@ class _MessageRow extends StatelessWidget {
         Text(
           formatClockTime(context, message.createdAt),
           style: Theme.of(context).textTheme.labelSmall?.copyWith(
-            color: isPhoto ? Colors.white : scheme.outline,
+            color: isEdgeTile ? Colors.white : scheme.outline,
             fontSize: 11,
           ),
         ),
         if (mine) ...[
           const SizedBox(width: 4),
-          _Ticks(
+          ReceiptTicks(
             level: message.pending ? -1 : message.receiptLevel(),
-            onPhoto: isPhoto,
+            onPhoto: isEdgeTile,
           ),
         ],
       ],
@@ -1155,18 +2192,23 @@ class _MessageRow extends StatelessWidget {
         emojiWithoutBubble(emojiCount) &&
         quote == null &&
         !showSenderName;
+    final openActions = message.isDeleted || message.isCallLog
+        ? null
+        : () => _showActions(context);
 
     return Align(
       alignment: mine ? Alignment.centerRight : Alignment.centerLeft,
       child: ConstrainedBox(
         constraints: BoxConstraints(maxWidth: maxWidth),
         child: GestureDetector(
-          onLongPress: message.isDeleted ? null : () => _showActions(context),
+          onLongPress: openActions,
           child: AnimatedContainer(
             duration: const Duration(milliseconds: 220),
             padding: bare
                 ? const EdgeInsets.fromLTRB(2, 2, 2, 0)
-                : isPhoto
+                : isDoodleTile
+                ? EdgeInsets.zero
+                : isMediaTile
                 ? const EdgeInsets.all(4)
                 : const EdgeInsets.fromLTRB(12, 8, 12, 7),
             decoration: BoxDecoration(
@@ -1174,6 +2216,8 @@ class _MessageRow extends StatelessWidget {
                   ? (highlighted
                         ? scheme.primary.withValues(alpha: 0.18)
                         : Colors.transparent)
+                  : isDoodleTile
+                  ? Colors.transparent
                   : highlighted
                   ? Color.alphaBlend(
                       scheme.primary.withValues(alpha: 0.22),
@@ -1185,7 +2229,7 @@ class _MessageRow extends StatelessWidget {
                   ? AppColors.bubbleMineFor(context)
                   : AppColors.bubblePeerFor(context),
               borderRadius: _bubbleRadius(),
-              boxShadow: bare
+              boxShadow: bare || isDoodleTile
                   ? null
                   : softShadow(
                       opacity: 0.045,
@@ -1222,19 +2266,35 @@ class _MessageRow extends StatelessWidget {
                       onTap: onQuoteTap,
                     ),
                   ),
-                _MessageContent(
-                  message: message,
-                  maxWidth: maxWidth,
-                  mine: mine,
-                  footer: isPhoto ? footer : null,
-                  emojiSize: emojiSize,
-                ),
-                if (!isPhoto)
+                if (isEdgeTile)
+                  _MessageContent(
+                    message: message,
+                    maxWidth: maxWidth,
+                    mine: mine,
+                    footer: footer,
+                    emojiSize: emojiSize,
+                    emojiCount: emojiCount,
+                    onLongPress: openActions,
+                  )
+                else
+                  BubbleBody(
+                    body: _MessageContent(
+                      message: message,
+                      maxWidth: maxWidth,
+                      mine: mine,
+                      emojiSize: emojiSize,
+                      emojiCount: emojiCount,
+                      onLongPress: openActions,
+                    ),
+                    meta: footer,
+                  ),
+                if (message.reactions.isNotEmpty)
                   Padding(
-                    padding: const EdgeInsets.only(top: 3),
-                    child: Align(
-                      alignment: Alignment.centerRight,
-                      child: footer,
+                    padding: const EdgeInsets.only(top: 5),
+                    child: ReactionChips(
+                      reactions: message.reactions,
+                      alignEnd: mine,
+                      onToggle: (emoji) => _react(context, emoji),
                     ),
                   ),
               ],
@@ -1258,6 +2318,58 @@ class _MessageRow extends StatelessWidget {
   }
 }
 
+/// Centered call-log entry ("Video call · 21 secs" / "Missed call"), styled
+/// like WhatsApp's in-transcript call rows.
+class _CallLogTile extends StatelessWidget {
+  const _CallLogTile({required this.message});
+
+  final ChatMessage message;
+
+  String? _endedByName(AppState state, CallLogInfo info) {
+    if (info.endedByUserId == null) return null;
+    final conv = state.conversationById(message.conversationId);
+    if (conv == null) return null;
+    for (final member in conv.members) {
+      if (member.userId == info.endedByUserId) {
+        return state.nameForMember(member);
+      }
+    }
+    return null;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final state = context.watch<AppState>();
+    final info = parseCallLogBody(message.body);
+    final label = formatCallLogTranscript(
+      info,
+      viewerUserId: state.me?.id,
+      endedByName: _endedByName(state, info),
+    );
+    final color = info.isNegative ? scheme.error : scheme.onSurfaceVariant;
+
+    return Center(
+      child: Container(
+        margin: const EdgeInsets.symmetric(vertical: 6),
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
+        decoration: BoxDecoration(
+          color: scheme.surfaceContainerHighest,
+          borderRadius: BorderRadius.circular(14),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(callLogIcon(info), size: 16, color: color),
+            const SizedBox(width: 6),
+            Text(label, style: TextStyle(fontSize: 12.5, color: color)),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
 class _MessageContent extends StatelessWidget {
   const _MessageContent({
     required this.message,
@@ -1265,15 +2377,21 @@ class _MessageContent extends StatelessWidget {
     required this.mine,
     this.footer,
     this.emojiSize,
+    this.emojiCount = 0,
+    this.onLongPress,
   });
 
   final ChatMessage message;
   final double maxWidth;
   final bool mine;
   final Widget? footer;
+  final VoidCallback? onLongPress;
 
   /// Set when the body is nothing but emoji, which are drawn oversized.
   final double? emojiSize;
+
+  /// How many emoji that body holds; a lone one gets the springy entrance.
+  final int emojiCount;
 
   @override
   Widget build(BuildContext context) {
@@ -1296,29 +2414,64 @@ class _MessageContent extends StatelessWidget {
           message: message,
           maxWidth: maxWidth,
           footer: footer,
+          onLongPress: onLongPress,
+        );
+      case 'video':
+        return VideoAttachment(
+          message: message,
+          maxWidth: maxWidth,
+          footer: footer,
+          onLongPress: onLongPress,
+        );
+      case 'doodle':
+        return DoodleAttachment(
+          message: message,
+          maxWidth: maxWidth,
+          footer: footer,
+          onLongPress: onLongPress,
         );
       case 'voice':
         return VoiceAttachment(
           message: message,
-          accent: mine ? AppColors.brandDeep : Theme.of(context).colorScheme.primary,
+          accent: mine
+              ? AppColors.brandDeep
+              : Theme.of(context).colorScheme.primary,
+          onLongPress: onLongPress,
         );
       case 'file':
-        return FileAttachment(message: message, maxWidth: maxWidth);
+        return FileAttachment(
+          message: message,
+          maxWidth: maxWidth,
+          onLongPress: onLongPress,
+        );
       default:
         final scheme = Theme.of(context).colorScheme;
         final size = emojiSize;
         return Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            if (size != null)
+            if (size != null &&
+                shouldAnimateSoloEmoji(
+                  emojiCount: emojiCount,
+                  animationsEnabled: !MediaQuery.disableAnimationsOf(context),
+                ))
+              SoloEmojiBubble(
+                emoji: (message.body ?? '').trim(),
+                fontSize: size,
+                playbackKey: soloEmojiPlaybackKey(
+                  messageId: message.id,
+                  clientId: message.clientId,
+                ),
+              )
+            else if (size != null)
               Text(
                 message.body ?? '',
                 // Emoji carry no links, so plain Text keeps the glyph metrics
                 // clean at this size.
-                style: TextStyle(height: 1.18, fontSize: size),
+                style: emojiTextStyle(fontSize: size),
               )
             else
-              LinkifiedText(
+              RichMessageText(
                 message.body ?? '',
                 style: const TextStyle(height: 1.35, fontSize: 15),
               ),
@@ -1426,7 +2579,9 @@ class _TypingBubbleState extends State<_TypingBubble>
                     width: 7,
                     height: 7,
                     decoration: BoxDecoration(
-                      color: scheme.primary.withValues(alpha: 0.35 + lift * 0.3),
+                      color: scheme.primary.withValues(
+                        alpha: 0.35 + lift * 0.3,
+                      ),
                       shape: BoxShape.circle,
                     ),
                   ),
@@ -1557,10 +2712,44 @@ class _ShareOption extends StatelessWidget {
   }
 }
 
+/// Thin banner shown while an album of attachments is uploading in order.
+class _UploadProgressBar extends StatelessWidget {
+  const _UploadProgressBar({required this.done, required this.total});
+
+  final int done;
+  final int total;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final value = total == 0 ? null : done / total;
+    return Container(
+      padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
+      color: scheme.surfaceContainerHighest,
+      child: Row(
+        children: [
+          SizedBox(
+            width: 18,
+            height: 18,
+            child: CircularProgressIndicator(strokeWidth: 2, value: value),
+          ),
+          const SizedBox(width: 12),
+          Text(
+            'Sending $done of $total…',
+            style: Theme.of(context).textTheme.bodyMedium,
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 /// Message field that swaps the mic for a send button once you start typing.
 class _Composer extends StatelessWidget {
   const _Composer({
+    super.key,
     required this.controller,
+    required this.focusNode,
     required this.recording,
     required this.recordedFor,
     required this.onChanged,
@@ -1572,6 +2761,7 @@ class _Composer extends StatelessWidget {
   });
 
   final TextEditingController controller;
+  final FocusNode focusNode;
   final bool recording;
   final Duration recordedFor;
   final ValueChanged<String> onChanged;
@@ -1588,7 +2778,11 @@ class _Composer extends StatelessWidget {
     return Container(
       decoration: BoxDecoration(
         color: scheme.surface,
-        boxShadow: softShadow(opacity: 0.06, blur: 16, offset: const Offset(0, -3)),
+        boxShadow: softShadow(
+          opacity: 0.06,
+          blur: 16,
+          offset: const Offset(0, -3),
+        ),
       ),
       child: SafeArea(
         top: false,
@@ -1615,8 +2809,19 @@ class _Composer extends StatelessWidget {
                     Expanded(
                       child: TextField(
                         controller: controller,
+                        focusNode: focusNode,
                         minLines: 1,
                         maxLines: 5,
+                        // Kept under the server's 8000-char body cap with room
+                        // for a DM's ciphertext, which base64 expands ~1.4x.
+                        maxLength: 4000,
+                        buildCounter:
+                            (
+                              _, {
+                              required currentLength,
+                              required isFocused,
+                              maxLength,
+                            }) => null,
                         textCapitalization: TextCapitalization.sentences,
                         keyboardType: TextInputType.multiline,
                         textInputAction: TextInputAction.newline,
@@ -1654,7 +2859,9 @@ class _Composer extends StatelessWidget {
                       builder: (context, value, _) {
                         final hasText = value.text.trim().isNotEmpty;
                         return _PrimaryComposerButton(
-                          icon: hasText ? Icons.send_rounded : Icons.mic_rounded,
+                          icon: hasText
+                              ? Icons.send_rounded
+                              : Icons.mic_rounded,
                           onPressed: hasText ? onSend : onStartRecording,
                         );
                       },
@@ -1780,27 +2987,6 @@ class _PulsingDotState extends State<_PulsingDot>
           shape: BoxShape.circle,
         ),
       ),
-    );
-  }
-}
-
-class _Ticks extends StatelessWidget {
-  const _Ticks({required this.level, this.onPhoto = false});
-
-  final int level;
-  final bool onPhoto;
-
-  @override
-  Widget build(BuildContext context) {
-    final muted = onPhoto ? Colors.white : Theme.of(context).colorScheme.outline;
-    if (level < 0) {
-      return Icon(Icons.access_time_rounded, size: 13, color: muted);
-    }
-    if (level == 0) return Icon(Icons.done_rounded, size: 14, color: muted);
-    return Icon(
-      Icons.done_all_rounded,
-      size: 14,
-      color: level >= 2 ? const Color(0xFF2563EB) : muted,
     );
   }
 }

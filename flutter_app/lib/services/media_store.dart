@@ -1,6 +1,5 @@
 import 'dart:async';
 import 'dart:io';
-import 'dart:typed_data';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:http/http.dart' as http;
@@ -15,6 +14,15 @@ import '../models.dart';
 /// Result of asking the user to save an attachment somewhere on the phone.
 enum SaveOutcome { saved, cancelled }
 
+/// Thrown when a download is stopped on purpose, so the UI can stay quiet
+/// instead of showing a scary network error.
+class DownloadCancelled implements Exception {
+  const DownloadCancelled();
+
+  @override
+  String toString() => 'Download cancelled';
+}
+
 /// Downloads chat attachments once, keeps them on the phone, and hands them to
 /// the gallery/file apps when asked.
 ///
@@ -28,6 +36,10 @@ class MediaStore {
   /// Downloads already running, keyed by message id, so a rebuild storm can't
   /// start the same download several times.
   final Map<int, Future<File>> _inFlight = {};
+
+  /// The live HTTP client per in-flight download, so a download can be
+  /// cancelled by closing its socket without disturbing other transfers.
+  final Map<int, http.Client> _clients = {};
 
   Directory? _cacheDir;
 
@@ -72,9 +84,17 @@ class MediaStore {
     if (running != null) return running;
     final future = _fetch(msg, onProgress).whenComplete(() {
       _inFlight.remove(msg.id);
+      _clients.remove(msg.id);
     });
     _inFlight[msg.id] = future;
     return future;
+  }
+
+  /// Stops an in-flight download for [messageId]. The pending `ensureLocal`
+  /// future completes with an error, which callers surface as "cancelled".
+  void cancelDownload(int messageId) {
+    final client = _clients.remove(messageId);
+    client?.close();
   }
 
   Future<File> _fetch(
@@ -85,6 +105,7 @@ class MediaStore {
     if (existing != null) return existing;
 
     final client = http.Client();
+    _clients[msg.id] = client;
     try {
       final request = http.Request('GET', Uri.parse(_api.mediaUrl(msg.id)));
       request.headers['Authorization'] = 'Bearer ${_api.token}';
@@ -106,25 +127,100 @@ class MediaStore {
       }
 
       final total = response.contentLength ?? msg.mediaSize ?? 0;
-      final chunks = <int>[];
-      var received = 0;
-      await for (final chunk in response.stream) {
-        chunks.addAll(chunk);
-        received += chunk.length;
-        if (total > 0) onProgress?.call((received / total).clamp(0.0, 1.0));
-      }
-
       // Written to a temporary name first so a failed download never leaves a
       // half-file that later looks like a valid cache hit.
       final file = await _target(msg);
       final partial = File('${file.path}.part');
-      await partial.writeAsBytes(Uint8List.fromList(chunks), flush: true);
+      // Streamed straight to disk rather than gathered in memory: a video can
+      // be hundreds of megabytes, and holding one whole would kill the app.
+      final sink = partial.openWrite();
+      var received = 0;
+      try {
+        await for (final chunk in response.stream) {
+          sink.add(chunk);
+          received += chunk.length;
+          if (total > 0) onProgress?.call((received / total).clamp(0.0, 1.0));
+        }
+        await sink.flush();
+      } on http.ClientException {
+        // A closed socket here is almost always a user cancellation; the
+        // half-written .part file is removed below so it never poses as cache.
+        await sink.close();
+        await partial.delete().catchError((_) => partial);
+        throw const DownloadCancelled();
+      } finally {
+        await sink.close();
+      }
+
       if (await file.exists()) await file.delete();
       await partial.rename(file.path);
       onProgress?.call(1);
       return file;
     } finally {
       client.close();
+    }
+  }
+
+  /// How many bytes the downloaded attachments take up on this phone.
+  Future<int> cacheSize() async {
+    try {
+      final dir = await _dir();
+      var total = 0;
+      await for (final entity in dir.list()) {
+        if (entity is File) {
+          try {
+            total += await entity.length();
+          } catch (_) {
+            // Vanished mid-scan; it contributes nothing either way.
+          }
+        }
+      }
+      return total;
+    } catch (_) {
+      return 0;
+    }
+  }
+
+  /// Deletes every downloaded attachment and reports how much that freed.
+  ///
+  /// Nothing is lost: the originals stay on the chat server, so anything opened
+  /// again is simply fetched once more.
+  Future<int> clearCache() async {
+    var freed = 0;
+    try {
+      final dir = await _dir();
+      await for (final entity in dir.list()) {
+        if (entity is! File) continue;
+        try {
+          freed += await entity.length();
+          await entity.delete();
+        } catch (_) {
+          // Locked or already gone; keep clearing the rest.
+        }
+      }
+    } catch (_) {
+      // Nothing cached yet.
+    }
+    return freed;
+  }
+
+  /// Removes local copies belonging to one server message.
+  Future<void> evict(int messageId) async {
+    _inFlight.remove(messageId);
+    try {
+      final dir = await _dir();
+      await for (final entity in dir.list()) {
+        if (entity is! File) continue;
+        final name = entity.uri.pathSegments.last;
+        if (!name.startsWith('${messageId}_')) continue;
+        try {
+          await entity.delete();
+        } catch (_) {
+          // Already gone or temporarily locked.
+        }
+      }
+    } catch (_) {
+      // Cache may not exist yet.
     }
   }
 
@@ -144,8 +240,11 @@ class MediaStore {
   /// Lets the user pick a folder and writes the file there, WhatsApp-style
   /// "save to phone". Uses the system save dialog, so no storage permission
   /// prompt is needed on any Android version.
-  Future<SaveOutcome> saveToDevice(ChatMessage msg) async {
-    final file = await ensureLocal(msg);
+  Future<SaveOutcome> saveToDevice(
+    ChatMessage msg, {
+    void Function(double progress)? onProgress,
+  }) async {
+    final file = await ensureLocal(msg, onProgress: onProgress);
     final bytes = await file.readAsBytes();
     final path = await FilePicker.platform.saveFile(
       fileName: _safeName(msg),

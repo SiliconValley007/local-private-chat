@@ -75,6 +75,26 @@ class RealtimeService {
     send({'type': 'ack.delivered', 'message_id': messageId});
   }
 
+  /// Fire an ephemeral poke; the server fans it out and drops it if throttled.
+  void sendNudge(
+    int conversationId, {
+    String variant = 'wave',
+    required String nudgeId,
+  }) {
+    send({
+      'type': 'chat.nudge',
+      'conversation_id': conversationId,
+      'variant': variant,
+      'nudge_id': nudgeId,
+    });
+  }
+
+  /// Relays a call-signaling frame (invite/offer/answer/ice/reject/end/busy).
+  void sendCallSignal(Map<String, dynamic> payload) => send(payload);
+
+  /// Relays an end-to-end key-exchange frame for a DM.
+  void sendE2eSignal(Map<String, dynamic> payload) => send(payload);
+
   void _setConnected(bool value) {
     if (_connected == value) return;
     _connected = value;
@@ -95,7 +115,9 @@ class RealtimeService {
       // long as the server had nothing to say.
       channel.ready.then(
         (_) {
-          if (_channel != channel) return; // A newer socket already replaced us.
+          if (_channel != channel) {
+            return; // A newer socket already replaced us.
+          }
           _attempt = 0;
           _setConnected(true);
         },

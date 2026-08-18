@@ -1,21 +1,32 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
+import '../call_log.dart';
 import '../app_state.dart';
+import '../chat_navigation.dart';
+import '../errors.dart';
+import '../invite_flow.dart';
 import '../models.dart';
 import '../services/theme_store.dart';
 import '../theme.dart';
 import '../time_format.dart';
 import '../widgets/avatar.dart';
+import '../widgets/avatar_viewer.dart';
 import '../widgets/change_password_dialog.dart';
+import '../widgets/receipt_ticks.dart';
 import '../widgets/rename_dialog.dart';
 import '../widgets/error_banner.dart';
 import 'backup_screen.dart';
-import 'chat_screen.dart';
+import 'global_search_screen.dart';
 import 'new_chat_screen.dart';
 import 'new_group_screen.dart';
+import 'privacy_onboarding_screen.dart';
 import 'qr_invite_screen.dart';
 import 'server_setup_screen.dart';
+import 'self_profile_screen.dart';
+import 'share_target_screen.dart';
+import 'starred_messages_screen.dart';
+import '../services/privacy_onboarding_store.dart';
 
 class InboxScreen extends StatefulWidget {
   const InboxScreen({super.key});
@@ -28,11 +39,16 @@ class _InboxScreenState extends State<InboxScreen> {
   final _search = TextEditingController();
   String _query = '';
 
+  /// True while a share picker or invite prompt is on screen, so a rebuild
+  /// cannot stack a second one on top.
+  bool _routingHandoff = false;
+
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addPostFrameCallback((_) {
       context.read<AppState>().refreshInbox();
+      _routeHandoffs();
     });
   }
 
@@ -40,6 +56,45 @@ class _InboxScreenState extends State<InboxScreen> {
   void dispose() {
     _search.dispose();
     super.dispose();
+  }
+
+  /// Picks up whatever Android handed the app: a share to forward into a chat,
+  /// or an invite link to add someone.
+  ///
+  /// Runs from the inbox because this is the first screen that exists only once
+  /// there is an account and a reachable server.
+  Future<void> _routeHandoffs() async {
+    if (_routingHandoff || !mounted) return;
+    final state = context.read<AppState>();
+
+    final share = state.takePendingShare();
+    if (share != null) {
+      _routingHandoff = true;
+      await Navigator.of(context).push(
+        MaterialPageRoute(builder: (_) => ShareTargetScreen(share: share)),
+      );
+      _routingHandoff = false;
+      if (mounted) await _routeHandoffs();
+      return;
+    }
+
+    final invite = state.takePendingInvite();
+    if (invite != null) {
+      _routingHandoff = true;
+      try {
+        final conv = await acceptInvite(context, invite);
+        if (conv != null && mounted) {
+          await pushChat(context, conversation: conv);
+        }
+      } catch (e) {
+        if (mounted) {
+          ScaffoldMessenger.of(
+            context,
+          ).showSnackBar(SnackBar(content: Text(friendlyMessage(e))));
+        }
+      }
+      _routingHandoff = false;
+    }
   }
 
   List<Conversation> _visible(AppState state, List<Conversation> all) {
@@ -50,19 +105,28 @@ class _InboxScreenState extends State<InboxScreen> {
       final shown = state.titleFor(c).toLowerCase();
       final real = c.peer?.displayName.toLowerCase() ?? '';
       final username = c.peer?.username.toLowerCase() ?? '';
-      var preview = '';
-      if (c.lastMessage != null) {
-        final summary = AppState.messagePreview(c.lastMessage!);
-        preview = c.lastMessage!.senderId == state.me?.id
-            ? 'you: $summary'
-            : summary;
-        preview = preview.toLowerCase();
-      }
+      // Uses the decrypted preview so filtering matches DM text, not ciphertext.
+      final preview = state.previewFor(c).toLowerCase();
       return shown.contains(query) ||
           real.contains(query) ||
           username.contains(query) ||
           preview.contains(query);
     }).toList();
+  }
+
+  /// Opens a chat's photo full screen rather than opening the chat.
+  void _viewConversationAvatar(AppState state, Conversation conv) {
+    final isGroup = conv.type == 'group';
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => AvatarViewerScreen(
+          name: state.titleFor(conv),
+          seed: isGroup ? conv.id : (conv.peer?.id ?? conv.id),
+          imageUrl: isGroup ? null : state.avatarUrlFor(conv.peer?.id),
+          imageHeaders: state.api.imageAuthHeaders,
+        ),
+      ),
+    );
   }
 
   Future<void> _rename(Conversation conv) async {
@@ -176,6 +240,43 @@ class _InboxScreenState extends State<InboxScreen> {
     );
   }
 
+  Future<void> _chooseMediaPrefs() async {
+    final state = context.read<AppState>();
+    await showModalBottomSheet<void>(
+      context: context,
+      showDragHandle: true,
+      builder: (sheetContext) {
+        final prefs = sheetContext.watch<AppState>().mediaPrefs;
+        return SafeArea(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Padding(
+                padding: const EdgeInsets.fromLTRB(20, 0, 20, 4),
+                child: Text(
+                  'Media downloads',
+                  style: Theme.of(sheetContext).textTheme.titleMedium,
+                ),
+              ),
+              SwitchListTile(
+                title: const Text('Wi‑Fi only for videos'),
+                subtitle: const Text(
+                  'Ask before saving videos when you are not on Wi‑Fi.',
+                ),
+                value: prefs.wifiOnlyVideoDownload,
+                onChanged: (v) {
+                  state.setMediaPrefs(prefs.copyWith(wifiOnlyVideoDownload: v));
+                },
+              ),
+              const SizedBox(height: 8),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
   IconData _appearanceIcon(ThemeMode mode) => switch (mode) {
     ThemeMode.light => Icons.light_mode_outlined,
     ThemeMode.dark => Icons.dark_mode_outlined,
@@ -186,8 +287,18 @@ class _InboxScreenState extends State<InboxScreen> {
     final state = context.read<AppState>();
     final navigator = Navigator.of(context);
     switch (value) {
+      case 'search_all':
+        await navigator.push(
+          MaterialPageRoute(builder: (_) => const GlobalSearchScreen()),
+        );
+      case 'starred':
+        await navigator.push(
+          MaterialPageRoute(builder: (_) => const StarredMessagesScreen()),
+        );
       case 'appearance':
         await _chooseAppearance();
+      case 'media':
+        await _chooseMediaPrefs();
       case 'qr':
         await navigator.push(
           MaterialPageRoute(builder: (_) => const QrInviteScreen()),
@@ -195,6 +306,16 @@ class _InboxScreenState extends State<InboxScreen> {
       case 'backup':
         await navigator.push(
           MaterialPageRoute(builder: (_) => const BackupScreen()),
+        );
+      case 'privacy_tips':
+        await PrivacyOnboardingStore.reset();
+        if (!mounted) return;
+        await navigator.push(
+          MaterialPageRoute(
+            builder: (_) => PrivacyOnboardingScreen(
+              onFinished: () => Navigator.of(context).pop(),
+            ),
+          ),
         );
       case 'password':
         if (!mounted) return;
@@ -248,9 +369,7 @@ class _InboxScreenState extends State<InboxScreen> {
       ),
     );
     if (conv != null && mounted) {
-      Navigator.of(context).push(
-        MaterialPageRoute(builder: (_) => ChatScreen(conversation: conv)),
-      );
+      await pushChat(context, conversation: conv);
     }
   }
 
@@ -260,6 +379,12 @@ class _InboxScreenState extends State<InboxScreen> {
     final theme = Theme.of(context);
     final scheme = theme.colorScheme;
     final me = state.me;
+    if (!_routingHandoff &&
+        (state.pendingShare != null || state.pendingInvite != null)) {
+      // A share into the running app arrives as a state change, not a rebuild of
+      // this widget, so the pick-up happens after this frame is on screen.
+      WidgetsBinding.instance.addPostFrameCallback((_) => _routeHandoffs());
+    }
     final conversations = _visible(state, state.conversations);
     final unreadTotal = state.conversations.fold<int>(
       0,
@@ -272,30 +397,60 @@ class _InboxScreenState extends State<InboxScreen> {
         title: Row(
           children: [
             if (me != null)
-              Avatar(name: me.displayName, seed: me.id, radius: 20),
+              GestureDetector(
+                onTap: () => Navigator.of(context).push(
+                  MaterialPageRoute(builder: (_) => const SelfProfileScreen()),
+                ),
+                child: Avatar(
+                  name: me.displayName,
+                  seed: me.id,
+                  radius: 20,
+                  imageUrl: state.avatarUrlFor(me.id),
+                  imageHeaders: state.api.imageAuthHeaders,
+                ),
+              ),
             const SizedBox(width: 12),
             Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text('Chats', style: theme.textTheme.titleLarge),
-                  Text(
-                    unreadTotal > 0
-                        ? '$unreadTotal unread message${unreadTotal == 1 ? '' : 's'}'
-                        : '@${me?.username ?? ''}',
-                    style: theme.textTheme.labelSmall?.copyWith(
-                      color: unreadTotal > 0
-                          ? scheme.primary
-                          : scheme.onSurfaceVariant,
-                      fontWeight: FontWeight.w600,
+              child: GestureDetector(
+                onTap: () => Navigator.of(context).push(
+                  MaterialPageRoute(builder: (_) => const SelfProfileScreen()),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      me?.displayName ?? 'Chats',
+                      style: theme.textTheme.titleLarge,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
                     ),
-                  ),
-                ],
+                    Text(
+                      unreadTotal > 0
+                          ? '$unreadTotal unread message${unreadTotal == 1 ? '' : 's'}'
+                          : '@${me?.username ?? ''}',
+                      style: theme.textTheme.labelSmall?.copyWith(
+                        color: unreadTotal > 0
+                            ? scheme.primary
+                            : scheme.onSurfaceVariant,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ],
+                ),
               ),
             ),
           ],
         ),
         actions: [
+          IconButton(
+            tooltip: 'Search messages',
+            onPressed: () {
+              Navigator.of(context).push(
+                MaterialPageRoute(builder: (_) => const GlobalSearchScreen()),
+              );
+            },
+            icon: const Icon(Icons.manage_search_rounded),
+          ),
           IconButton(
             tooltip: 'Refresh',
             onPressed: state.refreshInbox,
@@ -307,12 +462,39 @@ class _InboxScreenState extends State<InboxScreen> {
             onSelected: _onMenuSelected,
             itemBuilder: (_) => const [
               PopupMenuItem(
+                value: 'search_all',
+                child: ListTile(
+                  dense: true,
+                  contentPadding: EdgeInsets.zero,
+                  leading: Icon(Icons.manage_search_rounded),
+                  title: Text('Search all messages'),
+                ),
+              ),
+              PopupMenuItem(
+                value: 'starred',
+                child: ListTile(
+                  dense: true,
+                  contentPadding: EdgeInsets.zero,
+                  leading: Icon(Icons.star_outline_rounded),
+                  title: Text('Starred messages'),
+                ),
+              ),
+              PopupMenuItem(
                 value: 'appearance',
                 child: ListTile(
                   dense: true,
                   contentPadding: EdgeInsets.zero,
                   leading: Icon(Icons.brightness_6_outlined),
                   title: Text('Appearance'),
+                ),
+              ),
+              PopupMenuItem(
+                value: 'media',
+                child: ListTile(
+                  dense: true,
+                  contentPadding: EdgeInsets.zero,
+                  leading: Icon(Icons.wifi_rounded),
+                  title: Text('Media downloads'),
                 ),
               ),
               PopupMenuItem(
@@ -331,6 +513,15 @@ class _InboxScreenState extends State<InboxScreen> {
                   contentPadding: EdgeInsets.zero,
                   leading: Icon(Icons.cloud_upload_outlined),
                   title: Text('Backup & restore'),
+                ),
+              ),
+              PopupMenuItem(
+                value: 'privacy_tips',
+                child: ListTile(
+                  dense: true,
+                  contentPadding: EdgeInsets.zero,
+                  leading: Icon(Icons.privacy_tip_outlined),
+                  title: Text('Show privacy tips'),
                 ),
               ),
               PopupMenuItem(
@@ -457,6 +648,10 @@ class _InboxScreenState extends State<InboxScreen> {
                         return _ConversationTile(
                           conversation: conv,
                           title: state.titleFor(conv),
+                          avatarUrl: conv.type == 'dm'
+                              ? state.avatarUrlFor(conv.peer?.id)
+                              : null,
+                          avatarHeaders: state.api.imageAuthHeaders,
                           timeLabel: formatListTimestamp(
                             context,
                             conv.updatedAt,
@@ -466,14 +661,17 @@ class _InboxScreenState extends State<InboxScreen> {
                                     conv.peer!.isOnline)
                               : null,
                           fromMe: conv.lastMessage?.senderId == state.me?.id,
+                          receiptLevel: state.inboxReceiptLevelFor(conv),
+                          previewText:
+                              state.typingLabelFor(conv) ??
+                              state.previewFor(conv),
+                          previewIsTyping: state.typingLabelFor(conv) != null,
                           pinned: state.isPinned(conv.id),
                           muted: state.isMuted(conv.id),
-                          onTap: () => Navigator.of(context).push(
-                            MaterialPageRoute(
-                              builder: (_) => ChatScreen(conversation: conv),
-                            ),
-                          ),
+                          onTap: () => pushChat(context, conversation: conv),
                           onLongPress: () => _showConversationActions(conv),
+                          onAvatarTap: () =>
+                              _viewConversationAvatar(state, conv),
                         );
                       },
                     ),
@@ -492,10 +690,16 @@ class _ConversationTile extends StatelessWidget {
     required this.timeLabel,
     required this.online,
     required this.fromMe,
+    this.receiptLevel,
+    required this.previewText,
+    this.previewIsTyping = false,
     required this.pinned,
     required this.muted,
     required this.onTap,
     required this.onLongPress,
+    required this.onAvatarTap,
+    this.avatarUrl,
+    this.avatarHeaders,
   });
 
   final Conversation conversation;
@@ -503,16 +707,36 @@ class _ConversationTile extends StatelessWidget {
   final String timeLabel;
   final bool? online;
   final bool fromMe;
+  final int? receiptLevel;
+
+  /// Ready-made subtitle (DM bodies already decrypted, "You:" prefixed).
+  final String previewText;
+
+  /// When true, [previewText] is a typing indicator and gets accent styling.
+  final bool previewIsTyping;
   final bool pinned;
   final bool muted;
   final VoidCallback onTap;
   final VoidCallback onLongPress;
 
+  /// Opens the photo full screen instead of the chat.
+  final VoidCallback onAvatarTap;
+  final String? avatarUrl;
+  final Map<String, String>? avatarHeaders;
+
   /// Small glyph shown before the preview for anything that isn't plain text.
   IconData? get _previewIcon {
-    switch (conversation.lastMessage?.type) {
+    final last = conversation.lastMessage;
+    if (last?.type == 'call') {
+      return callLogIcon(parseCallLogBody(last!.body));
+    }
+    switch (last?.type) {
       case 'image':
         return Icons.photo_camera_rounded;
+      case 'doodle':
+        return Icons.draw_rounded;
+      case 'video':
+        return Icons.videocam_rounded;
       case 'voice':
         return Icons.mic_rounded;
       case 'file':
@@ -520,13 +744,6 @@ class _ConversationTile extends StatelessWidget {
       default:
         return null;
     }
-  }
-
-  String get _previewText {
-    final last = conversation.lastMessage;
-    if (last == null) return 'No messages yet';
-    final summary = AppState.messagePreview(last);
-    return fromMe ? 'You: $summary' : summary;
   }
 
   @override
@@ -547,14 +764,19 @@ class _ConversationTile extends StatelessWidget {
           padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
           child: Row(
             children: [
-              Avatar(
-                name: title,
-                seed: isGroup
-                    ? conversation.id
-                    : (conversation.peer?.id ?? conversation.id),
-                radius: 26,
-                online: online,
-                badge: isGroup ? Icons.group_rounded : null,
+              GestureDetector(
+                onTap: onAvatarTap,
+                child: Avatar(
+                  name: title,
+                  seed: isGroup
+                      ? conversation.id
+                      : (conversation.peer?.id ?? conversation.id),
+                  radius: 26,
+                  online: online,
+                  badge: isGroup ? Icons.group_rounded : null,
+                  imageUrl: avatarUrl,
+                  imageHeaders: avatarHeaders,
+                ),
               ),
               const SizedBox(width: 14),
               Expanded(
@@ -595,7 +817,13 @@ class _ConversationTile extends StatelessWidget {
                     const SizedBox(height: 3),
                     Row(
                       children: [
-                        if (_previewIcon != null) ...[
+                        if (!previewIsTyping &&
+                            fromMe &&
+                            receiptLevel != null) ...[
+                          ReceiptTicks(level: receiptLevel!, size: 13),
+                          const SizedBox(width: 4),
+                        ],
+                        if (!previewIsTyping && _previewIcon != null) ...[
                           Icon(
                             _previewIcon,
                             size: 14,
@@ -607,17 +835,22 @@ class _ConversationTile extends StatelessWidget {
                         ],
                         Expanded(
                           child: Text(
-                            _previewText,
+                            previewText,
                             maxLines: 1,
                             overflow: TextOverflow.ellipsis,
                             style: theme.textTheme.bodyMedium?.copyWith(
                               fontSize: 13.5,
-                              color: unread > 0
-                                  ? scheme.onSurface
-                                  : scheme.onSurfaceVariant,
-                              fontWeight: unread > 0
+                              color: previewIsTyping
+                                  ? scheme.primary
+                                  : (unread > 0
+                                        ? scheme.onSurface
+                                        : scheme.onSurfaceVariant),
+                              fontWeight: previewIsTyping || unread > 0
                                   ? FontWeight.w600
                                   : FontWeight.w400,
+                              fontStyle: previewIsTyping
+                                  ? FontStyle.italic
+                                  : FontStyle.normal,
                             ),
                           ),
                         ),

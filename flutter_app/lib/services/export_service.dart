@@ -24,11 +24,12 @@ String formatChatAsText({
       continue;
     }
     final body = switch (m.type) {
-      'image' => m.body?.trim().isNotEmpty == true
-          ? 'Photo · ${m.body}'
-          : 'Photo',
+      'image' =>
+        m.body?.trim().isNotEmpty == true ? 'Photo · ${m.body}' : 'Photo',
       'voice' => 'Voice message',
-      'file' => m.mediaName?.isNotEmpty == true ? 'File · ${m.mediaName}' : 'File',
+      'doodle' => 'Drawing',
+      'file' =>
+        m.mediaName?.isNotEmpty == true ? 'File · ${m.mediaName}' : 'File',
       _ => m.body ?? '',
     };
     final edited = m.editedAt != null ? ' (edited)' : '';

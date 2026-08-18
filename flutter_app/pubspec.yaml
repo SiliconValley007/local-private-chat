@@ -16,7 +16,9 @@ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 # https://developer.apple.com/library/archive/documentation/General/Reference/InfoPlistKeyReference/Articles/CoreFoundationKeys.html
 # In Windows, build-name is used as the major, minor, and patch parts
 # of the product and file versions while build-number is used as the build suffix.
-version: 1.2.0+4
+# Version name stays 1.5.x; the build number rises so the APK installs cleanly
+# over the previous one.
+version: 1.7.1+24
 
 environment:
   sdk: ^3.12.2
@@ -57,7 +59,11 @@ dependencies:
   url_launcher: ^6.3.1
   google_fonts: ^6.2.1
   share_plus: ^10.1.4
-
+  android_intent_plus: ^6.1.0
+  video_player: ^2.14.0
+  flutter_webrtc: ^1.6.0
+  wechat_assets_picker: ^10.1.3
+  photo_manager: ^3.12.0
 dev_dependencies:
   flutter_test:
     sdk: flutter
@@ -84,6 +90,15 @@ flutter:
     # Source art for the launcher/notification icons, also shown on the sign-in
     # screen. Regenerate the Android icons with tools/generate_icons.py.
     - assets/branding/chat.png
+
+  fonts:
+    # Phones ship whatever emoji font their Android version was released with, so
+    # anything newer than that renders as a box (Gboard still offers it, because
+    # Gboard draws its own). Carrying Noto Color Emoji ourselves means a message
+    # looks the same on every phone, whatever its system font knows about.
+    - family: NotoColorEmoji
+      fonts:
+        - asset: assets/fonts/NotoColorEmoji.ttf
 
   # An image asset can refer to one or more resolution-specific "variants", see
   # https://flutter.dev/to/resolution-aware-images

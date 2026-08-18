@@ -5,6 +5,7 @@ import 'package:provider/provider.dart';
 
 import '../app_state.dart';
 import '../errors.dart';
+import '../invite_flow.dart';
 import '../models.dart';
 import '../widgets/avatar.dart';
 import '../widgets/error_banner.dart';
@@ -74,7 +75,10 @@ class _NewChatScreenState extends State<NewChatScreen> {
     final q = _search.text.trim().toLowerCase();
     final contacts = state.localContacts.where((c) {
       if (q.isEmpty) return true;
-      return state.nameFor(c.username, c.displayName).toLowerCase().contains(q) ||
+      return state
+              .nameFor(c.username, c.displayName)
+              .toLowerCase()
+              .contains(q) ||
           c.displayName.toLowerCase().contains(q) ||
           c.username.toLowerCase().contains(q);
     }).toList();
@@ -144,6 +148,21 @@ class _NewChatScreenState extends State<NewChatScreen> {
                           },
                         ),
                       ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: _QuickAction(
+                          icon: Icons.link_rounded,
+                          label: 'Paste link',
+                          onTap: () async {
+                            final conv = await acceptInviteFromClipboard(
+                              context,
+                            );
+                            if (conv != null && context.mounted) {
+                              Navigator.of(context).pop(conv);
+                            }
+                          },
+                        ),
+                      ),
                     ],
                   ),
                 ),
@@ -158,12 +177,17 @@ class _NewChatScreenState extends State<NewChatScreen> {
                       if (contacts.isNotEmpty) ...[
                         _SectionLabel('Saved contacts'),
                         ...contacts.map((c) {
-                          final shown = state.nameFor(c.username, c.displayName);
+                          final shown = state.nameFor(
+                            c.username,
+                            c.displayName,
+                          );
                           return ListTile(
                             leading: Avatar(
                               name: shown,
                               seed: c.username,
                               radius: 21,
+                              imageUrl: state.avatarUrlFor(c.userId),
+                              imageHeaders: state.api.imageAuthHeaders,
                             ),
                             title: Text(shown),
                             subtitle: Text(
@@ -206,13 +230,18 @@ class _NewChatScreenState extends State<NewChatScreen> {
                       else
                         ...state.users.map((u) {
                           final online = state.onlineByUser[u.id] ?? u.isOnline;
-                          final shown = state.nameFor(u.username, u.displayName);
+                          final shown = state.nameFor(
+                            u.username,
+                            u.displayName,
+                          );
                           return ListTile(
                             leading: Avatar(
                               name: shown,
                               seed: u.id,
                               radius: 21,
                               online: online,
+                              imageUrl: state.avatarUrlFor(u.id),
+                              imageHeaders: state.api.imageAuthHeaders,
                             ),
                             title: Text(shown),
                             subtitle: Text(
