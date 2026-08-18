@@ -63,14 +63,12 @@ class CallAudioController {
     await _stopAlerts();
   }
 
-  Future<void> prepareInCallAudio({required bool isVideo}) async {
+  Future<void> prepareInCallAudio() async {
     if (!Platform.isAndroid || _prepared) return;
     try {
-      await _channel.invokeMethod<void>('prepareForCall', {'isVideo': isVideo});
+      await _channel.invokeMethod<void>('prepareForCall');
       _prepared = true;
-      await refreshRoutes(
-        preferred: defaultRouteForMedia(isVideo ? 'video' : 'audio'),
-      );
+      await refreshRoutes();
     } catch (e) {
       debugPrint('Call audio prepare skipped: $e');
     }
@@ -88,12 +86,14 @@ class CallAudioController {
       } else {
         _routes = parsed;
       }
+      // A choice the user already made outranks the default: they are listening
+      // to this call and this screen is not.
       final pick = preferred != null && _routes.contains(preferred)
           ? preferred
           : (_selectedRoute != null && _routes.contains(_selectedRoute!)
-                ? _selectedRoute
-                : _routes.first);
-      if (pick != null) await setRoute(pick);
+                ? _selectedRoute!
+                : preferredCallRoute(_routes));
+      await setRoute(pick);
     } catch (e) {
       debugPrint('Call audio routes skipped: $e');
     }

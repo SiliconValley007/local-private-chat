@@ -19,7 +19,7 @@ from app.call_log import (
     connected_duration_secs,
     should_include_ended_by,
 )
-from app import audit
+from app import audit, streaks
 from app.call_sessions import CallSessionRecord
 from app.fcm import send_message_push, send_reaction_push
 from app.media_files import delete_message_files
@@ -299,6 +299,10 @@ async def create_and_broadcast_message(
     recipients = member_user_ids(db, conversation_id) - {sender.id}
     for uid in recipients:
         db.add(MessageReceipt(message_id=message.id, user_id=uid))
+    # Written before anything can remove the message again: the streak counts
+    # days people spoke, and a day cannot be un-spoken by a later deletion or a
+    # disappearing timer.
+    streaks.record_spoken_day(db, conversation_id=conversation_id, user_id=sender.id, when=now)
     db.commit()
 
     message = load_message(db, message.id)

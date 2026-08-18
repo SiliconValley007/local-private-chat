@@ -54,6 +54,7 @@ import '../widgets/reaction_picker.dart';
 import '../widgets/receipt_ticks.dart';
 import '../widgets/rename_dialog.dart';
 import '../widgets/storage_strip.dart';
+import '../widgets/streak_tile.dart';
 import '../widgets/video_attachment.dart';
 import 'call_screen.dart';
 import 'contact_profile_screen.dart';
@@ -1407,13 +1408,10 @@ class _ChatScreenState extends State<ChatScreen> {
                     title: const Text('Clear anniversary'),
                     onTap: () => Navigator.pop(sheetContext, 'clear'),
                   ),
-                if (showing && live.streakDays > 0)
-                  ListTile(
-                    leading: const Text('🔥', style: TextStyle(fontSize: 22)),
-                    title: Text('${live.streakDays}-day streak'),
-                    subtitle: const Text(
-                      'A day counts when both of you send a message.',
-                    ),
+                if (showing)
+                  StreakTile(
+                    key: const Key('couple-details-streak'),
+                    days: live.streakDays,
                   ),
                 const SizedBox(height: 8),
               ],

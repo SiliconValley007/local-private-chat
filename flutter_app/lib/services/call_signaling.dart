@@ -178,9 +178,27 @@ String callAudioRouteWire(CallAudioRoute route) => switch (route) {
   CallAudioRoute.bluetooth => 'bluetooth',
 };
 
-/// Default route when a call becomes active.
-CallAudioRoute defaultRouteForMedia(String media) =>
-    media == 'video' ? CallAudioRoute.speaker : CallAudioRoute.earpiece;
+/// Where every call starts, in order of preference.
+///
+/// A headset if one is connected, otherwise the earpiece, and the speaker only
+/// when there is nothing else. Video calls used to open on the speaker, which
+/// put the call on show for whoever else was in the room and ignored a headset
+/// that was already on. The kind of call no longer decides this; only the person
+/// on it does, with the audio button.
+const callRoutePriority = <CallAudioRoute>[
+  CallAudioRoute.bluetooth,
+  CallAudioRoute.earpiece,
+  CallAudioRoute.speaker,
+];
+
+/// The route a call should open on, given what this phone can reach.
+CallAudioRoute preferredCallRoute(Iterable<CallAudioRoute> available) {
+  final reachable = available.toSet();
+  for (final route in callRoutePriority) {
+    if (reachable.contains(route)) return route;
+  }
+  return reachable.isEmpty ? CallAudioRoute.earpiece : available.first;
+}
 
 /// Whether incoming ringtone/vibration should play for this phase.
 bool shouldPlayIncomingAlert(CallPhase phase) => phase == CallPhase.incoming;

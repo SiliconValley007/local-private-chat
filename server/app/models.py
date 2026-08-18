@@ -84,6 +84,28 @@ class ConversationMember(Base):
     user: Mapped[User] = relationship(back_populates="memberships")
 
 
+class ConversationDay(Base):
+    """One row per chat, per person, per UTC day they said something.
+
+    The couple streak is counted from these rows instead of from the transcript,
+    so deleting a message or letting a disappearing timer clear the day cannot
+    take back a day that genuinely happened. Nothing removes rows from here.
+    """
+
+    __tablename__ = "conversation_days"
+    __table_args__ = (
+        UniqueConstraint("conversation_id", "user_id", "day", name="uq_conv_user_day"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    conversation_id: Mapped[int] = mapped_column(
+        ForeignKey("conversations.id"), nullable=False, index=True
+    )
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
+    # A UTC calendar day as YYYY-MM-DD: one shared clock for both phones.
+    day: Mapped[str] = mapped_column(String(10), nullable=False)
+
+
 class Message(Base):
     __tablename__ = "messages"
 

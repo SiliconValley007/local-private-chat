@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:provider/provider.dart';
 
@@ -39,6 +40,14 @@ Future<void> presentCallScreen(BuildContext context) async {
 double callControlsBottomInset(double screenHeight) =>
     (screenHeight * 0.17).clamp(120.0, 220.0);
 
+/// Whether tapping the picture may clear the name, timer, and buttons away.
+///
+/// Only on a video call that is under way: on a voice call there is nothing
+/// underneath to look at, and while a call is being offered or answered the
+/// buttons are the only way to take it.
+bool callChromeCanHide({required bool isVideo, required CallPhase phase}) =>
+    isVideo && phase == CallPhase.active;
+
 /// Full-screen voice/video call chrome (incoming, outgoing, active).
 class CallScreen extends StatefulWidget {
   const CallScreen({super.key});
@@ -51,6 +60,7 @@ class _CallScreenState extends State<CallScreen> {
   Timer? _tick;
   Timer? _popRetry;
   bool _didPop = false;
+  bool _chromeHidden = false;
   CallService? _calls;
 
   /// Last live session, kept so the route never paints a black spinner while
@@ -78,6 +88,8 @@ class _CallScreenState extends State<CallScreen> {
     _tick?.cancel();
     _popRetry?.cancel();
     _calls?.removeListener(_onCallChanged);
+    // Leaving the call must never leave the phone without its status bar.
+    if (_chromeHidden) _applySystemBars(hidden: false);
     super.dispose();
   }
 
@@ -140,6 +152,21 @@ class _CallScreenState extends State<CallScreen> {
   double _controlsBottomFor(BuildContext context) =>
       callControlsBottomInset(MediaQuery.sizeOf(context).height);
 
+  void _toggleChrome() {
+    setState(() => _chromeHidden = !_chromeHidden);
+    _applySystemBars(hidden: _chromeHidden);
+  }
+
+  /// Nothing but the picture while the chrome is away, system bars included.
+  ///
+  /// Coming back means edge-to-edge rather than a fixed set of overlays: that is
+  /// what the rest of the app runs in, and recent Android versions insist on it.
+  void _applySystemBars({required bool hidden}) {
+    SystemChrome.setEnabledSystemUIMode(
+      hidden ? SystemUiMode.immersiveSticky : SystemUiMode.edgeToEdge,
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final calls = context.watch<AppState>().calls;
@@ -176,6 +203,17 @@ class _CallScreenState extends State<CallScreen> {
       CallPhase.idle => '',
     };
 
+    final canHide = callChromeCanHide(isVideo: session.isVideo, phase: phase);
+    if (!canHide && _chromeHidden) {
+      // A call that just ended, or a video call that dropped to voice, must not
+      // keep its only buttons hidden.
+      _chromeHidden = false;
+      WidgetsBinding.instance.addPostFrameCallback(
+        (_) => _applySystemBars(hidden: false),
+      );
+    }
+    final chromeShown = !_chromeHidden;
+
     return PopScope(
       // A live call is worth confirming with a hang-up before leaving, so back
       // is intercepted then. Once the call is over there is nothing to protect
@@ -187,111 +225,140 @@ class _CallScreenState extends State<CallScreen> {
       },
       child: Scaffold(
         backgroundColor: _callCanvas,
-        body: SafeArea(
-          child: Stack(
-            children: [
-              if (session.isVideo) _VideoStage(session: session),
-              if (!session.isVideo)
-                Center(
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      CircleAvatar(
-                        radius: 48,
-                        backgroundColor: AppColors.brand.withValues(
-                          alpha: 0.25,
-                        ),
-                        child: Text(
-                          session.peerName.isNotEmpty
-                              ? session.peerName.characters.first.toUpperCase()
-                              : '?',
-                          style: const TextStyle(
-                            fontSize: 36,
-                            color: Colors.white,
-                            fontWeight: FontWeight.w700,
-                          ),
-                        ),
-                      ),
-                      const SizedBox(height: 20),
-                      Text(
-                        session.peerName,
-                        style: const TextStyle(
-                          color: Colors.white,
-                          fontSize: 24,
-                          fontWeight: FontWeight.w700,
-                        ),
-                      ),
-                      const SizedBox(height: 8),
-                      Text(
-                        title,
-                        style: const TextStyle(
-                          color: Colors.white70,
-                          fontSize: 15,
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              if (session.isVideo)
-                Positioned(
-                  top: 24,
-                  left: 0,
-                  right: 0,
-                  child: Column(
-                    children: [
-                      Text(
-                        session.peerName,
-                        style: const TextStyle(
-                          color: Colors.white,
-                          fontSize: 20,
-                          fontWeight: FontWeight.w700,
-                        ),
-                      ),
-                      const SizedBox(height: 4),
-                      Text(
-                        title,
-                        style: const TextStyle(color: Colors.white70),
-                      ),
-                    ],
-                  ),
-                ),
-              if (session.error != null)
-                Positioned(
-                  left: 16,
-                  right: 16,
-                  // Clear of the controls, wherever this screen's height put them.
-                  bottom: _controlsBottomFor(context) + 108,
-                  child: Material(
-                    color: Colors.red.shade900.withValues(alpha: 0.85),
-                    borderRadius: BorderRadius.circular(12),
-                    child: Padding(
-                      padding: const EdgeInsets.all(12),
-                      child: Text(
-                        session.error!,
-                        style: const TextStyle(color: Colors.white),
-                        textAlign: TextAlign.center,
-                      ),
-                    ),
-                  ),
-                ),
-              Positioned(
-                left: 0,
-                right: 0,
-                bottom: _controlsBottomFor(context),
-                child: _CallControls(
-                  session: session,
-                  ending: ending,
-                  availableRoutes: calls.availableRoutes,
-                  onAccept: () => calls.acceptIncoming(),
-                  onReject: () => calls.rejectIncoming(),
-                  onEnd: () => calls.endCall(),
-                  onToggleMute: () => session.setMuted(!session.muted),
-                  onToggleCam: () => session.setCameraOff(!session.cameraOff),
-                  onSelectRoute: (route) => calls.setAudioRoute(route),
+        // The picture runs to the edges of the screen; only the chrome over it
+        // keeps clear of the system insets.
+        body: Stack(
+          fit: StackFit.expand,
+          children: [
+            if (session.isVideo) _VideoStage(session: session),
+            // Tapping the picture puts the chrome away and brings it back, so
+            // the person on the other end can be watched without buttons over
+            // them.
+            if (canHide)
+              Positioned.fill(
+                child: GestureDetector(
+                  key: const Key('call-chrome-toggle'),
+                  behavior: HitTestBehavior.opaque,
+                  onTap: _toggleChrome,
                 ),
               ),
-            ],
-          ),
+            IgnorePointer(
+              key: const Key('call-chrome'),
+              ignoring: !chromeShown,
+              child: AnimatedOpacity(
+                opacity: chromeShown ? 1 : 0,
+                duration: const Duration(milliseconds: 180),
+                child: SafeArea(
+                  child: Stack(
+                    children: [
+                      if (!session.isVideo)
+                        Center(
+                          child: Column(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              CircleAvatar(
+                                radius: 48,
+                                backgroundColor: AppColors.brand.withValues(
+                                  alpha: 0.25,
+                                ),
+                                child: Text(
+                                  session.peerName.isNotEmpty
+                                      ? session.peerName.characters.first
+                                            .toUpperCase()
+                                      : '?',
+                                  style: const TextStyle(
+                                    fontSize: 36,
+                                    color: Colors.white,
+                                    fontWeight: FontWeight.w700,
+                                  ),
+                                ),
+                              ),
+                              const SizedBox(height: 20),
+                              Text(
+                                session.peerName,
+                                style: const TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 24,
+                                  fontWeight: FontWeight.w700,
+                                ),
+                              ),
+                              const SizedBox(height: 8),
+                              Text(
+                                title,
+                                style: const TextStyle(
+                                  color: Colors.white70,
+                                  fontSize: 15,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      if (session.isVideo)
+                        Positioned(
+                          top: 24,
+                          left: 0,
+                          right: 0,
+                          child: Column(
+                            children: [
+                              Text(
+                                session.peerName,
+                                style: const TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 20,
+                                  fontWeight: FontWeight.w700,
+                                ),
+                              ),
+                              const SizedBox(height: 4),
+                              Text(
+                                title,
+                                style: const TextStyle(color: Colors.white70),
+                              ),
+                            ],
+                          ),
+                        ),
+                      if (session.error != null)
+                        Positioned(
+                          left: 16,
+                          right: 16,
+                          // Clear of the controls, wherever this screen's
+                          // height put them.
+                          bottom: _controlsBottomFor(context) + 108,
+                          child: Material(
+                            color: Colors.red.shade900.withValues(alpha: 0.85),
+                            borderRadius: BorderRadius.circular(12),
+                            child: Padding(
+                              padding: const EdgeInsets.all(12),
+                              child: Text(
+                                session.error!,
+                                style: const TextStyle(color: Colors.white),
+                                textAlign: TextAlign.center,
+                              ),
+                            ),
+                          ),
+                        ),
+                      Positioned(
+                        left: 0,
+                        right: 0,
+                        bottom: _controlsBottomFor(context),
+                        child: _CallControls(
+                          session: session,
+                          ending: ending,
+                          availableRoutes: calls.availableRoutes,
+                          onAccept: () => calls.acceptIncoming(),
+                          onReject: () => calls.rejectIncoming(),
+                          onEnd: () => calls.endCall(),
+                          onToggleMute: () => session.setMuted(!session.muted),
+                          onToggleCam: () =>
+                              session.setCameraOff(!session.cameraOff),
+                          onSelectRoute: (route) => calls.setAudioRoute(route),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ],
         ),
       ),
     );
@@ -318,7 +385,9 @@ class _VideoStage extends StatelessWidget {
         if (session.localStream != null && !session.cameraOff)
           Positioned(
             right: 16,
-            top: 72,
+            // The picture behind it runs under the status bar, so the preview
+            // has to step around the notch itself.
+            top: MediaQuery.paddingOf(context).top + 72,
             width: 110,
             height: 160,
             child: ClipRRect(

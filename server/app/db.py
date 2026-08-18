@@ -63,6 +63,7 @@ def init_db() -> None:
     Base.metadata.create_all(bind=engine)
     _add_missing_columns()
     _add_missing_indexes()
+    _seed_spoken_days()
 
 
 # Columns added after the first release. ``create_all`` only creates missing
@@ -98,6 +99,22 @@ def _add_missing_columns() -> None:
                 conn.exec_driver_sql(
                     f"ALTER TABLE {table} ADD COLUMN {column} {column_type}"
                 )
+
+
+def _seed_spoken_days() -> None:
+    """Recovers couple streaks from the messages an upgraded database still has.
+
+    Only ever fills an empty ledger, so this is a one-off on the first start
+    after the upgrade and a no-op on every start after that.
+    """
+    # pylint: disable=import-outside-toplevel
+    from app.streaks import backfill_spoken_days
+
+    session = SessionLocal()
+    try:
+        backfill_spoken_days(session)
+    finally:
+        session.close()
 
 
 def _add_missing_indexes() -> None:

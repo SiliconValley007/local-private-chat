@@ -40,6 +40,32 @@ class CoupleMenuLabel {
 /// have no couple to speak of.
 bool offersCoupleDetails(String conversationType) => conversationType == 'dm';
 
+/// What the couple sheet says about the streak, including when there isn't one.
+class StreakLines {
+  const StreakLines({required this.title, required this.subtitle});
+
+  final String title;
+  final String subtitle;
+}
+
+/// Wording for the streak row.
+///
+/// A count of zero used to hide the row altogether, which read as the streak
+/// having been removed from the app rather than simply not being under way. It
+/// now says so, and says what starts one.
+StreakLines streakLines(int days) {
+  if (days <= 0) {
+    return const StreakLines(
+      title: 'No streak yet',
+      subtitle: 'A streak starts on a day you both send a message.',
+    );
+  }
+  return StreakLines(
+    title: days == 1 ? '1-day streak' : '$days-day streak',
+    subtitle: 'A day counts when both of you send a message.',
+  );
+}
+
 /// Names the menu entry after what it does while it is switched off, so a chat
 /// with a parent in it shows nothing more suggestive than a date reminder.
 CoupleMenuLabel coupleMenuLabel({

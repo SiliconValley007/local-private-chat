@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import select
 
+from app import streaks
 from app.avatars import avatar_version_for, has_avatar
 from app.image_shape import media_pixel_size
 from app.models import Conversation, ConversationMember, Message, User
@@ -25,36 +25,13 @@ from app.wallpapers import has_wallpaper, wallpaper_version_for
 DELETED_BODY = "This message was deleted"
 
 
-def _message_day(created_at: datetime) -> datetime.date:
-    if created_at.tzinfo is None:
-        created_at = created_at.replace(tzinfo=timezone.utc)
-    return created_at.astimezone(timezone.utc).date()
-
-
 def compute_dm_streak(db, conversation: Conversation) -> int:
-    """Consecutive UTC calendar days where every member sent at least one message."""
-    if conversation.type != "dm":
-        return 0
-    member_ids = {m.user_id for m in conversation.members}
-    if len(member_ids) < 2:
-        return 0
+    """Consecutive days where everyone in a one-to-one chat said something.
 
-    rows = db.execute(
-        select(Message.sender_id, Message.created_at).where(
-            Message.conversation_id == conversation.id,
-            Message.deleted_at.is_(None),
-        )
-    ).all()
-    by_day: dict[datetime.date, set[int]] = defaultdict(set)
-    for sender_id, created_at in rows:
-        by_day[_message_day(created_at)].add(sender_id)
-
-    streak = 0
-    day = datetime.now(timezone.utc).date()
-    while member_ids <= by_day.get(day, set()):
-        streak += 1
-        day -= timedelta(days=1)
-    return streak
+    Counted from the day ledger in [app.streaks], not from the messages that
+    happen to still be in the table.
+    """
+    return streaks.streak_days(db, conversation)
 
 
 def aggregate_reactions(
@@ -175,9 +152,9 @@ def conversation_out(
     *,
     is_online_fn,
 ) -> ConversationOut:
-    from sqlalchemy import func, select
+    from sqlalchemy import func
 
-    from app.models import Message, MessageReceipt
+    from app.models import MessageReceipt
 
     peer_user = None
     if conv.type == "dm":

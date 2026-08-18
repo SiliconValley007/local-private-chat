@@ -121,15 +121,14 @@ class CallAudio(context: Context) {
         vibrator = null
     }
 
-    fun prepareForCall(isVideo: Boolean) {
+    fun prepareForCall() {
         if (prepared) return
         savedMode = audioManager.mode
         savedSpeaker = audioManager.isSpeakerphoneOn
         savedSco = audioManager.isBluetoothScoOn
         audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
         if (!bluetoothActive()) {
-            val route = CallAudioPolicy.defaultRoute(isVideo, listRoutes())
-            applyRoute(route)
+            applyRoute(CallAudioPolicy.defaultRoute(listRoutes()))
         }
         prepared = true
     }

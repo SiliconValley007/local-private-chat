@@ -247,9 +247,7 @@ class CallService extends ChangeNotifier {
 
     try {
       await session.openLocalMedia(video: media == 'video');
-      await CallAudioController.instance.prepareInCallAudio(
-        isVideo: session.isVideo,
-      );
+      await CallAudioController.instance.prepareInCallAudio();
       session.audioRoute = CallAudioController.instance.selectedRoute;
       final pc = await session.createPeer(onIce: (c) => _sendIce(session, c));
       await session.addLocalTracks(pc);
@@ -338,9 +336,7 @@ class CallService extends ChangeNotifier {
       notifyListeners();
       await _syncCallAudio(session);
       await session.openLocalMedia(video: session.isVideo);
-      await CallAudioController.instance.prepareInCallAudio(
-        isVideo: session.isVideo,
-      );
+      await CallAudioController.instance.prepareInCallAudio();
       session.audioRoute = CallAudioController.instance.selectedRoute;
       final pc = await session.createPeer(onIce: (c) => _sendIce(session, c));
       await session.addLocalTracks(pc);
@@ -693,9 +689,7 @@ class CallService extends ChangeNotifier {
     );
     if (session.phase == CallPhase.connecting ||
         session.phase == CallPhase.active) {
-      await CallAudioController.instance.prepareInCallAudio(
-        isVideo: session.isVideo,
-      );
+      await CallAudioController.instance.prepareInCallAudio();
       session.audioRoute = CallAudioController.instance.selectedRoute;
     }
   }

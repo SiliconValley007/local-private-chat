@@ -54,8 +54,7 @@ class MainActivity : FlutterActivity() {
                         result.success(null)
                     }
                     "prepareForCall" -> {
-                        val isVideo = call.argument<Boolean>("isVideo") ?: false
-                        audio.prepareForCall(isVideo)
+                        audio.prepareForCall()
                         // A call with the screen off must keep its tunnel.
                         AppForeground.noteCall(true)
                         result.success(null)

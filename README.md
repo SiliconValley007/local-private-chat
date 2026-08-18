@@ -41,7 +41,7 @@ Inspired by the deployment model of [local-drive](https://github.com/SiliconVall
 - **No flash of "nothing here"** — chats, the chat list, starred, nudge history, shared media and uploads show stand-in rows until the first load resolves, so an empty illustration is never painted over history that is a second away
 - **Jump straight to a message** — starred, quoted/tagged replies, pins, search hits and “show in chat” fetch the history between here and there in a single request, then walk to the exact row, centre it, and light a highlight band behind it *as it arrives* (the same band for text, photos, files and drawings). The walk measures each step against the rows on screen instead of assuming every row is the same height, which is how it lands in a chat where one photo is worth a dozen lines of text; it never leaps past the end of the content, finds its way back if it ever ends up looking at nothing, holds history paging so the rows cannot renumber underneath it, and if it truly cannot land it says so and puts you back where you started
 - **Previews keep the shape they were taken in** — a photo, screenshot or video keeps its own proportions in the bubble, standing tall for a portrait and lying flat for a panorama, cropped past those limits rather than squashed; the shape is remembered so a row never resizes twice
-- **Couple details (DMs)** — every one-to-one chat carries an **Anniversary and streak** entry in its ⋮ menu, reading “Off” until you use it, so the one chat that wants a date is a tap away and a chat with a parent or a colleague shows nothing until you say so. Setting a date turns the display on by itself; the switch, the date, and the streak all live in the same sheet, and the contact's info page has the same switch. Everything stays on this phone
+- **Couple details (DMs)** — every one-to-one chat carries an **Anniversary and streak** entry in its ⋮ menu, reading “Off” until you use it, so the one chat that wants a date is a tap away and a chat with a parent or a colleague shows nothing until you say so. Setting a date turns the display on by itself; the switch, the date, and the streak all live in the same sheet, and the contact's info page has the same switch. Everything stays on this phone. The streak counts days from a ledger the server writes the moment somebody sends (`app/streaks.py`, one row per chat, per person, per UTC day), never from the messages still in the table: deleting a message for everyone, or letting a disappearing timer clear the day, cannot take back a day you both spoke on. It counts back from today or yesterday, so a live streak never reads zero for the hours before the day gets going, and the row stays in the sheet at zero saying what would start one
 - **Shared chat wallpapers** — any member sets one image and everyone in the chat sees it; the gallery grid offers photos only and has no Send/Preview step (one tap goes straight to framing), the picked photo is framed with pinch to zoom and drag to position against a live preview of the chat bubbles, and the dim slider that keeps text legible is set in the same place
 - **Activity log (admin)** — the server keeps its own append-only account of every action: who did it, when, from which address, and for an edit or a deletion **the text as it stood before**, so a message removed from a chat is still on record. One account holds the role, named by username (`DDas`), claimed from the app (self only while unclaimed) or pinned on the server with `LOCALCHAT_ADMIN_USERNAME` / `SetAdmin.exe`. The first phone that successfully opens the log is pinned as the trusted admin device; other installs of the same account are refused until the pin is cleared. The admin can force-sign-out any other user. The screen speaks in human sentences (timers as “24 hours”, chat names when known), opens sealed DM text **only on a member phone that holds the key**, folds machine ids under Technical details, and copies a readable report. Every person in an entry is named from what the server wrote down at the time — who sent the message, who else was in that chat, and whether a deletion was the sender's own or an admin's — so the reader is never presented as the other party, and a timer running out is not recorded as somebody deleting anything. Nothing in the app can edit or delete an entry
 - **Server status** — the inbox overflow menu reports the host running the chat: Termux/Android or Windows, free RAM and what the server process itself holds, disk, battery with charging state, and uptime, plus plain advice when any of them turns risky. Read on open and on pull-to-refresh only, never polled, so watching the server costs no battery
@@ -598,8 +598,15 @@ A server-rendered FCM `notification` block cannot read private storage on the re
 - Missed or interrupted invites are recovered from a short-lived pending-call store when the app returns online.
 - Call notifications resolve the recipient's private saved alias, just like
   message notifications.
-- Voice defaults to earpiece, video to speaker; the in-call route control offers
-  earpiece, speaker, and Bluetooth when Android reports them.
+- Every call starts on a connected Bluetooth headset if there is one, otherwise
+  the earpiece, and only falls back to the speaker when nothing else is there —
+  video calls included, so a call no longer announces itself to the room. The
+  in-call route control offers earpiece, speaker, and Bluetooth when Android
+  reports them, and a route you pick during a call stays picked.
+- On a video call that is under way, a tap on the picture clears the name, timer,
+  and buttons away and hides the system bars, so the other person fills the
+  screen; another tap anywhere brings everything back. The buttons return by
+  themselves when the call ends, and a voice call always keeps its controls.
 - The server finalizes each call exactly once. Transcript rows include outcome,
   connected duration, and who ended an answered call; remote hangup closes the
   call screen instead of leaving a black spinner.
@@ -774,7 +781,11 @@ On both client phones:
 2. **Calls** — place audio + video foreground/background/locked; verify local
    alias in the alert, ringtone/vibration, ringback only after Ringing, no black
    hangup screen, one transcript row, correct ended-by text, and
-   earpiece/speaker/Bluetooth routing. Test reject/cancel/no-answer/offline.
+   earpiece/speaker/Bluetooth routing. Every call must start on a paired headset
+   if one is connected, otherwise the earpiece — video included. On a connected
+   video call, tap the picture: name, timer, buttons, and the system bars all go
+   away and come back on the next tap, and the bars are back after hanging up.
+   Test reject/cancel/no-answer/offline.
 3. **Gallery/captions** — review, reorder, remove, and caption single/multiple
    photos, videos, and documents; only the first batch item gets the caption.
 4. **Bottom/navigation** — a photo-heavy chat opens on the newest bubble;
@@ -846,7 +857,10 @@ On both client phones:
 21. **Anniversary and streak** — every DM's ⋮ menu shows the entry, reading
     "Off". Set a date: the countdown appears in that chat only. Open a chat with
     a parent and confirm nothing about couples shows there. Turn it off again and
-    the banner and streak go, while the date stays for next time.
+    the banner and streak go, while the date stays for next time. With it on,
+    the streak row is always there — "No streak yet" until you have both sent
+    something on the same day. Send one each, reopen the sheet, and it reads
+    "1-day streak"; delete your message for everyone and the count must stay.
 22. **Activity log (admin)** — sign in as the admin (`DDas`) and open Activity log
     from the inbox menu. Send, edit, then delete a message; each shows up newest
     first, with the edit holding both versions and the deletion holding what was
@@ -929,7 +943,16 @@ contract are tested (`tests/test_integration_ws.py`,
 
 ## GitHub Releases (APK + Windows server)
 
-**Current app version:** `1.8.3+36` (the activity log now names the people in an
+**Current app version:** `1.8.4+37` (the couple streak is counted from a day
+ledger the server writes as people send, so deleting a message or letting a
+disappearing timer clear the day no longer erases days you both plainly spoke on,
+and the streak row now stays in the couple sheet and says "No streak yet" instead
+of hiding itself; a tap on a video call clears the name, timer and buttons away
+and puts the picture full-screen, system bars included, and another tap brings
+them back; and every call — voice or video — now starts on a connected Bluetooth
+headset, then the earpiece, with the speaker as the last resort, instead of video
+calls opening on the speaker;
+plus the 1.8.3 additions: the activity log names the people in an
 entry from what the server recorded at the time — who sent the message, who else
 was in that chat, and who removed it — so no entry can read as though you sent a
 message to yourself; a sealed entry opens as soon as the key for that chat is
