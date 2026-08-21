@@ -3,12 +3,15 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
 import 'api_client.dart';
+import 'app_entry.dart';
 import 'app_state.dart';
 import 'navigation.dart';
 import 'screens/auth_screen.dart';
+import 'screens/app_lock_screen.dart';
 import 'screens/inbox_screen.dart';
 import 'screens/privacy_onboarding_screen.dart';
 import 'screens/tailscale_gate_screen.dart';
+import 'services/app_lock_store.dart';
 import 'services/notification_service.dart';
 import 'services/privacy_onboarding_store.dart';
 import 'services/theme_store.dart';
@@ -28,19 +31,44 @@ Future<void> main() async {
   FirebaseMessaging.onBackgroundMessage(firebaseMessagingBackgroundHandler);
   // Read before the first frame, otherwise a dark-mode phone flashes white.
   final themeMode = await ThemeStore.load();
-  runApp(LocalChatApp(initialThemeMode: themeMode));
+  final api = ApiClient();
+  final appLockStore = AppLockStore();
+  await api.loadPersisted();
+  final lockSettings = await appLockStore.load();
+  runApp(
+    LocalChatApp(
+      initialThemeMode: themeMode,
+      api: api,
+      appLockStore: appLockStore,
+      initialLockSettings: lockSettings,
+    ),
+  );
 }
 
 class LocalChatApp extends StatelessWidget {
-  const LocalChatApp({super.key, this.initialThemeMode = ThemeMode.system});
+  const LocalChatApp({
+    super.key,
+    this.initialThemeMode = ThemeMode.system,
+    this.api,
+    this.appLockStore,
+    this.initialLockSettings,
+  });
 
   final ThemeMode initialThemeMode;
+  final ApiClient? api;
+  final AppLockStore? appLockStore;
+  final AppLockSettings? initialLockSettings;
 
   @override
   Widget build(BuildContext context) {
     return ChangeNotifierProvider(
       create: (_) {
-        final state = AppState(ApiClient(), themeMode: initialThemeMode);
+        final state = AppState(
+          api ?? ApiClient(),
+          themeMode: initialThemeMode,
+          appLockStore: appLockStore,
+          initialLockSettings: initialLockSettings,
+        );
         state.bootstrap();
         return state;
       },
@@ -53,21 +81,21 @@ class LocalChatApp extends StatelessWidget {
           theme: buildAppTheme(),
           darkTheme: buildAppTheme(brightness: Brightness.dark),
           themeMode: state.themeMode,
-          home: const _Root(),
+          home: const AppRoot(),
         ),
       ),
     );
   }
 }
 
-class _Root extends StatefulWidget {
-  const _Root();
+class AppRoot extends StatefulWidget {
+  const AppRoot({super.key});
 
   @override
-  State<_Root> createState() => _RootState();
+  State<AppRoot> createState() => _AppRootState();
 }
 
-class _RootState extends State<_Root> {
+class _AppRootState extends State<AppRoot> {
   bool? _onboardingDone;
   int? _checkedForUserId;
 
@@ -100,6 +128,18 @@ class _RootState extends State<_Root> {
   Widget build(BuildContext context) {
     final state = context.watch<AppState>();
 
+    // Privacy outranks connectivity. An armed lock is the only widget until
+    // unlock — never the Tailscale gate, and never a cached inbox.
+    if (appEntryKind(
+          isLoggedIn: state.isLoggedIn,
+          appLocked: state.appLocked,
+          ready: state.ready,
+          onboardingDone: _onboardingDone,
+          hasStableShell: _stableShell != null,
+        ) ==
+        AppEntryKind.lock) {
+      return const AppLockScreen();
+    }
     // Only the very first boot may blank the tree. Once the inbox (or auth)
     // has painted, keep that shell through brief readiness flaps after a call.
     if (!state.ready) {

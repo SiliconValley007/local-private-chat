@@ -86,7 +86,7 @@ String uploadProgressLabel({
   bool waiting = false,
 }) {
   if (waiting) {
-    return 'Paused — waiting for the connection…';
+    return 'Connection lost — upload will retry automatically…';
   }
   if (filesTotal > 1) {
     final current = filesDone + 1 > filesTotal ? filesTotal : filesDone + 1;

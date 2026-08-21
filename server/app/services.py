@@ -8,7 +8,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 from fastapi import HTTPException, status
-from sqlalchemy import and_, delete, or_, select
+from sqlalchemy import and_, delete, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
@@ -582,7 +582,7 @@ async def edit_message(
     editor: User,
     new_body: str,
 ) -> Message:
-    """Edit a text message you sent. Soft-deleted messages cannot be edited."""
+    """Edit your text, or let any chat member update a shared checklist."""
     message = load_message(db, message_id)
     if message is None:
         raise HTTPException(
@@ -590,7 +590,8 @@ async def edit_message(
             detail="That message is no longer available.",
         )
     require_membership(db, message.conversation_id, editor.id)
-    if message.sender_id != editor.id:
+    is_checklist = message.type == "list"
+    if not is_checklist and message.sender_id != editor.id:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="You can only edit messages you sent.",
@@ -600,15 +601,15 @@ async def edit_message(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Deleted messages cannot be edited.",
         )
-    if message.type != "text":
+    if message.type not in {"text", "list"}:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Only text messages can be edited.",
+            detail="Only text messages and checklists can be edited.",
         )
     created = message.created_at
     if created.tzinfo is None:
         created = created.replace(tzinfo=timezone.utc)
-    if utcnow() - created.astimezone(timezone.utc) > EDIT_WINDOW:
+    if not is_checklist and utcnow() - created.astimezone(timezone.utc) > EDIT_WINDOW:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Edit window expired",
@@ -718,6 +719,116 @@ async def soft_delete_message(
         members, events.event_pins_changed(message.conversation_id)
     )
     return message
+
+
+async def permanently_delete_saved_message(
+    db: Session,
+    *,
+    message_id: int,
+    actor: User,
+) -> None:
+    """Erase one Saved Messages row instead of leaving a chat tombstone."""
+    message = load_message(db, message_id)
+    if message is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="That saved message is no longer available.",
+        )
+    require_membership(db, message.conversation_id, actor.id)
+    conversation = db.get(Conversation, message.conversation_id)
+    if conversation is None or conversation.type != "notes":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Permanent deletion is only available in Saved messages.",
+        )
+    if message.sender_id != actor.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only delete your own saved messages.",
+        )
+
+    conversation_id = message.conversation_id
+    media_path = message.media_path
+    thumb_path = message.media_thumb_path
+    details = audit.snapshot(message)
+    description = audit.describe_message(message)
+
+    # Explicit cleanup keeps this safe on old SQLite databases whose foreign
+    # keys may predate the current on-delete settings.
+    db.execute(
+        update(Message)
+        .where(Message.reply_to_message_id == message_id)
+        .values(reply_to_message_id=None)
+    )
+    for model in (
+        MessageHide,
+        MessagePin,
+        MessageReaction,
+        MessageReceipt,
+        MessageStar,
+    ):
+        db.execute(delete(model).where(model.message_id == message_id))
+    db.execute(delete(Message).where(Message.id == message_id))
+    db.commit()
+
+    # Keep only the fact that a deletion happened. Saved content itself is not
+    # copied into the audit trail, so permanent deletion actually removes it.
+    audit.record(
+        db,
+        action="message.deleted",
+        summary=(
+            f"{actor.username} permanently deleted {description} "
+            f"(message {message_id}) from Saved messages"
+        ),
+        actor=actor,
+        conversation_id=conversation_id,
+        message_id=message_id,
+        target_user_id=actor.id,
+        details={**details, "permanent": True, "saved_messages": True},
+    )
+    delete_message_files(media_path, thumb_path)
+    await hub.send_to_user(
+        actor.id,
+        events.event_message_removed(
+            message_id=message_id,
+            conversation_id=conversation_id,
+        ),
+    )
+    await hub.send_to_user(
+        actor.id,
+        events.event_conversation_updated(conversation_id),
+    )
+    await hub.send_to_user(actor.id, events.event_stars_changed())
+
+
+def purge_saved_message_tombstones(db: Session, conversation_id: int) -> int:
+    """Remove placeholders produced by older Saved Messages deletion logic."""
+    ids = list(
+        db.scalars(
+            select(Message.id).where(
+                Message.conversation_id == conversation_id,
+                Message.deleted_at.is_not(None),
+            )
+        ).all()
+    )
+    if not ids:
+        return 0
+    db.execute(
+        update(Message)
+        .where(Message.reply_to_message_id.in_(ids))
+        .values(reply_to_message_id=None)
+    )
+    for model in (
+        MessageHide,
+        MessagePin,
+        MessageReaction,
+        MessageReceipt,
+        MessageStar,
+    ):
+        db.execute(delete(model).where(model.message_id.in_(ids)))
+    db.execute(delete(Message).where(Message.id.in_(ids)))
+    db.commit()
+    return len(ids)
 
 
 async def hide_message_for_user(
@@ -1429,7 +1540,7 @@ def search_messages(
         conditions.append(Message.body.ilike("%http%"))
         if needle:
             conditions.append(Message.body.ilike(f"%{needle}%"))
-    elif kind in ("image", "video", "file", "voice", "doodle"):
+    elif kind in ("image", "video", "file", "voice", "doodle", "call", "list"):
         conditions.append(Message.type == kind)
         if needle:
             conditions.append(
@@ -1441,7 +1552,7 @@ def search_messages(
     else:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="media_type must be text, image, video, file, voice, doodle, or link.",
+            detail="media_type must be text, image, video, file, voice, doodle, link, call, or list.",
         )
 
     if sender_id is not None:

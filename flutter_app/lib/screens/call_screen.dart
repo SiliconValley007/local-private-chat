@@ -290,6 +290,12 @@ class _CallScreenState extends State<CallScreen> {
                                   fontSize: 15,
                                 ),
                               ),
+                              if (phase == CallPhase.active) ...[
+                                const SizedBox(height: 8),
+                                _ConnectionQualityLabel(
+                                  quality: session.networkQuality,
+                                ),
+                              ],
                             ],
                           ),
                         ),
@@ -313,6 +319,12 @@ class _CallScreenState extends State<CallScreen> {
                                 title,
                                 style: const TextStyle(color: Colors.white70),
                               ),
+                              if (phase == CallPhase.active) ...[
+                                const SizedBox(height: 6),
+                                _ConnectionQualityLabel(
+                                  quality: session.networkQuality,
+                                ),
+                              ],
                             ],
                           ),
                         ),
@@ -360,6 +372,40 @@ class _CallScreenState extends State<CallScreen> {
             ),
           ],
         ),
+      ),
+    );
+  }
+}
+
+class _ConnectionQualityLabel extends StatelessWidget {
+  const _ConnectionQualityLabel({required this.quality});
+
+  final CallNetworkQuality quality;
+
+  @override
+  Widget build(BuildContext context) {
+    final warning =
+        quality == CallNetworkQuality.fair ||
+        quality == CallNetworkQuality.poor ||
+        quality == CallNetworkQuality.reconnecting;
+    final color = warning ? Colors.amber.shade200 : Colors.white70;
+    return Semantics(
+      liveRegion: warning,
+      label: callNetworkQualityLabel(quality),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(
+            warning ? Icons.signal_wifi_bad_rounded : Icons.lock_rounded,
+            size: 14,
+            color: color,
+          ),
+          const SizedBox(width: 5),
+          Text(
+            callNetworkQualityLabel(quality),
+            style: TextStyle(color: color, fontSize: 12.5),
+          ),
+        ],
       ),
     );
   }

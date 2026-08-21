@@ -52,10 +52,15 @@ object TailscaleIdleExit {
 
     /**
      * Runs on the alarm; sets the timer again instead when the user is back in
-     * the app or a call is still running, so a busy phone is checked later
-     * rather than left connected for good.
+     * the app or a call/upload is still running, so a busy phone is checked
+     * later rather than left connected for good.
      */
-    fun onAlarm(context: Context, appForeground: Boolean, callActive: Boolean) {
+    fun onAlarm(
+        context: Context,
+        appForeground: Boolean,
+        callActive: Boolean,
+        transferActive: Boolean,
+    ) {
         val app = context.applicationContext
         val snap = TailscaleExit.readOwnership(app)
         if (!TailscaleExitPolicy.shouldDisconnectOnIdleAlarm(
@@ -63,9 +68,10 @@ object TailscaleIdleExit {
                 snap.phase,
                 appForeground,
                 callActive,
+                transferActive,
             )
         ) {
-            if (appForeground || callActive) arm(app)
+            if (appForeground || callActive || transferActive) arm(app)
             return
         }
         TailscaleExit.disconnectIfAllowed(app, "idle in background")

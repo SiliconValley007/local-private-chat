@@ -63,6 +63,10 @@ dist/
 releases/*
 !releases/.gitkeep
 
+# --- Local investigation dumps (never source) ---
+.package-audit/
+.video-analysis/
+
 # --- Stray build / run logs ---
 *.log
 gradle_out.txt

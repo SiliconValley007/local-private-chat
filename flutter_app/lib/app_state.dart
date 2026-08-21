@@ -4,12 +4,14 @@ import 'dart:io';
 // material.dart (not widgets.dart) for ThemeMode, which lives in Material.
 import 'package:flutter_cache_manager/flutter_cache_manager.dart';
 import 'package:flutter/material.dart';
+import 'package:local_auth/local_auth.dart';
 import 'package:uuid/uuid.dart';
 
 import 'api_client.dart';
 import 'app_config.dart';
 import 'audit.dart';
 import 'chat_navigation.dart';
+import 'checklist.dart';
 import 'doodle_stroke.dart';
 import 'e2e_text.dart';
 import 'errors.dart';
@@ -23,6 +25,7 @@ import 'nudge_log.dart';
 import 'realtime_service.dart';
 import 'screens/call_screen.dart';
 import 'services/backup_service.dart';
+import 'services/app_lock_store.dart';
 import 'services/call_service.dart';
 import 'services/connectivity_service.dart';
 import 'services/contacts_store.dart';
@@ -32,6 +35,7 @@ import 'services/incoming_share_service.dart';
 import 'services/media_prefs_store.dart';
 import 'services/media_store.dart';
 import 'services/notification_service.dart';
+import 'services/outbox_store.dart';
 import 'services/pending_call_store.dart';
 import 'services/tailscale_assist.dart';
 import 'services/tailscale_prefs_store.dart';
@@ -72,7 +76,12 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     TailscaleAssist? tailscale,
     IncomingShareService? incomingShares,
     E2EService? e2e,
+    AppLockStore? appLockStore,
+    LocalAuthentication? localAuthentication,
+    AppLockSettings? initialLockSettings,
   }) : e2e = e2e ?? E2EService(),
+       appLockStore = appLockStore ?? AppLockStore(),
+       localAuthentication = localAuthentication ?? LocalAuthentication(),
        realtime = RealtimeService(api),
        connectivity = ConnectivityService(baseUrlProvider: () => api.baseUrl),
        backup = BackupService(api),
@@ -99,6 +108,10 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     };
     realtime.onConnectionChanged = _onRealtimeConnectionChanged;
     WidgetsBinding.instance.addObserver(this);
+    if (initialLockSettings != null) {
+      appLockSettings = initialLockSettings;
+      appLocked = isLoggedIn && initialLockSettings.armed;
+    }
   }
 
   final ApiClient api;
@@ -106,6 +119,8 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   final ConnectivityService connectivity;
   final BackupService backup;
   final TailscaleAssist tailscale;
+  final AppLockStore appLockStore;
+  final LocalAuthentication localAuthentication;
 
   /// Shares and `localchat://` links handed over by Android.
   final IncomingShareService incomingShares;
@@ -144,6 +159,18 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
 
   /// Local media download behaviour (Wi‑Fi-only video, etc.).
   MediaPrefs mediaPrefs = const MediaPrefs();
+
+  AppLockSettings appLockSettings = const AppLockSettings();
+  bool appLocked = false;
+  bool biometricAvailable = false;
+  bool biometricUnlocking = false;
+  DateTime? _backgroundedAt;
+  bool _biometricPromptActive = false;
+  bool _leftDuringBiometric = false;
+  DateTime? _unlockedAt;
+
+  @visibleForTesting
+  bool get biometricPromptActive => _biometricPromptActive;
 
   /// Durable phase of who may switch Tailscale off on exit (native is authority).
   TailscaleOwnershipPhase _tailscalePhase = TailscaleOwnershipPhase.unowned;
@@ -198,6 +225,42 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   /// conversationId -> pin/mute prefs for this phone only.
   Map<int, ConversationPrefs> conversationPrefs = {};
   final Map<int, List<ChatMessage>> messagesByConv = {};
+
+  /// Text and checklist sends waiting for a working private path.
+  ///
+  /// Kept in memory for O(1) UI reads and mirrored to SharedPreferences after
+  /// each mutation so Android can kill the process without losing a send.
+  List<OutboxItem> _outbox = const [];
+  int? _outboxUserId;
+  bool _outboxFlushing = false;
+
+  /// Queued sends with a request in flight right now.
+  ///
+  /// Every send is written to the queue before the request leaves, so the queue
+  /// alone cannot tell "waiting for the network" apart from "on its way". Only
+  /// the former deserves a banner; a healthy send is already reported by the
+  /// clock on its own bubble.
+  final Set<String> _outboxInFlight = {};
+  final Set<int> _checklistUpdates = {};
+
+  int outboxCountFor(int conversationId) => _outboxFlushing
+      ? 0
+      : _outbox
+            .where(
+              (item) =>
+                  item.conversationId == conversationId &&
+                  !_outboxInFlight.contains(item.clientId),
+            )
+            .length;
+
+  int get outboxCount => _outboxFlushing
+      ? 0
+      : _outbox
+            .where((item) => !_outboxInFlight.contains(item.clientId))
+            .length;
+
+  bool checklistUpdating(int messageId) =>
+      _checklistUpdates.contains(messageId);
 
   /// Conversations whose history has answered at least once this session.
   ///
@@ -262,9 +325,53 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   final Map<int, Set<int>> typingUsers = {};
   final Map<int, bool> onlineByUser = {};
 
-  /// Freshest "last seen" heard over the socket. More current than the value
-  /// that arrived with the last inbox refresh.
+  /// Freshest trustworthy "last seen" heard from either realtime or REST.
   final Map<int, DateTime> lastSeenByUser = {};
+
+  bool isUserOnline(ChatUser user) => onlineByUser[user.id] ?? user.isOnline;
+
+  /// Returns the freshest known offline time and never exposes an old timestamp
+  /// while the same source says the person is online.
+  DateTime? lastSeenFor(ChatUser user) {
+    if (isUserOnline(user)) return null;
+    final local = lastSeenByUser[user.id];
+    final server = user.lastSeenAt;
+    if (local == null) return server;
+    if (server == null) return local;
+    return local.isAfter(server) ? local : server;
+  }
+
+  void _mergePresence({
+    required int userId,
+    required bool online,
+    DateTime? lastSeenAt,
+    bool authoritativeOffline = false,
+  }) {
+    if (online) {
+      onlineByUser[userId] = true;
+      // The previous offline instant is no longer a meaningful fallback. This
+      // was the sticky value behind "online" becoming "26 minutes ago".
+      lastSeenByUser.remove(userId);
+      return;
+    }
+    if (lastSeenAt == null && !authoritativeOffline) {
+      // REST can briefly observe hub=offline before disconnect has committed
+      // its timestamp. Offline is still authoritative, but showing no time for
+      // that brief window is more honest than resurrecting "26 minutes ago".
+      onlineByUser[userId] = false;
+      lastSeenByUser.remove(userId);
+      return;
+    }
+    onlineByUser[userId] = false;
+    if (lastSeenAt == null) {
+      lastSeenByUser.remove(userId);
+      return;
+    }
+    final previous = lastSeenByUser[userId];
+    if (previous == null || lastSeenAt.isAfter(previous)) {
+      lastSeenByUser[userId] = lastSeenAt;
+    }
+  }
 
   /// userId -> avatar cache-busting version. A present entry means the user has
   /// a picture; the value changes whenever they replace it, which busts the
@@ -302,6 +409,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     _reconnectNotice?.cancel();
     if (connected) {
       showReconnecting = false;
+      unawaited(flushOutbox());
       final active = activeConversationId;
       if (active != null && isLoggedIn) {
         syncInBackground(active, markRead: true);
@@ -356,6 +464,21 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     error = null;
     await api.loadPersisted();
     await e2e.init();
+    appLockSettings = await appLockStore.load();
+    // An interrupted setup can leave the preference saying "on" with no PIN
+    // behind it. Screens read `armed` so that half state is never presented as
+    // a live lock, but the stored preference is deliberately left alone: an
+    // earlier build rewrote it to "off" here, which turned one bad read into
+    // permanent loss of the owner's choice.
+    // Do not re-arm after this session already unlocked (PIN or fingerprint
+    // can finish while e2e/storage is still loading).
+    if (_unlockedAt == null) {
+      appLocked = isLoggedIn && appLockSettings.armed;
+    } else if (!isLoggedIn || !appLockSettings.armed) {
+      appLocked = false;
+    }
+    notifyListeners();
+    unawaited(_refreshBiometricAvailability());
     contactAliases = await contactsStore.aliases();
     conversationPrefs = await ConversationPrefsStore.load();
     tailscalePrefs = await TailscalePrefsStore.load();
@@ -538,6 +661,8 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     try {
       await api.fetchMe();
       await refreshInbox();
+      await _loadOutboxForCurrentUser();
+      unawaited(flushOutbox());
       await refreshLocalContacts();
       await refreshStarred();
       await _registerFcm();
@@ -670,8 +795,15 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
         lastCheck: serverCheck,
       );
       if (sent) await _syncTailscalePhaseFromNative();
-      // A second nudge helps when the first landed while the receiver was waking.
-      await Future<void>.delayed(const Duration(milliseconds: 700));
+      // A second nudge helps when the receiver was waking. A false result can
+      // also mean the native 3-second exit guard is still protecting a recent
+      // background disconnect; wait it out instead of making the user's first
+      // return to the app fail once in a while.
+      await Future<void>.delayed(
+        sent
+            ? const Duration(milliseconds: 700)
+            : const Duration(milliseconds: 3200),
+      );
       await tailscale.requestConnect(force: true, lastCheck: serverCheck);
       await _syncTailscalePhaseFromNative();
       for (var i = 0; i < 15; i++) {
@@ -732,6 +864,198 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     await MediaPrefsStore.save(value);
   }
 
+  Future<void> _refreshBiometricAvailability() async {
+    try {
+      biometricAvailable =
+          await localAuthentication.canCheckBiometrics &&
+          (await localAuthentication.getAvailableBiometrics()).isNotEmpty;
+    } catch (_) {
+      biometricAvailable = false;
+    }
+    notifyListeners();
+  }
+
+  Future<void> setAppLock({
+    required String pin,
+    required AppLockTimeout timeout,
+    bool biometricsEnabled = true,
+    AppLockPreferredAuth preferredAuth = AppLockPreferredAuth.biometric,
+  }) async {
+    if (!isValidAppLockPin(pin)) {
+      throw ArgumentError('Use 4 to 8 digits for the app PIN.');
+    }
+    if (!await appLockStore.setPin(pin)) {
+      throw StateError(
+        'This phone would not keep the PIN, so app lock stays off.',
+      );
+    }
+    appLockSettings = appLockSettings.copyWith(
+      enabled: true,
+      hasPin: true,
+      timeout: timeout,
+      biometricsEnabled: biometricsEnabled,
+      preferredAuth: biometricsEnabled
+          ? preferredAuth
+          : AppLockPreferredAuth.pin,
+    );
+    await appLockStore.saveSettings(appLockSettings);
+    appLocked = false;
+    notifyListeners();
+  }
+
+  /// Turns protection on or off without throwing away the saved PIN.
+  ///
+  /// Home / office use: leave the PIN on this phone, flip the switch when you
+  /// want Local Chat to ask for it again. Turning off still needs the PIN once
+  /// so someone with a briefly unlocked phone cannot silently disarm it.
+  Future<void> setAppLockEnabled(bool enabled) async {
+    if (enabled) {
+      if (!appLockSettings.hasPin) {
+        throw StateError('Set an app PIN before turning lock on.');
+      }
+      appLockSettings = appLockSettings.copyWith(enabled: true);
+      await appLockStore.saveSettings(appLockSettings);
+      notifyListeners();
+      return;
+    }
+    // This is a convenience/privacy preference, not account authentication.
+    // The phone is already unlocked and Remove PIN remains separately
+    // protected. Requiring the PIN for every home/office toggle made the
+    // requested quick switch frustrating and error-prone.
+    appLockSettings = appLockSettings.copyWith(enabled: false);
+    await appLockStore.saveSettings(appLockSettings);
+    appLocked = false;
+    notifyListeners();
+  }
+
+  Future<void> updateAppLockTimeout(AppLockTimeout timeout) async {
+    appLockSettings = appLockSettings.copyWith(timeout: timeout);
+    await appLockStore.saveSettings(appLockSettings);
+    notifyListeners();
+  }
+
+  Future<void> updateBiometricUnlock(bool enabled) async {
+    // Turning fingerprint unlock on is a request to use it, not merely to make
+    // it available behind a button; turning it off leaves only the PIN.
+    appLockSettings = appLockSettings.copyWith(
+      biometricsEnabled: enabled,
+      preferredAuth: enabled
+          ? AppLockPreferredAuth.biometric
+          : AppLockPreferredAuth.pin,
+    );
+    await appLockStore.saveSettings(appLockSettings);
+    notifyListeners();
+  }
+
+  Future<void> updatePreferredAppLockAuth(
+    AppLockPreferredAuth preferredAuth,
+  ) async {
+    if (preferredAuth == AppLockPreferredAuth.biometric &&
+        (!biometricAvailable || !appLockSettings.biometricsEnabled)) {
+      return;
+    }
+    appLockSettings = appLockSettings.copyWith(preferredAuth: preferredAuth);
+    await appLockStore.saveSettings(appLockSettings);
+    notifyListeners();
+  }
+
+  Future<void> changeAppLockPin({
+    required String currentPin,
+    required String newPin,
+  }) async {
+    if (!await appLockStore.pinMatches(currentPin)) {
+      throw ArgumentError('The current PIN is not correct.');
+    }
+    if (!isValidAppLockPin(newPin)) {
+      throw ArgumentError('Use 4 to 8 digits for the new PIN.');
+    }
+    if (!await appLockStore.setPin(newPin)) {
+      throw StateError('This phone would not keep the new PIN.');
+    }
+  }
+
+  /// Permanently deletes the PIN and turns lock off.
+  Future<void> removeAppLockPin(String pin) async {
+    if (!await appLockStore.pinMatches(pin)) {
+      throw ArgumentError('That PIN is not correct.');
+    }
+    await appLockStore.clearPin();
+    appLockSettings = const AppLockSettings();
+    appLocked = false;
+    notifyListeners();
+  }
+
+  /// Kept for callers that mean "turn off and forget the PIN".
+  Future<void> disableAppLock(String pin) => removeAppLockPin(pin);
+
+  Future<bool> unlockWithPin(String pin) async {
+    if (!await appLockStore.pinMatches(pin)) return false;
+    appLocked = false;
+    _unlockedAt = DateTime.now();
+    notifyListeners();
+    return true;
+  }
+
+  Future<bool> unlockWithBiometrics() async {
+    if (!appLocked ||
+        biometricUnlocking ||
+        !appLockSettings.biometricsEnabled ||
+        !biometricAvailable) {
+      return false;
+    }
+    biometricUnlocking = true;
+    _biometricPromptActive = true;
+    notifyListeners();
+    var unlocked = false;
+    try {
+      unlocked = await localAuthentication.authenticate(
+        localizedReason: 'Unlock Local Chat',
+        biometricOnly: true,
+        persistAcrossBackgrounding: false,
+      );
+      if (unlocked) {
+        appLocked = false;
+        _unlockedAt = DateTime.now();
+        _leftDuringBiometric = false;
+      }
+      return unlocked;
+    } on LocalAuthException {
+      return false;
+    } catch (_) {
+      return false;
+    } finally {
+      _biometricPromptActive = false;
+      biometricUnlocking = false;
+      if (!unlocked && _leftDuringBiometric) {
+        _backgroundedAt ??= DateTime.now();
+        if (appLockSettings.armed &&
+            appLockSettings.timeout == AppLockTimeout.immediately &&
+            calls.active == null) {
+          appLocked = true;
+        }
+      }
+      _leftDuringBiometric = false;
+      notifyListeners();
+    }
+  }
+
+  void _engageAppLockIfDue() {
+    if (!isLoggedIn) return;
+    final shouldLock = appLockShouldEngage(
+      enabled: appLockSettings.enabled,
+      hasPin: appLockSettings.hasPin,
+      now: DateTime.now(),
+      backgroundedAt: _backgroundedAt,
+      timeout: appLockSettings.timeout,
+      callInProgress: calls.active != null,
+    );
+    if (shouldLock && !appLocked) {
+      appLocked = true;
+      notifyListeners();
+    }
+    _backgroundedAt = null;
+  }
+
   /// Whether a video download should proceed under the Wi‑Fi-only preference.
   Future<bool> allowVideoDownload({bool userConfirmed = false}) async {
     if (!mediaPrefs.wifiOnlyVideoDownload || userConfirmed) return true;
@@ -740,13 +1064,55 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (_biometricPromptActive && state != AppLifecycleState.resumed) {
+      if (state == AppLifecycleState.paused ||
+          state == AppLifecycleState.hidden ||
+          state == AppLifecycleState.detached) {
+        _leftDuringBiometric = true;
+      }
+      // The fingerprint sheet backgrounds Flutter. That is not the user
+      // leaving, so do not stamp `_backgroundedAt` or lock. Cancelling auth
+      // here would abort the prompt they are using; `persistAcrossBackgrounding:
+      // false` already drops a real Home/Recents leave without retrying.
+      if (state == AppLifecycleState.detached) {
+        unawaited(localAuthentication.stopAuthentication());
+        _onDetached();
+      }
+      return;
+    }
+
     switch (state) {
       case AppLifecycleState.resumed:
+        if (_biometricPromptActive ||
+            appLockSkipEngageAfterUnlock(
+              now: DateTime.now(),
+              unlockedAt: _unlockedAt,
+            )) {
+          _backgroundedAt = null;
+        } else {
+          _engageAppLockIfDue();
+        }
         _onResumed();
         unawaited(calls.syncActiveCallAudio());
       case AppLifecycleState.paused:
       case AppLifecycleState.detached:
-      case AppLifecycleState.hidden:
+        if (appLockSkipEngageAfterUnlock(
+          now: DateTime.now(),
+          unlockedAt: _unlockedAt,
+        )) {
+          // Android may deliver one final hidden/paused transition while the
+          // biometric sheet is dismissing. It belongs to that system overlay,
+          // not to navigation inside Local Chat or a real trip to Home.
+          return;
+        }
+        _backgroundedAt ??= DateTime.now();
+        if (appLockSettings.armed &&
+            appLockSettings.timeout == AppLockTimeout.immediately &&
+            calls.active == null &&
+            !appLocked) {
+          appLocked = true;
+          notifyListeners();
+        }
         unawaited(calls.onAppLifecycleBackground());
         // Let the socket go while the app is away. Android can freeze our
         // isolate at any moment, and a socket that looks alive to the server
@@ -760,6 +1126,13 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
         _reconnectNotice?.cancel();
         showReconnecting = false;
         if (state == AppLifecycleState.detached) _onDetached();
+      case AppLifecycleState.hidden:
+        // Flutter synthesizes hidden while Android moves between inactive and
+        // paused. A transient hidden event can also accompany system UI and
+        // back gestures, so it is not proof that Local Chat was left. A real
+        // background always reaches paused immediately afterwards.
+        clearAllTyping();
+        break;
       case AppLifecycleState.inactive:
         // Brief OS overlays (incoming call UI, permission sheets). Do not drop
         // the socket here — that would reconnect for every system dialog.
@@ -779,6 +1152,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     if (isLoggedIn) {
       realtime.connect();
       await refreshInbox();
+      unawaited(flushOutbox());
       final active = activeConversationId;
       if (active != null) {
         syncInBackground(active, markRead: true);
@@ -887,6 +1261,18 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     await api.logout();
     conversations = [];
     messagesByConv.clear();
+    onlineByUser.clear();
+    lastSeenByUser.clear();
+    _outbox = const [];
+    _outboxUserId = null;
+    _outboxFlushing = false;
+    _outboxInFlight.clear();
+    appLocked = false;
+    biometricUnlocking = false;
+    _biometricPromptActive = false;
+    _leftDuringBiometric = false;
+    _unlockedAt = null;
+    _backgroundedAt = null;
     pinsByConv.clear();
     localContacts = [];
     // The next account starts over: nothing here has answered for them yet, and
@@ -979,7 +1365,11 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     _inboxResolved = true;
     for (final c in conversations) {
       if (c.peer != null) {
-        onlineByUser[c.peer!.id] = c.peer!.isOnline;
+        _mergePresence(
+          userId: c.peer!.id,
+          online: c.peer!.isOnline,
+          lastSeenAt: c.peer!.lastSeenAt,
+        );
         _rememberAvatar(
           c.peer!.id,
           hasAvatar: c.peer!.hasAvatar,
@@ -1043,8 +1433,16 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     } else {
       summary = chatMessagePreview(last, viewerUserId: me?.id);
     }
+    if (conv.isNotes) return summary;
     final fromMe = last.senderId == me?.id;
     return fromMe ? 'You: $summary' : summary;
+  }
+
+  /// Opens (or creates on first use) this account's private Saved messages.
+  Future<Conversation> savedMessagesConversation() async {
+    final conversation = await api.notesConversation();
+    _replaceConversation(conversation);
+    return conversation;
   }
 
   Future<void> togglePin(int conversationId) async {
@@ -1179,6 +1577,14 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   int? inboxReceiptLevelFor(Conversation conv) {
     final meId = me?.id;
     if (meId == null) return null;
+    if (conv.isNotes) return null;
+
+    // A call-log row records the outcome of a call; it is not a message the
+    // other person can read. The server may still attach receipt metadata
+    // because call logs share the message transport, but showing those marks as
+    // blue ticks falsely claims that the peer read the call.
+    final last = conv.lastMessage;
+    if (last?.isCallLog ?? false) return null;
 
     final local = messagesByConv[conv.id];
     if (local != null && local.isNotEmpty) {
@@ -1188,7 +1594,6 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       }
     }
 
-    final last = conv.lastMessage;
     if (last == null || last.senderId != meId) return null;
 
     final transcript = local?.where((m) => m.id == last.id).firstOrNull;
@@ -1235,7 +1640,11 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   Future<void> refreshUsers({String? q}) async {
     users = await api.listUsers(q: q);
     for (final u in users) {
-      onlineByUser[u.id] = u.isOnline;
+      _mergePresence(
+        userId: u.id,
+        online: u.isOnline,
+        lastSeenAt: u.lastSeenAt,
+      );
       _rememberAvatar(u.id, hasAvatar: u.hasAvatar, version: u.avatarVersion);
     }
     notifyListeners();
@@ -2012,19 +2421,24 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
         after: after,
       );
       final local = <ChatMessage>[];
-      for (final conv in conversations) {
-        if (conv.type != 'dm') continue;
-        await ensureTranscriptForSearch(conv.id);
-        local.addAll(
-          _localSearch(
-            conv.id,
-            query,
-            senderId: senderId,
-            mediaType: mediaType,
-            before: before,
-            after: after,
-          ),
-        );
+      // Call logs are server-authored plaintext metadata, so the indexed server
+      // result is complete. Paging every encrypted DM to its beginning just to
+      // build the Calls screen would be needless network, RAM and battery.
+      if (mediaType != 'call') {
+        for (final conv in conversations) {
+          if (conv.type != 'dm') continue;
+          await ensureTranscriptForSearch(conv.id);
+          local.addAll(
+            _localSearch(
+              conv.id,
+              query,
+              senderId: senderId,
+              mediaType: mediaType,
+              before: before,
+              after: after,
+            ),
+          );
+        }
       }
       final byId = <int, ChatMessage>{
         for (final m in [...server, ...local]) m.id: m,
@@ -2041,6 +2455,9 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       after: after,
     );
   }
+
+  Future<List<ChatMessage>> listCallLogs({int limit = 100}) =>
+      api.searchMessages('', mediaType: 'call', limit: limit);
 
   /// Pages a chat's whole history in before it is searched locally.
   ///
@@ -2116,6 +2533,41 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     await refreshInbox();
   }
 
+  /// Updates one shared checklist immediately, then reconciles with the server.
+  ///
+  /// One request per list is allowed at a time. This prevents two rapid taps
+  /// from racing whole-document replacements and bringing an old checkbox
+  /// state back.
+  Future<void> updateChecklist(ChatMessage message, Checklist checklist) async {
+    if (message.id <= 0 || _checklistUpdates.contains(message.id)) return;
+    final before = message.body;
+    final body = checklist.encode();
+    _checklistUpdates.add(message.id);
+    _replaceLocalMessage(message.copyWith(body: body));
+    notifyListeners();
+    try {
+      final wire = await _wireBodyFor(message.conversationId, body);
+      final updated = await api.editMessage(message.id, wire);
+      await upsertFromWire(updated);
+      await refreshInbox();
+    } catch (_) {
+      _replaceLocalMessage(message.copyWith(body: before));
+      rethrow;
+    } finally {
+      _checklistUpdates.remove(message.id);
+      notifyListeners();
+    }
+  }
+
+  void _replaceLocalMessage(ChatMessage updated) {
+    final local = messagesByConv[updated.conversationId];
+    if (local == null) return;
+    messagesByConv[updated.conversationId] = [
+      for (final message in local)
+        if (message.id == updated.id) updated else message,
+    ];
+  }
+
   /// The body to put on the wire: an encrypted token for a DM once keys are
   /// exchanged, or the plaintext unchanged for groups / before the handshake.
   Future<String> _wireBodyFor(int conversationId, String plaintext) async {
@@ -2161,6 +2613,35 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     await refreshInbox();
   }
 
+  Future<void> permanentlyDeleteSavedMessage(
+    int conversationId,
+    ChatMessage message,
+  ) async {
+    await api.permanentlyDeleteSavedMessage(message.id);
+    await media.evict(message.id);
+    _removeLocalMessage(conversationId, message.id);
+  }
+
+  void _removeLocalMessage(int conversationId, int messageId) {
+    final local = messagesByConv[conversationId];
+    if (local != null) {
+      messagesByConv[conversationId] = [
+        for (final message in local)
+          if (message.id != messageId) message,
+      ];
+    }
+    final pins = pinsByConv[conversationId];
+    if (pins != null) {
+      pinsByConv[conversationId] = [
+        for (final message in pins)
+          if (message.id != messageId) message,
+      ];
+    }
+    starredIds.remove(messageId);
+    starredMessages.removeWhere((message) => message.id == messageId);
+    notifyListeners();
+  }
+
   Future<List<OwnedMedia>> listMyMedia() => api.listMyMedia();
 
   Future<MediaCleanupResult> deleteMyMedia(Iterable<int> messageIds) async {
@@ -2173,50 +2654,194 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     return result;
   }
 
-  /// Sends a text message, optionally quoting [replyTo].
+  /// Loads this account's durable queue and paints its optimistic bubbles.
+  Future<void> _loadOutboxForCurrentUser() async {
+    final userId = me?.id;
+    if (userId == null || _outboxUserId == userId) return;
+    _outboxUserId = userId;
+    _outbox = await OutboxStore.load(userId);
+    for (final item in _outbox) {
+      final local = messagesByConv[item.conversationId] ?? const [];
+      if (local.any((message) => message.clientId == item.clientId)) continue;
+      messagesByConv[item.conversationId] = [
+        ...local,
+        _optimisticOutboxMessage(item, senderId: userId),
+      ];
+    }
+    notifyListeners();
+  }
+
+  ChatMessage _optimisticOutboxMessage(
+    OutboxItem item, {
+    required int senderId,
+    ChatMessage? replyTo,
+  }) {
+    return ChatMessage(
+      id: -item.createdAt.microsecondsSinceEpoch,
+      conversationId: item.conversationId,
+      senderId: senderId,
+      type: item.type,
+      body: item.body,
+      clientId: item.clientId,
+      createdAt: item.createdAt,
+      replyTo: replyTo == null ? null : QuotedMessage.fromMessage(replyTo),
+      pending: true,
+    );
+  }
+
+  Future<void> _persistOutbox() async {
+    final userId = _outboxUserId ?? me?.id;
+    if (userId != null) await OutboxStore.save(userId, _outbox);
+  }
+
+  Future<void> _removeOutboxItem(String clientId) async {
+    final next = [
+      for (final item in _outbox)
+        if (item.clientId != clientId) item,
+    ];
+    if (next.length == _outbox.length) return;
+    _outbox = next;
+    await _persistOutbox();
+    notifyListeners();
+  }
+
+  bool _isTransientOutboxFailure(Object failure) {
+    if (failure is! ApiException) return true;
+    final status = failure.statusCode;
+    return status == null || status == 408 || status == 429 || status >= 500;
+  }
+
+  Future<ChatMessage> _sendOutboxItem(OutboxItem item) async {
+    final wire = await _wireBodyFor(item.conversationId, item.body);
+    return api.sendText(
+      item.conversationId,
+      wire,
+      clientId: item.clientId,
+      replyToMessageId: item.replyToMessageId,
+      type: item.type,
+    );
+  }
+
+  /// Tries the durable queue once, oldest first.
   ///
-  /// The message is added to the transcript before the request goes out, so the
-  /// chat shows it — quote included — without waiting for the server.
+  /// Called on login, resume and websocket recovery. A failed path ends the
+  /// pass immediately: hammering the same offline server for every queued item
+  /// would waste radio, battery and time. Client ids make every retry
+  /// idempotent if the server accepted a send but its response was lost.
+  Future<void> flushOutbox() async {
+    if (_outboxFlushing || !isLoggedIn || !serverReachable) return;
+    await _loadOutboxForCurrentUser();
+    if (_outbox.isEmpty) return;
+    _outboxFlushing = true;
+    var sentAny = false;
+    try {
+      for (final item in List<OutboxItem>.from(_outbox)) {
+        _outboxInFlight.add(item.clientId);
+        try {
+          final confirmed = await _sendOutboxItem(item);
+          await upsertFromWire(confirmed);
+          await _removeOutboxItem(item.clientId);
+          sentAny = true;
+        } catch (failure) {
+          if (!_isTransientOutboxFailure(failure)) {
+            await _removeOutboxItem(item.clientId);
+            final local = messagesByConv[item.conversationId];
+            if (local != null) {
+              messagesByConv[item.conversationId] = [
+                for (final message in local)
+                  if (message.clientId != item.clientId) message,
+              ];
+            }
+            error = friendlyMessage(failure);
+            notifyListeners();
+            continue;
+          }
+          break;
+        } finally {
+          _outboxInFlight.remove(item.clientId);
+        }
+      }
+      if (sentAny) await refreshInbox();
+    } finally {
+      _outboxFlushing = false;
+      notifyListeners();
+    }
+  }
+
+  /// Sends text, or keeps it in the durable outbox until the private path is up.
   Future<void> sendText(
     int conversationId,
     String text, {
     ChatMessage? replyTo,
+  }) =>
+      _sendDurableContent(conversationId, text, type: 'text', replyTo: replyTo);
+
+  /// Sends a shared checklist using the same durable path as text.
+  Future<void> sendChecklist(int conversationId, Checklist checklist) =>
+      _sendDurableContent(conversationId, checklist.encode(), type: 'list');
+
+  Future<void> _sendDurableContent(
+    int conversationId,
+    String body, {
+    required String type,
+    ChatMessage? replyTo,
   }) async {
-    final clientId = DateTime.now().microsecondsSinceEpoch.toString();
-    final meId = me!.id;
-    final optimistic = ChatMessage(
-      id: -DateTime.now().millisecondsSinceEpoch,
+    final now = DateTime.now().toUtc();
+    final item = OutboxItem(
+      clientId: const Uuid().v4(),
       conversationId: conversationId,
-      senderId: meId,
-      type: 'text',
-      body: text,
-      clientId: clientId,
-      createdAt: DateTime.now().toUtc(),
-      replyTo: replyTo == null ? null : QuotedMessage.fromMessage(replyTo),
-      pending: true,
+      type: type,
+      body: body,
+      replyToMessageId: replyTo?.id,
+      createdAt: now,
     );
+    final meId = me!.id;
     messagesByConv.putIfAbsent(conversationId, () => []);
     messagesByConv[conversationId] = [
       ...messagesByConv[conversationId]!,
-      optimistic,
+      _optimisticOutboxMessage(item, senderId: meId, replyTo: replyTo),
     ];
+    _outboxUserId = meId;
+    _outbox = [..._outbox, item];
+    final sendImmediately = serverReachable;
+    if (sendImmediately) {
+      // The durable queue is also the crash-safe source of truth for a healthy
+      // send. Mark it in-flight before the first rebuild so the UI never calls
+      // an ordinary online request "waiting" or "failed".
+      _outboxInFlight.add(item.clientId);
+    }
     notifyListeners();
     try {
-      // The wire carries ciphertext for a DM; the local echo below is decrypted
-      // back to [text] so the sender keeps reading plain text.
-      final wire = await _wireBodyFor(conversationId, text);
-      final msg = await api.sendText(
-        conversationId,
-        wire,
-        clientId: clientId,
-        replyToMessageId: replyTo?.id,
-      );
-      await upsertFromWire(msg);
+      await _persistOutbox();
+    } catch (failure) {
+      // Storage trouble must not stop an online send. The in-memory queue still
+      // protects this process; a successful response removes it as usual.
+      debugPrint('Could not persist outbox: $failure');
+    }
+
+    if (!sendImmediately) return;
+    try {
+      final confirmed = await _sendOutboxItem(item);
+      await upsertFromWire(confirmed);
+      await _removeOutboxItem(item.clientId);
       await refreshInbox();
-    } catch (e) {
-      error = friendlyMessage(e);
-      notifyListeners();
+    } catch (failure) {
+      if (_isTransientOutboxFailure(failure)) {
+        // The clock tick and queue count are the honest UI. Reconnect will run
+        // one retry pass; no global error banner is needed for an expected
+        // offline state.
+        return;
+      }
+      await _removeOutboxItem(item.clientId);
+      messagesByConv[conversationId] = [
+        for (final message in messagesByConv[conversationId] ?? const [])
+          if (message.clientId != item.clientId) message,
+      ];
+      error = friendlyMessage(failure);
       rethrow;
+    } finally {
+      _outboxInFlight.remove(item.clientId);
+      notifyListeners();
     }
   }
 
@@ -3273,6 +3898,14 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       case 'message.updated':
         unawaited(_handleUpdatedMessage(event));
         break;
+      case 'message.removed':
+        final conversationId = event['conversation_id'] as int?;
+        final messageId = event['message_id'] as int?;
+        if (conversationId != null && messageId != null) {
+          _removeLocalMessage(conversationId, messageId);
+          unawaited(media.evict(messageId));
+        }
+        break;
       case 'reaction.updated':
         _applyReactionUpdate(event);
         break;
@@ -3289,9 +3922,13 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       case 'presence':
         final uid = event['user_id'] as int;
         final online = event['online'] as bool? ?? false;
-        onlineByUser[uid] = online;
         final seen = tryParseServerTime(event['last_seen_at'] as String?);
-        if (seen != null) lastSeenByUser[uid] = seen;
+        _mergePresence(
+          userId: uid,
+          online: online,
+          lastSeenAt: seen,
+          authoritativeOffline: true,
+        );
         // Going offline mid-typing must not leave a stuck indicator.
         if (!online) _clearTypingForUser(uid);
         notifyListeners();
@@ -3316,7 +3953,11 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
         break;
       case 'user.updated':
         final u = ChatUser.fromJson(event['user'] as Map<String, dynamic>);
-        onlineByUser[u.id] = u.isOnline;
+        _mergePresence(
+          userId: u.id,
+          online: u.isOnline,
+          lastSeenAt: u.lastSeenAt,
+        );
         _rememberAvatar(u.id, hasAvatar: u.hasAvatar, version: u.avatarVersion);
         _patchUserInConversations(u);
         if (u.id == me?.id) {
@@ -3580,6 +4221,19 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     if (recipientIds.every((uid) => delivered[uid] != null)) return 1;
     if (recipientIds.any((uid) => delivered[uid] != null)) return 1;
     return 0;
+  }
+
+  /// Freshest local copy of a sent message with realtime receipt watermarks
+  /// folded in, for the Message info screen.
+  ChatMessage messageForInfo(ChatMessage message, Conversation conversation) {
+    final current = messagesByConv[conversation.id]
+        ?.cast<ChatMessage?>()
+        .firstWhere((item) => item?.id == message.id, orElse: () => null);
+    final source = current ?? message;
+    final marks = receiptMarks[conversation.id];
+    if (marks == null || marks.isEmpty) return source;
+    return _withReceiptMarks(source, marks, isDm: conversation.type == 'dm') ??
+        source;
   }
 
   /// [msg] with any receipt implied by the watermarks filled in, or null when it

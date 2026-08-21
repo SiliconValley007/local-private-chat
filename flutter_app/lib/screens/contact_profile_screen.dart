@@ -32,8 +32,8 @@ class ContactProfileScreen extends StatelessWidget {
     }
 
     final title = state.titleFor(conv);
-    final online = state.onlineByUser[peer.id] ?? peer.isOnline;
-    final seen = state.lastSeenByUser[peer.id] ?? peer.lastSeenAt;
+    final online = state.isUserOnline(peer);
+    final seen = state.lastSeenFor(peer);
     final presence = online
         ? 'online'
         : (seen == null ? '' : formatLastSeen(context, seen));
@@ -114,7 +114,9 @@ class ContactProfileScreen extends StatelessWidget {
                       presence,
                       textAlign: TextAlign.center,
                       style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                        color: online ? scheme.primary : scheme.onSurfaceVariant,
+                        color: online
+                            ? scheme.primary
+                            : scheme.onSurfaceVariant,
                       ),
                     ),
                   ),

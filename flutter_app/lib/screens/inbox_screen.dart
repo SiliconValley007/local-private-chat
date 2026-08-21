@@ -8,29 +8,22 @@ import '../errors.dart';
 import '../invite_flow.dart';
 import '../load_state.dart';
 import '../models.dart';
-import '../services/theme_store.dart';
 import '../theme.dart';
 import '../time_format.dart';
 import '../widgets/avatar.dart';
 import '../widgets/avatar_viewer.dart';
-import '../widgets/change_password_dialog.dart';
 import '../widgets/receipt_ticks.dart';
 import '../widgets/rename_dialog.dart';
 import '../widgets/error_banner.dart';
 import '../widgets/loading_placeholders.dart';
-import 'activity_log_screen.dart';
-import 'backup_screen.dart';
+import 'calls_screen.dart';
 import 'global_search_screen.dart';
 import 'new_chat_screen.dart';
 import 'new_group_screen.dart';
-import 'privacy_onboarding_screen.dart';
-import 'qr_invite_screen.dart';
-import 'server_info_screen.dart';
-import 'server_setup_screen.dart';
+import 'settings_screen.dart';
 import 'self_profile_screen.dart';
 import 'share_target_screen.dart';
 import 'starred_messages_screen.dart';
-import '../services/privacy_onboarding_store.dart';
 
 class InboxScreen extends StatefulWidget {
   const InboxScreen({super.key});
@@ -109,9 +102,10 @@ class _InboxScreenState extends State<InboxScreen> {
   }
 
   List<Conversation> _visible(AppState state, List<Conversation> all) {
+    final inbox = all.where((conversation) => !conversation.isNotes);
     final query = _query.trim().toLowerCase();
-    if (query.isEmpty) return all;
-    return all.where((c) {
+    if (query.isEmpty) return inbox.toList();
+    return inbox.where((c) {
       // Match the name you gave them, the name they chose, and the username.
       final shown = state.titleFor(c).toLowerCase();
       final real = c.peer?.displayName.toLowerCase() ?? '';
@@ -199,103 +193,7 @@ class _InboxScreenState extends State<InboxScreen> {
     }
   }
 
-  Future<void> _chooseAppearance() async {
-    final state = context.read<AppState>();
-    await showModalBottomSheet<void>(
-      context: context,
-      showDragHandle: true,
-      builder: (sheetContext) => SafeArea(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Padding(
-              padding: const EdgeInsets.fromLTRB(20, 0, 20, 4),
-              child: Text(
-                'Appearance',
-                style: Theme.of(sheetContext).textTheme.titleMedium,
-              ),
-            ),
-            Padding(
-              padding: const EdgeInsets.fromLTRB(20, 0, 20, 10),
-              child: Text(
-                'Your choice is kept until you change it again.',
-                style: Theme.of(sheetContext).textTheme.bodySmall?.copyWith(
-                  color: Theme.of(sheetContext).colorScheme.onSurfaceVariant,
-                ),
-              ),
-            ),
-            // RadioGroup owns the selected value so the tick follows a change
-            // made while this sheet is open.
-            RadioGroup<ThemeMode>(
-              groupValue: sheetContext.watch<AppState>().themeMode,
-              onChanged: (picked) {
-                if (picked != null) state.setThemeMode(picked);
-              },
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  for (final mode in ThemeMode.values)
-                    RadioListTile<ThemeMode>(
-                      value: mode,
-                      title: Text(ThemeStore.labelFor(mode)),
-                      secondary: Icon(_appearanceIcon(mode)),
-                    ),
-                ],
-              ),
-            ),
-            const SizedBox(height: 12),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Future<void> _chooseMediaPrefs() async {
-    final state = context.read<AppState>();
-    await showModalBottomSheet<void>(
-      context: context,
-      showDragHandle: true,
-      builder: (sheetContext) {
-        final prefs = sheetContext.watch<AppState>().mediaPrefs;
-        return SafeArea(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Padding(
-                padding: const EdgeInsets.fromLTRB(20, 0, 20, 4),
-                child: Text(
-                  'Media downloads',
-                  style: Theme.of(sheetContext).textTheme.titleMedium,
-                ),
-              ),
-              SwitchListTile(
-                title: const Text('Wi‑Fi only for videos'),
-                subtitle: const Text(
-                  'Ask before saving videos when you are not on Wi‑Fi.',
-                ),
-                value: prefs.wifiOnlyVideoDownload,
-                onChanged: (v) {
-                  state.setMediaPrefs(prefs.copyWith(wifiOnlyVideoDownload: v));
-                },
-              ),
-              const SizedBox(height: 8),
-            ],
-          ),
-        );
-      },
-    );
-  }
-
-  IconData _appearanceIcon(ThemeMode mode) => switch (mode) {
-    ThemeMode.light => Icons.light_mode_outlined,
-    ThemeMode.dark => Icons.dark_mode_outlined,
-    ThemeMode.system => Icons.brightness_auto_outlined,
-  };
-
   Future<void> _onMenuSelected(String value) async {
-    final state = context.read<AppState>();
     final navigator = Navigator.of(context);
     switch (value) {
       case 'search_all':
@@ -306,48 +204,10 @@ class _InboxScreenState extends State<InboxScreen> {
         await navigator.push(
           MaterialPageRoute(builder: (_) => const StarredMessagesScreen()),
         );
-      case 'appearance':
-        await _chooseAppearance();
-      case 'media':
-        await _chooseMediaPrefs();
-      case 'qr':
-        await navigator.push(
-          MaterialPageRoute(builder: (_) => const QrInviteScreen()),
-        );
-      case 'backup':
-        await navigator.push(
-          MaterialPageRoute(builder: (_) => const BackupScreen()),
-        );
-      case 'privacy_tips':
-        await PrivacyOnboardingStore.reset();
-        if (!mounted) return;
-        await navigator.push(
-          MaterialPageRoute(
-            builder: (_) => PrivacyOnboardingScreen(
-              onFinished: () => Navigator.of(context).pop(),
-            ),
-          ),
-        );
-      case 'password':
-        if (!mounted) return;
-        await showChangePasswordDialog(context);
-      case 'server_status':
-        await navigator.push(
-          MaterialPageRoute(builder: (_) => const ServerInfoScreen()),
-        );
-      case 'activity_log':
-        await navigator.push(
-          MaterialPageRoute(builder: (_) => const ActivityLogScreen()),
-        );
-        // The role may have been claimed or handed on in there, which decides
-        // whether this entry is still offered.
-        await state.refreshAdminStatus(force: true);
       case 'settings':
         await navigator.push(
-          MaterialPageRoute(builder: (_) => const ServerSetupScreen()),
+          MaterialPageRoute(builder: (_) => const SettingsScreen()),
         );
-      case 'logout':
-        await state.logout();
     }
   }
 
@@ -359,6 +219,15 @@ class _InboxScreenState extends State<InboxScreen> {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
+            ListTile(
+              leading: const _SheetGlyph(
+                icon: Icons.bookmark_rounded,
+                color: Color(0xFF0E7C66),
+              ),
+              title: const Text('Saved messages'),
+              subtitle: const Text('Private notes, files, and checklists'),
+              onTap: () => Navigator.pop(sheetContext, 'notes'),
+            ),
             ListTile(
               leading: const _SheetGlyph(
                 icon: Icons.chat_bubble_rounded,
@@ -384,12 +253,26 @@ class _InboxScreenState extends State<InboxScreen> {
     );
     if (!mounted || action == null) return;
 
-    final conv = await Navigator.of(context).push<Conversation>(
-      MaterialPageRoute(
-        builder: (_) =>
-            action == 'group' ? const NewGroupScreen() : const NewChatScreen(),
-      ),
-    );
+    final Conversation? conv;
+    if (action == 'notes') {
+      try {
+        conv = await context.read<AppState>().savedMessagesConversation();
+      } catch (failure) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(friendlyMessage(failure))));
+        return;
+      }
+    } else {
+      conv = await Navigator.of(context).push<Conversation>(
+        MaterialPageRoute(
+          builder: (_) => action == 'group'
+              ? const NewGroupScreen()
+              : const NewChatScreen(),
+        ),
+      );
+    }
     if (conv != null && mounted) {
       await pushChat(context, conversation: conv);
     }
@@ -414,10 +297,9 @@ class _InboxScreenState extends State<InboxScreen> {
       phase: _query.trim().isEmpty ? state.inboxPhase : LoadPhase.ready,
       isEmpty: conversations.isEmpty,
     );
-    final unreadTotal = state.conversations.fold<int>(
-      0,
-      (sum, c) => sum + c.unreadCount,
-    );
+    final unreadTotal = state.conversations
+        .where((conversation) => !conversation.isNotes)
+        .fold<int>(0, (sum, c) => sum + c.unreadCount);
 
     return Scaffold(
       appBar: AppBar(
@@ -480,9 +362,11 @@ class _InboxScreenState extends State<InboxScreen> {
             icon: const Icon(Icons.manage_search_rounded),
           ),
           IconButton(
-            tooltip: 'Refresh',
-            onPressed: state.refreshInbox,
-            icon: const Icon(Icons.refresh_rounded),
+            tooltip: 'Calls',
+            onPressed: () => Navigator.of(
+              context,
+            ).push(MaterialPageRoute(builder: (_) => const CallsScreen())),
+            icon: const Icon(Icons.call_outlined),
           ),
           PopupMenuButton<String>(
             tooltip: 'More',
@@ -508,96 +392,12 @@ class _InboxScreenState extends State<InboxScreen> {
                 ),
               ),
               const PopupMenuItem(
-                value: 'appearance',
-                child: ListTile(
-                  dense: true,
-                  contentPadding: EdgeInsets.zero,
-                  leading: Icon(Icons.brightness_6_outlined),
-                  title: Text('Appearance'),
-                ),
-              ),
-              const PopupMenuItem(
-                value: 'media',
-                child: ListTile(
-                  dense: true,
-                  contentPadding: EdgeInsets.zero,
-                  leading: Icon(Icons.wifi_rounded),
-                  title: Text('Media downloads'),
-                ),
-              ),
-              const PopupMenuItem(
-                value: 'qr',
-                child: ListTile(
-                  dense: true,
-                  contentPadding: EdgeInsets.zero,
-                  leading: Icon(Icons.qr_code_2_rounded),
-                  title: Text('My invite QR'),
-                ),
-              ),
-              const PopupMenuItem(
-                value: 'backup',
-                child: ListTile(
-                  dense: true,
-                  contentPadding: EdgeInsets.zero,
-                  leading: Icon(Icons.cloud_upload_outlined),
-                  title: Text('Backup & restore'),
-                ),
-              ),
-              const PopupMenuItem(
-                value: 'privacy_tips',
-                child: ListTile(
-                  dense: true,
-                  contentPadding: EdgeInsets.zero,
-                  leading: Icon(Icons.privacy_tip_outlined),
-                  title: Text('Show privacy tips'),
-                ),
-              ),
-              const PopupMenuItem(
-                value: 'password',
-                child: ListTile(
-                  dense: true,
-                  contentPadding: EdgeInsets.zero,
-                  leading: Icon(Icons.lock_outline_rounded),
-                  title: Text('Change password'),
-                ),
-              ),
-              const PopupMenuItem(
-                value: 'server_status',
-                child: ListTile(
-                  dense: true,
-                  contentPadding: EdgeInsets.zero,
-                  leading: Icon(Icons.monitor_heart_outlined),
-                  title: Text('Server status'),
-                ),
-              ),
-              // Only for the admin, and for anyone at all while nobody holds the
-              // role — that is how the first admin appoints themselves.
-              if (state.offersActivityLog)
-                const PopupMenuItem(
-                  value: 'activity_log',
-                  child: ListTile(
-                    dense: true,
-                    contentPadding: EdgeInsets.zero,
-                    leading: Icon(Icons.fact_check_outlined),
-                    title: Text('Activity log'),
-                  ),
-                ),
-              const PopupMenuItem(
                 value: 'settings',
                 child: ListTile(
                   dense: true,
                   contentPadding: EdgeInsets.zero,
-                  leading: Icon(Icons.dns_outlined),
-                  title: Text('Server settings'),
-                ),
-              ),
-              const PopupMenuItem(
-                value: 'logout',
-                child: ListTile(
-                  dense: true,
-                  contentPadding: EdgeInsets.zero,
-                  leading: Icon(Icons.logout_rounded),
-                  title: Text('Log out'),
+                  leading: Icon(Icons.settings_outlined),
+                  title: Text('Settings'),
                 ),
               ),
             ],
@@ -812,6 +612,8 @@ class _ConversationTile extends StatelessWidget {
         return Icons.mic_rounded;
       case 'file':
         return Icons.insert_drive_file_rounded;
+      case 'list':
+        return Icons.checklist_rounded;
       default:
         return null;
     }
@@ -823,6 +625,7 @@ class _ConversationTile extends StatelessWidget {
     final scheme = theme.colorScheme;
     final unread = conversation.unreadCount;
     final isGroup = conversation.type == 'group';
+    final isNotes = conversation.isNotes;
 
     return Material(
       color: scheme.surface,
@@ -844,7 +647,9 @@ class _ConversationTile extends StatelessWidget {
                       : (conversation.peer?.id ?? conversation.id),
                   radius: 26,
                   online: online,
-                  badge: isGroup ? Icons.group_rounded : null,
+                  badge: isGroup
+                      ? Icons.group_rounded
+                      : (isNotes ? Icons.bookmark_rounded : null),
                   imageUrl: avatarUrl,
                   imageHeaders: avatarHeaders,
                 ),
@@ -890,6 +695,7 @@ class _ConversationTile extends StatelessWidget {
                       children: [
                         if (!previewIsTyping &&
                             fromMe &&
+                            conversation.lastMessage?.isCallLog != true &&
                             receiptLevel != null) ...[
                           ReceiptTicks(level: receiptLevel!, size: 13),
                           const SizedBox(width: 4),

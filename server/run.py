@@ -2,14 +2,21 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import socket
 import struct
 import subprocess
 import sys
+import traceback
 
-import uvicorn
-from app.config import ACCESS_LOG, HOST, LOW_MEMORY, MAX_CONCURRENCY, PORT
+# Loaded inside main so a frozen build can print and pause on import/config
+# failures instead of flashing a console window closed before any explanation.
+HOST = "0.0.0.0"
+PORT = 8000
+ACCESS_LOG = False
+LOW_MEMORY = False
+MAX_CONCURRENCY = 0
 
 # Linux/Android ioctl for "give me this interface's IPv4 address".
 _SIOCGIFADDR = 0x8915
@@ -243,31 +250,121 @@ def _print_port_in_use() -> None:
     print("Then stop that process and try again.")
 
 
-if __name__ == "__main__":
-    _harden_console()
-    # Checked up front: uvicorn swallows the bind error and logs a one-line
-    # traceback of its own, so this advice never reached the screen.
+def _pause_after_failure() -> None:
+    """Keep an Explorer-launched frozen console open after a fatal error."""
+    if not getattr(sys, "frozen", False):
+        return
+    if os.environ.get("LOCALCHAT_LAUNCHED_BY_WRAPPER") == "1":
+        return
+    try:
+        print()
+        input("Press Enter to close this window...")
+    except (EOFError, OSError):
+        pass
+
+
+def _check_windows_firewall(port: int) -> None:
+    """Report the Windows inbound firewall, and never get in the way elsewhere.
+
+    Android/Termux has no host firewall, so importing the helper there buys
+    nothing and would make an unrelated platform depend on a Windows-only
+    module. A missing module is likewise reported rather than fatal: an operator
+    who copies files by hand must still end up with a running server.
+    """
+    if os.name != "nt":
+        return
+    try:
+        import firewall  # pylint: disable=import-outside-toplevel
+    except ImportError:
+        print(" Skipping the firewall check: firewall.py is missing.")
+        return
+    firewall.ensure_inbound_access(port)
+
+
+def _run_server() -> int:
+    """Load runtime dependencies and serve until the operator stops it."""
+    global ACCESS_LOG, HOST, LOW_MEMORY, MAX_CONCURRENCY, PORT
+
+    import uvicorn  # pylint: disable=import-outside-toplevel
+    from app import config  # pylint: disable=import-outside-toplevel
+
+    HOST = config.HOST
+    PORT = config.PORT
+    ACCESS_LOG = config.ACCESS_LOG
+    LOW_MEMORY = config.LOW_MEMORY
+    MAX_CONCURRENCY = config.MAX_CONCURRENCY
+
     if not port_is_free(HOST, PORT):
         _print_port_in_use()
-        raise SystemExit(1)
+        _pause_after_failure()
+        return 1
     _print_banner()
+
+    _check_windows_firewall(PORT)
+
+    uvicorn_kwargs: dict = {
+        "host": HOST,
+        "port": PORT,
+        "reload": False,
+        # Windows is operator-facing: every request remains visible. Low-memory
+        # Termux stays quiet unless LOCALCHAT_ACCESS_LOG is enabled.
+        "access_log": ACCESS_LOG if LOW_MEMORY else True,
+        "log_level": "info" if (not LOW_MEMORY or ACCESS_LOG) else "warning",
+    }
+    if LOW_MEMORY:
+        uvicorn_kwargs["timeout_keep_alive"] = 5
+        if MAX_CONCURRENCY > 0:
+            uvicorn_kwargs["limit_concurrency"] = MAX_CONCURRENCY
+    uvicorn.run("app.main:app", **uvicorn_kwargs)
+    return 0
+
+
+def _dispatch(args: list[str]) -> int:
+    if args and args[0] == "reset-password":
+        from reset_password import (  # pylint: disable=import-outside-toplevel
+            main as reset_password_main,
+        )
+
+        return reset_password_main(args[1:])
+    if args and args[0] == "set-admin":
+        from set_admin import main as set_admin_main  # pylint: disable=import-outside-toplevel
+
+        return set_admin_main(args[1:])
+    if args and args[0] == "allow-firewall":
+        if os.name != "nt":
+            print("Nothing to do: this host has no Windows Firewall.")
+            return 0
+        from firewall import (  # pylint: disable=import-outside-toplevel
+            main as allow_firewall_main,
+        )
+
+        return allow_firewall_main(args[1:])
+    return _run_server()
+
+
+def main() -> int:
+    """Start the server or one of its bundled operator subcommands."""
+    _harden_console()
     try:
-        # Phone servers keep logging quiet and concurrency bounded so a handful
-        # of uploads cannot push Termux into the Android low-memory killer.
-        uvicorn_kwargs: dict = {
-            "host": HOST,
-            "port": PORT,
-            "reload": False,
-        }
-        if LOW_MEMORY:
-            uvicorn_kwargs["access_log"] = ACCESS_LOG
-            uvicorn_kwargs["log_level"] = "info" if ACCESS_LOG else "warning"
-            uvicorn_kwargs["timeout_keep_alive"] = 5
-            if MAX_CONCURRENCY > 0:
-                uvicorn_kwargs["limit_concurrency"] = MAX_CONCURRENCY
-        uvicorn.run("app.main:app", **uvicorn_kwargs)
+        return _dispatch(sys.argv[1:])
+    except KeyboardInterrupt:
+        print("\nLocal Chat server stopped.")
+        return 0
     except OSError as exc:
-        if getattr(exc, "winerror", None) == 10048 or getattr(exc, "errno", None) in (98, 10048):
+        address_in_use = getattr(exc, "winerror", None) == 10048 or getattr(
+            exc, "errno", None
+        ) in (98, 10048)
+        if address_in_use:
             _print_port_in_use()
-            raise SystemExit(1) from exc
-        raise
+        else:
+            traceback.print_exc()
+        _pause_after_failure()
+        return 1
+    except Exception:  # Keep frozen startup/import errors readable.
+        traceback.print_exc()
+        _pause_after_failure()
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

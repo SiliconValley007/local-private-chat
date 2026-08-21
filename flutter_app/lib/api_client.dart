@@ -235,9 +235,9 @@ class ApiClient {
         headers: _headers(jsonBody: false),
       ),
     );
-    return _decodeList(res)
-        .map((e) => OnlineAdminUser.fromJson(e as Map<String, dynamic>))
-        .toList();
+    return _decodeList(
+      res,
+    ).map((e) => OnlineAdminUser.fromJson(e as Map<String, dynamic>)).toList();
   }
 
   Future<void> forceLogoutUser(int userId) async {
@@ -560,6 +560,17 @@ class ApiClient {
     return Conversation.fromJson(data);
   }
 
+  Future<Conversation> notesConversation() async {
+    final res = await _send(
+      () => http.get(
+        _uri('/api/conversations/notes'),
+        headers: _headers(jsonBody: false),
+      ),
+    );
+    final data = await _decode(res);
+    return Conversation.fromJson(data);
+  }
+
   Future<Conversation> createGroup(String title, List<int> memberIds) async {
     final res = await _send(
       () => http.post(
@@ -648,13 +659,14 @@ class ApiClient {
     String body, {
     String? clientId,
     int? replyToMessageId,
+    String type = 'text',
   }) async {
     final res = await _send(
       () => http.post(
         _uri('/api/conversations/$conversationId/messages'),
         headers: _headers(),
         body: jsonEncode({
-          'type': 'text',
+          'type': type,
           'body': body,
           'client_id': ?clientId,
           'reply_to_message_id': ?replyToMessageId,
@@ -691,6 +703,15 @@ class ApiClient {
     );
     final data = await _decode(res);
     return ChatMessage.fromJson(data, meId: meId);
+  }
+
+  Future<void> permanentlyDeleteSavedMessage(int messageId) async {
+    await _send(
+      () => http.delete(
+        _uri('/api/messages/$messageId/permanent'),
+        headers: _headers(jsonBody: false),
+      ),
+    ).then(_parse);
   }
 
   /// Sets or replaces your emoji reaction on a message.

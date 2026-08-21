@@ -21,7 +21,8 @@ $targets = @(
     "server\.pytest_cache",
     ".pytest_cache",
     "tools\.pytest_cache",
-    "server-update.zip"
+    ".package-audit",
+    ".video-analysis"
 )
 if ($DeepFlutter) { $targets += "flutter_app\.dart_tool" }
 
@@ -61,4 +62,4 @@ Get-ChildItem $Root -Recurse -Force -Directory -Filter "__pycache__" -ErrorActio
         Write-Host "removed $($_.FullName.Substring($Root.Length + 1))"
     }
 
-Write-Host ("==> Freed about {0:N0} MB. Kept: .venv, server\data, server\media, secrets, releases\." -f ($freed / 1MB)) -ForegroundColor Green
+Write-Host ("==> Freed about {0:N0} MB. Kept: .venv, server\data, server\media, secrets, releases\, server-update.zip." -f ($freed / 1MB)) -ForegroundColor Green

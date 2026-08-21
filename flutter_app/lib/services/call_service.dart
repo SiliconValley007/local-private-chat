@@ -14,6 +14,16 @@ import 'pending_call_store.dart';
 
 export 'call_signaling.dart';
 
+enum CallNetworkQuality { unknown, good, fair, poor, reconnecting }
+
+String callNetworkQualityLabel(CallNetworkQuality quality) => switch (quality) {
+  CallNetworkQuality.unknown => 'Measuring connection…',
+  CallNetworkQuality.good => 'Good connection',
+  CallNetworkQuality.fair => 'Connection is a little slow',
+  CallNetworkQuality.poor => 'Weak connection',
+  CallNetworkQuality.reconnecting => 'Media interrupted — reconnecting…',
+};
+
 /// One in-progress (or ringing) peer call over Tailscale mesh WebRTC.
 class CallSession extends ChangeNotifier {
   CallSession({
@@ -40,6 +50,7 @@ class CallSession extends ChangeNotifier {
   bool calleeAckedRinging = false;
   CallDeliveryState? deliveryState;
   CallAudioRoute? audioRoute;
+  CallNetworkQuality networkQuality = CallNetworkQuality.unknown;
 
   RTCPeerConnection? _pc;
   MediaStream? _local;
@@ -47,6 +58,7 @@ class CallSession extends ChangeNotifier {
   final RTCVideoRenderer localRenderer = RTCVideoRenderer();
   final RTCVideoRenderer remoteRenderer = RTCVideoRenderer();
   bool _renderersReady = false;
+  Timer? _qualityTimer;
 
   MediaStream? get localStream => _local;
   MediaStream? get remoteStream => _remote;
@@ -101,10 +113,13 @@ class CallSession extends ChangeNotifier {
         phase = CallPhase.active;
         connectedAt ??= DateTime.now();
         error = null;
+        networkQuality = CallNetworkQuality.unknown;
+        _startQualitySampling();
         notifyListeners();
       } else if (state == RTCPeerConnectionState.RTCPeerConnectionStateFailed ||
           state == RTCPeerConnectionState.RTCPeerConnectionStateDisconnected) {
         if (phase == CallPhase.active || phase == CallPhase.connecting) {
+          networkQuality = CallNetworkQuality.reconnecting;
           error =
               'Call media failed to connect. Check Tailscale is direct (not relay-only).';
           notifyListeners();
@@ -113,6 +128,64 @@ class CallSession extends ChangeNotifier {
     };
     _pc = pc;
     return pc;
+  }
+
+  void _startQualitySampling() {
+    _qualityTimer?.cancel();
+    // Stats stay entirely on-device. Seven seconds is responsive enough to be
+    // useful without waking the CPU every second for a cosmetic indicator.
+    _qualityTimer = Timer.periodic(
+      const Duration(seconds: 7),
+      (_) => unawaited(_sampleNetworkQuality()),
+    );
+    unawaited(_sampleNetworkQuality());
+  }
+
+  Future<void> _sampleNetworkQuality() async {
+    final pc = _pc;
+    if (pc == null || phase != CallPhase.active) return;
+    try {
+      final reports = await pc.getStats();
+      var worst = CallNetworkQuality.good;
+      for (final report in reports) {
+        final values = report.values;
+        if (report.type == 'candidate-pair') {
+          final rtt = _statNumber(values['currentRoundTripTime']);
+          if (rtt != null) {
+            if (rtt >= 0.8) {
+              worst = CallNetworkQuality.poor;
+            } else if (rtt >= 0.35 && worst != CallNetworkQuality.poor) {
+              worst = CallNetworkQuality.fair;
+            }
+          }
+        }
+        if (report.type == 'inbound-rtp') {
+          final received = _statNumber(values['packetsReceived']) ?? 0;
+          final lost = _statNumber(values['packetsLost']) ?? 0;
+          final total = received + (lost > 0 ? lost : 0);
+          final loss = total > 0 ? lost / total : 0;
+          final jitter = _statNumber(values['jitter']) ?? 0;
+          if (loss >= 0.08 || jitter >= 0.08) {
+            worst = CallNetworkQuality.poor;
+          } else if ((loss >= 0.03 || jitter >= 0.03) &&
+              worst != CallNetworkQuality.poor) {
+            worst = CallNetworkQuality.fair;
+          }
+        }
+      }
+      if (networkQuality != worst) {
+        networkQuality = worst;
+        notifyListeners();
+      }
+    } catch (_) {
+      // Stats support differs by WebRTC build. The call itself is authority;
+      // never disturb working media because its quality badge could not sample.
+    }
+  }
+
+  num? _statNumber(dynamic value) {
+    if (value is num) return value;
+    return num.tryParse('$value');
   }
 
   Future<MediaStream> openLocalMedia({required bool video}) async {
@@ -151,6 +224,8 @@ class CallSession extends ChangeNotifier {
   }
 
   Future<void> disposeMedia() async {
+    _qualityTimer?.cancel();
+    _qualityTimer = null;
     try {
       await _pc?.close();
     } catch (_) {}

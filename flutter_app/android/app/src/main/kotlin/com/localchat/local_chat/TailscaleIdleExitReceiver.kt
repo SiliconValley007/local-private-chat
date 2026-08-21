@@ -15,6 +15,7 @@ class TailscaleIdleExitReceiver : BroadcastReceiver() {
             context,
             AppForeground.isForeground(context),
             AppForeground.callStillActive(),
+            AppForeground.transferStillActive(),
         )
     }
 }

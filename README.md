@@ -364,13 +364,55 @@ python run.py
 
 Or `server\start.bat`.
 
-If clients use **LAN** only, allow the firewall once:
+The Windows release contains a single self-contained `LocalChatServer.exe` plus
+`START_HERE.txt`. Extract the ZIP first and double-click the EXE: a console stays open, prints the addresses to
+use, and logs every request until you close the window or press Ctrl+C. Startup
+errors pause in that console instead of flashing away. Its `data`, `media`,
+`jwt_secret.txt`, and optional `firebase-service-account.json` are created/read
+beside the EXE, so replacing the EXE does not replace chat data.
+
+The release build starts the frozen EXE from a clean temporary folder before it
+publishes the ZIP. It requires the console subsystem, probes `/api/health` and
+`/docs`, verifies access logs, requires the firewall state to be reported,
+restarts against the same database/secret, and checks the bundled
+`reset-password`, `set-admin`, and `allow-firewall` commands.
+
+#### Windows blocks phones until you allow the port
+
+Windows Defender Firewall denies unsolicited inbound connections on **every**
+profile, including the Tailscale interface. This is the single most confusing
+failure in the whole project, because nothing looks broken: the console prints a
+healthy banner, `http://127.0.0.1:8000/docs` works on the host, Tailscale says
+Connected on both devices — and every phone still shows "Chat server is not
+running", because the SYN is dropped before uvicorn sees it. A Termux host has no
+firewall, which is why moving the server from a phone to a PC appears to break it.
+
+The server now detects this itself. On startup it reports which state the
+firewall is in and, if the port is closed, asks Windows for permission to open it
+(approve the prompt). It never waits for that answer, so the server starts either
+way. To do it explicitly:
 
 ```powershell
-netsh advfirewall firewall add rule name="LocalChat" dir=in action=allow protocol=TCP localport=8000
+.\LocalChatServer.exe allow-firewall   # or: python run.py allow-firewall
 ```
 
-For Tailscale-only clients, the Tailscale interface is enough; still keep `HOST=0.0.0.0` (default).
+That installs one rule allowing inbound TCP 8000 from Tailscale's CGNAT range
+(`100.64.0.0/10`) and the local subnet only — not the public internet. Set
+`LOCALCHAT_FIREWALL_AUTOFIX=0` to keep the diagnosis but never raise a UAC prompt
+(the release verifier and any service wrapper use this); the subcommand then
+prints the exact `netsh` line for a deployment script. Set
+`LOCALCHAT_SKIP_FIREWALL_CHECK=1` to skip the check entirely.
+
+None of this runs on Android/Termux: that host has no firewall of its own, so the
+check is skipped there rather than making a phone server depend on a Windows-only
+module. Keep `HOST=0.0.0.0` (the default) so the server listens on the LAN and
+Tailscale interfaces both. If the rule is present and phones still cannot connect, check
+Tailscale's own "Allow incoming connections" setting on the host.
+
+A one-file build unpacks each module from its own archive on first use, so if a
+real-time antivirus scanner is still holding the binary the very first launch can
+die with `PermissionError: ... LocalChatServer.exe`. Starting it again works; the
+release verifier treats that signature as a retry rather than a broken build.
 
 The startup banner is deliberately plain ASCII. A Windows console on a legacy
 code page cannot encode a character such as an em dash, and the resulting
@@ -730,8 +772,8 @@ python reset_password.py alice        # type a new password privately
 **On a Windows host using the release zip, no Python needed:**
 
 ```text
-.\ResetPassword.exe
-.\ResetPassword.exe THEIR_USERNAME
+.\LocalChatServer.exe reset-password
+.\LocalChatServer.exe reset-password THEIR_USERNAME
 ```
 
 They can sign in with the new password immediately — no server restart needed.
@@ -747,7 +789,14 @@ python set_admin.py DDas --clear-device
 python set_admin.py --bump-all        # sign everyone out everywhere
 ```
 
-Windows release zip also ships `SetAdmin.exe`. Environment
+The same single Windows executable also provides the operator tool:
+
+```text
+.\LocalChatServer.exe set-admin
+.\LocalChatServer.exe set-admin DDas --clear-device
+```
+
+Environment
 `LOCALCHAT_ADMIN_USERNAME` still wins over the database when set.
 
 ### Encrypted backup / restore
@@ -943,7 +992,23 @@ contract are tested (`tests/test_integration_ws.py`,
 
 ## GitHub Releases (APK + Windows server)
 
-**Current app version:** `1.8.4+37` (the couple streak is counted from a day
+**Current app version:** `1.8.8+41` (a locked app now offers the fingerprint by
+itself on every launch instead of opening on a PIN field and waiting for a tap:
+where fingerprint unlock is on and no other choice was saved, fingerprint is the
+default, and the lock screen leads with it while keeping the PIN one tap away;
+plus 1.8.7: a Windows host now opens its own firewall
+port instead of looking healthy while every phone says the server is down, and
+the "server is not running" screen explains both an Android and a Windows host;
+plus 1.8.6: ordinary online sends no longer flash
+“did not go through”; App Lock no longer appears from in-app back or focus
+churn; fingerprint can be saved as the default unlock and is then offered
+on every launch; Message info uses gray double ticks for Delivered and
+blue only for Read; plus 1.8.5: fingerprint unlock no longer treats the
+system biometric sheet as leaving the app, so a successful scan stays unlocked
+instead of prompting forever, and chats/Tailscale cannot paint while the lock is armed;
+plus earlier: call-log previews no longer borrow message
+delivery/read ticks and falsely imply that the other person read a completed
+call; the couple streak is counted from a day
 ledger the server writes as people send, so deleting a message or letting a
 disappearing timer clear the day no longer erases days you both plainly spoke on,
 and the streak row now stays in the couple sheet and says "No streak yet" instead
@@ -981,12 +1046,12 @@ That writes:
 | `releases/LocalChat-android-arm64.apk` | Almost all modern Android phones |
 | `releases/LocalChat-android-arm32.apk` | Older / budget phones (armeabi-v7a) |
 | `releases/LocalChat-android-universal.apk` | When you don't know the phone — bigger, runs anywhere |
-| `releases/LocalChatServer-windows-x64.zip` | Windows PC host — unzip and run `LocalChatServer.exe` |
+| `releases/LocalChatServer-windows-x64.zip` | Windows PC host — `START_HERE.txt` + one self-contained console EXE; extract, then double-click |
 | `server-update.zip` (repo root) | Your own running Termux/Linux server — code only, no dependencies |
 
 Skip parts of it with `-SkipApk`, `-SkipServer`, or `-SkipUpdateZip`. The Windows
-zip needs `server\.venv` (PyInstaller runs inside it); everything else needs only
-Flutter.
+zip needs `server\.venv` only while building (PyInstaller runs inside it); the
+downloaded EXE needs no Python, installer, `_internal` folder, or helper script.
 
 Between releases, drop the regenerable build output with:
 

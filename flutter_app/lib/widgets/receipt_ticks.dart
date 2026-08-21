@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 
+import '../message_info.dart';
+
 /// WhatsApp-style delivery ticks for outgoing messages.
 ///
 /// [level]: -1 pending, 0 sent, 1 delivered, 2 read.
@@ -29,7 +31,7 @@ class ReceiptTicks extends StatelessWidget {
     return Icon(
       Icons.done_all_rounded,
       size: size,
-      color: level >= 2 ? const Color(0xFF2563EB) : muted,
+      color: level >= 2 ? receiptReadTickColor : muted,
     );
   }
 }

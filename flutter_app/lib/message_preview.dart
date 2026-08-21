@@ -1,4 +1,5 @@
 import 'call_log.dart';
+import 'checklist.dart';
 import 'e2e_text.dart';
 import 'models.dart';
 
@@ -36,6 +37,14 @@ String formatMessagePreview({
         viewerUserId: viewerUserId,
         endedByName: endedByName,
       );
+    case 'list':
+      if (sealed) return encryptedPreview;
+      final checklist = parseChecklist(body);
+      if (checklist == null) return 'Checklist';
+      final progress = '${checklist.doneCount}/${checklist.items.length}';
+      return checklist.title.isEmpty
+          ? 'Checklist · $progress'
+          : '${checklist.title} · $progress';
     default:
       if (sealed) return encryptedPreview;
       final text = body?.trim() ?? '';

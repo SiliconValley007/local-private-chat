@@ -32,6 +32,7 @@ from app.services import (
     list_nudge_events,
     member_user_ids,
     nudge_out,
+    purge_saved_message_tombstones,
     require_membership,
     set_anniversary,
     set_conversation_wallpaper,
@@ -78,7 +79,12 @@ def list_conversations(
         return []
     convs = db.scalars(
         select(Conversation)
-        .where(Conversation.id.in_(conv_ids))
+        # Saved Messages is an account tool reached from Settings, not an
+        # ordinary conversation competing for the top of the inbox.
+        .where(
+            Conversation.id.in_(conv_ids),
+            Conversation.type != "notes",
+        )
         .options(selectinload(Conversation.members).selectinload(ConversationMember.user))
     ).all()
     outs = [_conversation_out(db, c, current) for c in convs]
@@ -130,6 +136,47 @@ async def create_or_get_dm(
         {current.id, other.id},
         events.event_conversation_updated(conv.id),
     )
+    return _conversation_out(db, conv, current)
+
+
+@router.get("/notes", response_model=ConversationOut)
+async def get_or_create_notes(
+    db: Session = Depends(get_db),
+    current: User = Depends(get_current_user),
+) -> ConversationOut:
+    """The signed-in person's private vault: notes, files, and lists.
+
+    One conversation per account, created on first open. Nobody else is a
+    member, so it never appears in another inbox and cannot be called.
+    """
+    notes_key = f"notes:{current.id}"
+    existing = db.scalar(select(Conversation).where(Conversation.dm_key == notes_key))
+    if existing is not None:
+        purge_saved_message_tombstones(db, existing.id)
+        conv = _load_conv(db, existing.id)
+        assert conv is not None
+        return _conversation_out(db, conv, current)
+
+    conv = Conversation(
+        type="notes",
+        title="Saved messages",
+        dm_key=notes_key,
+        created_by=current.id,
+    )
+    db.add(conv)
+    db.flush()
+    db.add(ConversationMember(conversation_id=conv.id, user_id=current.id, role="member"))
+    db.commit()
+    audit.record(
+        db,
+        action="conversation.created",
+        summary=f"{current.username} opened Saved messages",
+        actor=current,
+        conversation_id=conv.id,
+        details={"type": "notes"},
+    )
+    conv = _load_conv(db, conv.id)
+    assert conv is not None
     return _conversation_out(db, conv, current)
 
 

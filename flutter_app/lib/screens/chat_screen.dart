@@ -18,6 +18,7 @@ import '../call_log.dart';
 import '../app_state.dart';
 import '../chat_navigation.dart';
 import '../chat_scroll.dart';
+import '../checklist.dart';
 import '../couple_details.dart';
 import '../doodle_stroke.dart';
 import '../e2e_text.dart';
@@ -46,7 +47,7 @@ import '../widgets/chat_background.dart';
 import '../widgets/doodle_attachment.dart';
 import '../widgets/doodle_overlay.dart';
 import '../widgets/loading_placeholders.dart';
-import '../widgets/message_highlight.dart';
+import '../widgets/message_highlight.dart' show messageHighlightHold;
 import '../widgets/rich_message_text.dart';
 import '../widgets/nudge_overlay.dart';
 import '../widgets/quoted_message.dart';
@@ -58,6 +59,7 @@ import '../widgets/streak_tile.dart';
 import '../widgets/video_attachment.dart';
 import 'call_screen.dart';
 import 'contact_profile_screen.dart';
+import 'message_info_screen.dart';
 import 'nudge_history_screen.dart';
 import 'shared_media_screen.dart';
 import 'wallpaper_crop_screen.dart';
@@ -96,6 +98,7 @@ class _ChatScreenState extends State<ChatScreen> {
   final _text = TextEditingController();
   final _searchQuery = TextEditingController();
   final _scroll = ScrollController();
+  final _messageListKey = GlobalKey();
   final _recorder = AudioRecorder();
 
   /// Held here so replying can raise the keyboard the way WhatsApp does.
@@ -141,6 +144,8 @@ class _ChatScreenState extends State<ChatScreen> {
 
   /// Tracks transcript growth so arrivals can be told apart from older pages.
   int _knownMessageCount = 0;
+  Object? _knownNewestMessage;
+  bool _knownTyping = false;
 
   @override
   void initState() {
@@ -324,33 +329,88 @@ class _ChatScreenState extends State<ChatScreen> {
     return isAtNewest(_scroll.position.pixels);
   }
 
-  /// Handles a transcript that grew.
+  Object _messageIdentity(ChatMessage message) =>
+      message.clientId ?? message.id;
+
+  /// Handles a change at the newest edge of the transcript.
   ///
-  /// Reading the newest messages follows them down. Reading older history keeps
-  /// its place instead: an arrival is added at the anchored end, which pushes
-  /// everything else away from it, so the offset is moved by the same amount.
-  void _followNewMessages(int messageCount) {
-    if (messageCount == _knownMessageCount) return;
-    final grew = messageCount > _knownMessageCount;
-    _knownMessageCount = messageCount;
-    if (!grew || _openingConversation) return;
+  /// A reversed lazy list estimates its full extent from the handful of rows it
+  /// has measured. The old implementation compensated an arrival with the
+  /// *estimated* extent change; mixed-height quotes and bubbles made that value
+  /// several screens wrong, which is the jump visible in the recordings.
+  ///
+  /// At the bottom we follow smoothly. While reading history we instead pin one
+  /// real, visible bubble to its measured screen coordinate. While the user is
+  /// actively dragging we do nothing at all, so an arrival never fights their
+  /// finger. Loading an older page is ignored because it grows the far edge.
+  void _followTranscript(List<ChatMessage> messages, {required bool typing}) {
+    final newest = messages.isEmpty ? null : _messageIdentity(messages.last);
+    final grew = messages.length > _knownMessageCount;
+    final newestChanged = newest != _knownNewestMessage;
+    final newestEdgeChanged = newestChanged || typing != _knownTyping;
+    _knownMessageCount = messages.length;
+    _knownNewestMessage = newest;
+    _knownTyping = typing;
+
+    if (_openingConversation || !newestEdgeChanged) return;
+    // More rows with the same newest row means an older history page landed.
+    if (grew && !newestChanged) return;
     if (_isNearBottom) {
-      _jumpToEnd(animate: false);
+      _jumpToEnd(animate: true);
       return;
     }
-    if (!_scroll.hasClients) return;
-    final extentBefore = _scroll.position.maxScrollExtent;
+    final anchor = _visibleMessageAnchor();
+    if (anchor == null) return;
     final pixelsBefore = _scroll.position.pixels;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted || !_scroll.hasClients) return;
       final position = _scroll.position;
-      final target = offsetAfterGrowth(
-        pixels: pixelsBefore,
-        extentDelta: position.maxScrollExtent - extentBefore,
-        maxScrollExtent: position.maxScrollExtent,
+      // Never undo a drag that began after the transcript rebuilt.
+      if (position.isScrollingNotifier.value ||
+          (position.pixels - pixelsBefore).abs() > 0.5) {
+        return;
+      }
+      final context = _messageKeys[anchor.id]?.currentContext;
+      final box = context?.findRenderObject();
+      if (box is! RenderBox || !box.attached) return;
+      final after = box.localToGlobal(Offset.zero).dy;
+      final target = (position.pixels + anchor.dy - after).clamp(
+        newestMessageOffset,
+        position.maxScrollExtent,
       );
-      if (target != position.pixels) _scroll.jumpTo(target);
+      if ((target - position.pixels).abs() > 0.5) {
+        // This correction is visually stationary: it offsets the exact movement
+        // of the same bubble rather than guessing from the sliver's extent.
+        position.jumpTo(target);
+      }
     });
+  }
+
+  ({int id, double dy})? _visibleMessageAnchor() {
+    if (!_scroll.hasClients || _scroll.position.isScrollingNotifier.value) {
+      return null;
+    }
+    final listObject = _messageListKey.currentContext?.findRenderObject();
+    if (listObject is! RenderBox || !listObject.attached) return null;
+    final listTop = listObject.localToGlobal(Offset.zero).dy;
+    final listBottom = listTop + listObject.size.height;
+    ({int id, double dy})? best;
+    var bestDistance = double.infinity;
+    for (final entry in _messageKeys.entries) {
+      final object = entry.value.currentContext?.findRenderObject();
+      if (object is! RenderBox || !object.attached) continue;
+      final top = object.localToGlobal(Offset.zero).dy;
+      final bottom = top + object.size.height;
+      if (bottom <= listTop || top >= listBottom) continue;
+      // Prefer the first fully visible row; fall back to the row crossing the
+      // top edge when a tall message fills the viewport.
+      final distance = top >= listTop ? top - listTop : listTop - top + 100000;
+      if (distance < bestDistance) {
+        bestDistance = distance;
+        best = (id: entry.key, dy: top);
+      }
+    }
+    return best;
   }
 
   void _jumpToLatestPressed() => _jumpToEnd(animate: true);
@@ -702,7 +762,9 @@ class _ChatScreenState extends State<ChatScreen> {
                 style: Theme.of(sheetContext).textTheme.titleMedium,
               ),
               const SizedBox(height: 18),
-              Row(
+              Wrap(
+                alignment: WrapAlignment.spaceAround,
+                runSpacing: 6,
                 children: [
                   _ShareOption(
                     icon: Icons.photo_library_rounded,
@@ -721,6 +783,12 @@ class _ChatScreenState extends State<ChatScreen> {
                     label: 'Document',
                     color: const Color(0xFF2563EB),
                     onTap: () => Navigator.pop(sheetContext, 'file'),
+                  ),
+                  _ShareOption(
+                    icon: Icons.checklist_rounded,
+                    label: 'Checklist',
+                    color: const Color(0xFF0E7C66),
+                    onTap: () => Navigator.pop(sheetContext, 'list'),
                   ),
                 ],
               ),
@@ -741,6 +809,82 @@ class _ChatScreenState extends State<ChatScreen> {
         await _pickCameraImage();
       case 'file':
         await _pickFiles();
+      case 'list':
+        await _createChecklist();
+    }
+  }
+
+  Future<void> _createChecklist() async {
+    final title = TextEditingController();
+    final items = TextEditingController();
+    try {
+      final checklist = await showDialog<Checklist>(
+        context: context,
+        builder: (dialogContext) => AlertDialog(
+          title: const Text('New checklist'),
+          content: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 420),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                TextField(
+                  controller: title,
+                  maxLength: checklistMaxTitle,
+                  textCapitalization: TextCapitalization.sentences,
+                  decoration: const InputDecoration(
+                    labelText: 'Title (optional)',
+                    prefixIcon: Icon(Icons.title_rounded),
+                  ),
+                ),
+                const SizedBox(height: 10),
+                TextField(
+                  controller: items,
+                  autofocus: true,
+                  minLines: 4,
+                  maxLines: 8,
+                  textCapitalization: TextCapitalization.sentences,
+                  decoration: const InputDecoration(
+                    labelText: 'Items',
+                    hintText: 'One item per line',
+                    alignLabelWithHint: true,
+                    prefixIcon: Icon(Icons.checklist_rounded),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () {
+                final value = checklistFromLines(title.text, items.text);
+                if (value == null) {
+                  ScaffoldMessenger.of(dialogContext).showSnackBar(
+                    const SnackBar(content: Text('Add at least one item.')),
+                  );
+                  return;
+                }
+                Navigator.pop(dialogContext, value);
+              },
+              child: const Text('Send'),
+            ),
+          ],
+        ),
+      );
+      if (checklist == null || !mounted) return;
+      await context.read<AppState>().sendChecklist(
+        widget.conversation.id,
+        checklist,
+      );
+      _jumpToEnd(animate: false);
+    } catch (failure) {
+      if (mounted) _showMessage(friendlyMessage(failure));
+    } finally {
+      title.dispose();
+      items.dispose();
     }
   }
 
@@ -846,13 +990,14 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   String _subtitleFor(Conversation conv, AppState state) {
+    if (conv.isNotes) return 'Only you can see this';
     final typing = state.typingLabelFor(conv);
     if (typing != null) return typing;
     if (conv.type == 'group') return '${conv.members.length} members';
     final peer = conv.peer;
     if (peer == null) return '';
-    if (state.onlineByUser[peer.id] ?? peer.isOnline) return 'online';
-    final seen = state.lastSeenByUser[peer.id] ?? peer.lastSeenAt;
+    if (state.isUserOnline(peer)) return 'online';
+    final seen = state.lastSeenFor(peer);
     if (seen == null) return '';
     return formatLastSeen(context, seen);
   }
@@ -881,6 +1026,7 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   Future<void> _openContactProfile(Conversation conv) async {
+    if (conv.isNotes) return;
     if (conv.type == 'group') {
       _showGroupMembers(conv);
       return;
@@ -1153,17 +1299,21 @@ class _ChatScreenState extends State<ChatScreen> {
       context: context,
       showDragHandle: true,
       builder: (sheetContext) => SafeArea(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            for (final v in NudgeVariant.values)
-              ListTile(
-                leading: Text(v.emoji, style: const TextStyle(fontSize: 24)),
-                title: Text('${v.name[0].toUpperCase()}${v.name.substring(1)}'),
-                onTap: () => Navigator.pop(sheetContext, v),
-              ),
-            const SizedBox(height: 8),
-          ],
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              for (final v in NudgeVariant.values)
+                ListTile(
+                  leading: Text(v.emoji, style: const TextStyle(fontSize: 24)),
+                  title: Text(
+                    '${v.name[0].toUpperCase()}${v.name.substring(1)}',
+                  ),
+                  onTap: () => Navigator.pop(sheetContext, v),
+                ),
+              const SizedBox(height: 8),
+            ],
+          ),
         ),
       ),
     );
@@ -1452,7 +1602,11 @@ class _ChatScreenState extends State<ChatScreen> {
                     title: Text(
                       hasWallpaper ? 'Change wallpaper' : 'Choose from gallery',
                     ),
-                    subtitle: const Text('Shared with everyone in this chat'),
+                    subtitle: Text(
+                      conv.isNotes
+                          ? 'Shown only in Saved messages'
+                          : 'Shared with everyone in this chat',
+                    ),
                     onTap: () => Navigator.pop(sheetContext, 'pick'),
                   ),
                   if (hasWallpaper) ...[
@@ -1589,33 +1743,35 @@ class _ChatScreenState extends State<ChatScreen> {
           title: const Text('Wallpaper'),
         ),
       ),
-      PopupMenuItem(
-        value: 'nudge',
-        child: ListTile(
-          dense: true,
-          contentPadding: EdgeInsets.zero,
-          leading: const Icon(Icons.waving_hand_rounded),
-          title: const Text('Send a nudge'),
+      if (!conv.isNotes) ...[
+        const PopupMenuItem(
+          value: 'nudge',
+          child: ListTile(
+            dense: true,
+            contentPadding: EdgeInsets.zero,
+            leading: Icon(Icons.waving_hand_rounded),
+            title: Text('Send a nudge'),
+          ),
         ),
-      ),
-      PopupMenuItem(
-        value: 'nudge_history',
-        child: ListTile(
-          dense: true,
-          contentPadding: EdgeInsets.zero,
-          leading: const Icon(Icons.history_rounded),
-          title: const Text('Nudge history'),
+        const PopupMenuItem(
+          value: 'nudge_history',
+          child: ListTile(
+            dense: true,
+            contentPadding: EdgeInsets.zero,
+            leading: Icon(Icons.history_rounded),
+            title: Text('Nudge history'),
+          ),
         ),
-      ),
-      const PopupMenuItem(
-        value: 'doodle',
-        child: ListTile(
-          dense: true,
-          contentPadding: EdgeInsets.zero,
-          leading: Icon(Icons.draw_rounded),
-          title: Text('Draw on chat'),
+        const PopupMenuItem(
+          value: 'doodle',
+          child: ListTile(
+            dense: true,
+            contentPadding: EdgeInsets.zero,
+            leading: Icon(Icons.draw_rounded),
+            title: Text('Draw on chat'),
+          ),
         ),
-      ),
+      ],
       PopupMenuItem(
         value: 'disappearing',
         child: ListTile(
@@ -1679,15 +1835,15 @@ class _ChatScreenState extends State<ChatScreen> {
           : state.conversationPhase(conv.id),
       isEmpty: messages.isEmpty,
     );
-    _followNewMessages(messages.length);
     final online = conv.type == 'dm' && conv.peer != null
-        ? (state.onlineByUser[conv.peer!.id] ?? false)
+        ? state.isUserOnline(conv.peer!)
         : null;
     final scheme = Theme.of(context).colorScheme;
     final title = state.titleFor(conv);
     final presence = _subtitleFor(conv, state);
     final mood = _moodLine(conv, state);
     final typing = (state.typingUsers[conv.id] ?? const {}).isNotEmpty;
+    _followTranscript(messages, typing: typing);
 
     return PopScope(
       canPop: false,
@@ -1731,13 +1887,15 @@ class _ChatScreenState extends State<ChatScreen> {
                   onSubmitted: (value) => _searchInChat(conv, value),
                 )
               : InkWell(
-                  onTap: () => _openContactProfile(conv),
+                  onTap: conv.isNotes ? null : () => _openContactProfile(conv),
                   child: Row(
                     children: [
                       GestureDetector(
                         // The photo itself opens full screen; the name beside it
                         // opens the contact profile.
-                        onTap: () => _viewAvatar(conv, title, state),
+                        onTap: conv.isNotes
+                            ? null
+                            : () => _viewAvatar(conv, title, state),
                         child: Avatar(
                           name: title,
                           seed: conv.type == 'dm'
@@ -1747,7 +1905,7 @@ class _ChatScreenState extends State<ChatScreen> {
                           online: online,
                           badge: conv.type == 'group'
                               ? Icons.group_rounded
-                              : null,
+                              : (conv.isNotes ? Icons.bookmark_rounded : null),
                           imageUrl: conv.type == 'dm'
                               ? state.avatarUrlFor(conv.peer?.id)
                               : null,
@@ -1898,7 +2056,7 @@ class _ChatScreenState extends State<ChatScreen> {
                 // still reach the messages underneath.
                 child: GestureDetector(
                   behavior: HitTestBehavior.translucent,
-                  onDoubleTap: _doodleMode ? null : _sendNudge,
+                  onDoubleTap: _doodleMode || conv.isNotes ? null : _sendNudge,
                   child: Stack(
                     children: [
                       // An unanswered chat is not an empty one: until the
@@ -1907,9 +2065,10 @@ class _ChatScreenState extends State<ChatScreen> {
                       if (transcriptView == CollectionView.skeleton)
                         const TranscriptSkeleton()
                       else if (transcriptView == CollectionView.empty)
-                        _EmptyConversation(title: title)
+                        _EmptyConversation(title: title, notes: conv.isNotes)
                       else
                         _MessageList(
+                          key: _messageListKey,
                           controller: _scroll,
                           messages: messages,
                           conversation: conv,
@@ -1960,6 +2119,12 @@ class _ChatScreenState extends State<ChatScreen> {
                 bytesTotal: state.mediaUploadBytesTotal,
                 waiting: state.mediaUploadWaiting,
               ),
+            if (state.outboxCountFor(conv.id) > 0)
+              _OutboxBar(
+                count: state.outboxCountFor(conv.id),
+                connected: state.serverReachable,
+                onRetry: state.flushOutbox,
+              ),
             // Keys matter here. Inserting the draft bar above the composer shifts
             // the composer down a slot, and without keys Flutter rebuilds it from
             // scratch: the text field loses its platform input connection, so the
@@ -1999,6 +2164,7 @@ class _ChatScreenState extends State<ChatScreen> {
 /// Scrolling transcript with date separators and grouped runs of messages.
 class _MessageList extends StatefulWidget {
   const _MessageList({
+    super.key,
     required this.controller,
     required this.messages,
     required this.conversation,
@@ -2030,6 +2196,24 @@ class _MessageListState extends State<_MessageList> {
   static bool _sameDay(DateTime a, DateTime b) =>
       a.year == b.year && a.month == b.month && a.day == b.day;
 
+  String _rowKey(ChatMessage message) =>
+      'message:${message.clientId ?? message.id}';
+
+  int? _findRowIndex(Key key) {
+    if (key == const ValueKey<String>('typing')) {
+      return widget.typing ? 0 : null;
+    }
+    if (key is! ValueKey<String> || !key.value.startsWith('message:')) {
+      return null;
+    }
+    final messageIndex = widget.messages.indexWhere(
+      (message) => _rowKey(message) == key.value,
+    );
+    if (messageIndex < 0) return null;
+    final reversed = widget.messages.length - 1 - messageIndex;
+    return reversed + (widget.typing ? 1 : 0);
+  }
+
   @override
   Widget build(BuildContext context) {
     return ListView.builder(
@@ -2042,6 +2226,7 @@ class _MessageListState extends State<_MessageList> {
       // needs no catch-up scroll and a late-loading image cannot shift it.
       reverse: true,
       addAutomaticKeepAlives: false,
+      findChildIndexCallback: _findRowIndex,
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
       itemCount: transcriptItemCount(
         messageCount: widget.messages.length,
@@ -2054,7 +2239,9 @@ class _MessageListState extends State<_MessageList> {
           messageCount: messages.length,
           typing: widget.typing,
         );
-        if (messageIndex == null) return const _TypingBubble();
+        if (messageIndex == null) {
+          return const _TypingBubble(key: ValueKey<String>('typing'));
+        }
 
         final msg = messages[messageIndex];
         final previous = messageIndex == 0 ? null : messages[messageIndex - 1];
@@ -2073,44 +2260,41 @@ class _MessageListState extends State<_MessageList> {
             !_sameDay(next.createdAt.toLocal(), msg.createdAt.toLocal());
 
         return Column(
+          key: ValueKey<String>(_rowKey(msg)),
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
             if (startsDay) _DateSeparator(date: msg.createdAt.toLocal()),
             Padding(
               key: widget.keyFor(msg.id),
               padding: EdgeInsets.only(top: firstOfRun ? 8 : 2),
-              // Behind the whole row, so a photo or a drawing lights up as
-              // plainly as a line of text.
-              child: MessageHighlight(
-                active: widget.highlightedMessageId == msg.id,
-                child: SwipeToReply(
-                  // Pending messages have no server id yet, so there is nothing
-                  // for the other side to quote.
-                  enabled: !msg.pending && msg.id > 0 && !msg.isDeleted,
-                  onReply: () => widget.onReply(msg),
-                  child: _MessageRow(
-                    message: msg,
-                    conversationId: widget.conversation.id,
-                    mine: mine,
-                    firstOfRun: firstOfRun,
-                    lastOfRun: lastOfRun,
-                    showSenderName:
-                        widget.conversation.type == 'group' &&
-                        !mine &&
-                        firstOfRun,
-                    senderName: widget.senderNameOf(msg.senderId),
-                    highlighted: widget.highlightedMessageId == msg.id,
-                    quotedSenderName: msg.replyTo == null
-                        ? null
-                        : widget.senderNameOf(msg.replyTo!.senderId),
-                    quotedIsMine: msg.replyTo?.senderId == widget.meId,
-                    onQuoteTap: msg.replyTo == null
-                        ? null
-                        : () => widget.onQuoteTap(msg.replyTo!.id),
-                    onReply: msg.pending || msg.id <= 0 || msg.isDeleted
-                        ? null
-                        : () => widget.onReply(msg),
-                  ),
+              child: SwipeToReply(
+                // Pending messages have no server id yet, so there is nothing
+                // for the other side to quote.
+                enabled: !msg.pending && msg.id > 0 && !msg.isDeleted,
+                onReply: () => widget.onReply(msg),
+                child: _MessageRow(
+                  message: msg,
+                  conversationId: widget.conversation.id,
+                  savedMessages: widget.conversation.isNotes,
+                  mine: mine,
+                  firstOfRun: firstOfRun,
+                  lastOfRun: lastOfRun,
+                  showSenderName:
+                      widget.conversation.type == 'group' &&
+                      !mine &&
+                      firstOfRun,
+                  senderName: widget.senderNameOf(msg.senderId),
+                  highlighted: widget.highlightedMessageId == msg.id,
+                  quotedSenderName: msg.replyTo == null
+                      ? null
+                      : widget.senderNameOf(msg.replyTo!.senderId),
+                  quotedIsMine: msg.replyTo?.senderId == widget.meId,
+                  onQuoteTap: msg.replyTo == null
+                      ? null
+                      : () => widget.onQuoteTap(msg.replyTo!.id),
+                  onReply: msg.pending || msg.id <= 0 || msg.isDeleted
+                      ? null
+                      : () => widget.onReply(msg),
                 ),
               ),
             ),
@@ -2125,6 +2309,7 @@ class _MessageRow extends StatelessWidget {
   const _MessageRow({
     required this.message,
     required this.conversationId,
+    required this.savedMessages,
     required this.mine,
     required this.firstOfRun,
     required this.lastOfRun,
@@ -2139,6 +2324,7 @@ class _MessageRow extends StatelessWidget {
 
   final ChatMessage message;
   final int conversationId;
+  final bool savedMessages;
   final bool mine;
   final bool firstOfRun;
   final bool lastOfRun;
@@ -2167,6 +2353,8 @@ class _MessageRow extends StatelessWidget {
     final canCopy = isText && (message.body ?? '').trim().isNotEmpty;
     // Editing is only offered inside the 15-minute trust window.
     final canEdit = message.canEdit(meId);
+    final canShowInfo =
+        mine && !savedMessages && !message.pending && message.id > 0;
     final hasAttachActions = messageHasAttachmentActions(message);
     // Delete for everyone is the sender's (or a group admin's) call; delete for
     // me is always available so anyone can clear their own view.
@@ -2221,6 +2409,13 @@ class _MessageRow extends StatelessWidget {
                 leading: const Icon(Icons.reply_rounded),
                 title: const Text('Reply'),
                 onTap: () => Navigator.pop(sheetContext, 'reply'),
+              ),
+            if (canShowInfo)
+              ListTile(
+                leading: const Icon(Icons.info_outline_rounded),
+                title: const Text('Info'),
+                subtitle: const Text('Read and delivery details'),
+                onTap: () => Navigator.pop(sheetContext, 'info'),
               ),
             if (canCopy)
               ListTile(
@@ -2305,6 +2500,18 @@ class _MessageRow extends StatelessWidget {
     switch (action) {
       case 'reply':
         onReply?.call();
+      case 'info':
+        final conversation = state.conversationById(conversationId);
+        if (conversation != null && context.mounted) {
+          await Navigator.of(context).push(
+            MaterialPageRoute<void>(
+              builder: (_) => MessageInfoScreen(
+                message: message,
+                conversation: conversation,
+              ),
+            ),
+          );
+        }
       case 'copy':
         await Clipboard.setData(ClipboardData(text: message.body ?? ''));
         if (context.mounted) {
@@ -2419,6 +2626,41 @@ class _MessageRow extends StatelessWidget {
   }
 
   Future<void> _deleteMessage(BuildContext context) async {
+    if (savedMessages) {
+      final confirmed = await showDialog<bool>(
+        context: context,
+        builder: (dialogContext) => AlertDialog(
+          title: const Text('Delete saved message?'),
+          content: const Text(
+            'It will be permanently removed without leaving a deleted-message placeholder.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext, false),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(dialogContext, true),
+              child: const Text('Delete'),
+            ),
+          ],
+        ),
+      );
+      if (confirmed != true || !context.mounted) return;
+      try {
+        await context.read<AppState>().permanentlyDeleteSavedMessage(
+          conversationId,
+          message,
+        );
+      } catch (e) {
+        if (context.mounted) {
+          ScaffoldMessenger.of(
+            context,
+          ).showSnackBar(SnackBar(content: Text(friendlyMessage(e))));
+        }
+      }
+      return;
+    }
     // Delete for everyone is only meaningful for your own messages (the server
     // also allows a group admin, but the common case is your own text). Delete
     // for me is always available.
@@ -2579,6 +2821,12 @@ class _MessageRow extends StatelessWidget {
                     )
                   : bubbleColor,
               borderRadius: _bubbleRadius(),
+              border: highlighted
+                  ? Border.all(
+                      color: scheme.primary.withValues(alpha: 0.55),
+                      width: 1.25,
+                    )
+                  : null,
               boxShadow: bare || isDoodleTile
                   ? null
                   : softShadow(
@@ -2824,6 +3072,9 @@ class _MessageContent extends StatelessWidget {
           maxWidth: maxWidth,
           onLongPress: onLongPress,
         );
+      case 'list':
+        if (isE2eCipherText(message.body)) return const _SealedBody();
+        return _ChecklistBody(message: message);
       default:
         // Sealed text cannot be shown, and its token least of all: a reinstall
         // retires the key that opened this stretch of history for good, so the
@@ -2874,6 +3125,91 @@ class _MessageContent extends StatelessWidget {
           ],
         );
     }
+  }
+}
+
+class _ChecklistBody extends StatelessWidget {
+  const _ChecklistBody({required this.message});
+
+  final ChatMessage message;
+
+  @override
+  Widget build(BuildContext context) {
+    final checklist = parseChecklist(message.body);
+    if (checklist == null) {
+      return const Text('This checklist could not be opened.');
+    }
+    final state = context.watch<AppState>();
+    final busy = message.pending || state.checklistUpdating(message.id);
+    final scheme = Theme.of(context).colorScheme;
+    return ConstrainedBox(
+      constraints: const BoxConstraints(minWidth: 220, maxWidth: 320),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Row(
+            children: [
+              Icon(Icons.checklist_rounded, size: 19, color: scheme.primary),
+              const SizedBox(width: 7),
+              Expanded(
+                child: Text(
+                  checklist.title.isEmpty ? 'Checklist' : checklist.title,
+                  style: const TextStyle(fontWeight: FontWeight.w700),
+                ),
+              ),
+              Text(
+                '${checklist.doneCount}/${checklist.items.length}',
+                style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                  color: scheme.onSurfaceVariant,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 4),
+          for (final item in checklist.items)
+            CheckboxListTile(
+              dense: true,
+              visualDensity: VisualDensity.compact,
+              contentPadding: EdgeInsets.zero,
+              controlAffinity: ListTileControlAffinity.leading,
+              value: item.done,
+              title: Text(
+                item.text,
+                style: TextStyle(
+                  decoration: item.done ? TextDecoration.lineThrough : null,
+                  color: item.done ? scheme.onSurfaceVariant : null,
+                ),
+              ),
+              onChanged: busy
+                  ? null
+                  : (_) async {
+                      try {
+                        await context.read<AppState>().updateChecklist(
+                          message,
+                          toggleChecklistItem(checklist, item.id),
+                        );
+                      } catch (failure) {
+                        if (!context.mounted) return;
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          SnackBar(content: Text(friendlyMessage(failure))),
+                        );
+                      }
+                    },
+            ),
+          if (busy)
+            Padding(
+              padding: const EdgeInsets.only(top: 2),
+              child: Text(
+                message.pending ? 'Waiting to send' : 'Saving…',
+                style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                  color: scheme.onSurfaceVariant,
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
   }
 }
 
@@ -2939,7 +3275,7 @@ class _DateSeparator extends StatelessWidget {
 }
 
 class _TypingBubble extends StatefulWidget {
-  const _TypingBubble();
+  const _TypingBubble({super.key});
 
   @override
   State<_TypingBubble> createState() => _TypingBubbleState();
@@ -3008,9 +3344,10 @@ class _TypingBubbleState extends State<_TypingBubble>
 }
 
 class _EmptyConversation extends StatelessWidget {
-  const _EmptyConversation({required this.title});
+  const _EmptyConversation({required this.title, this.notes = false});
 
   final String title;
+  final bool notes;
 
   @override
   Widget build(BuildContext context) {
@@ -3029,20 +3366,22 @@ class _EmptyConversation extends StatelessWidget {
                 boxShadow: softShadow(color: scheme.primary, opacity: 0.15),
               ),
               child: Icon(
-                Icons.lock_outline_rounded,
+                notes ? Icons.bookmark_rounded : Icons.lock_outline_rounded,
                 size: 34,
                 color: scheme.primary,
               ),
             ),
             const SizedBox(height: 18),
             Text(
-              'Say hello to $title',
+              notes ? 'Keep something for yourself' : 'Say hello to $title',
               textAlign: TextAlign.center,
               style: Theme.of(context).textTheme.titleMedium,
             ),
             const SizedBox(height: 8),
             Text(
-              'Messages here travel only over your private Tailscale network.',
+              notes
+                  ? 'Save notes, files, links, and checklists here. This space belongs only to your account.'
+                  : 'Messages here travel only over your private Tailscale network.',
               textAlign: TextAlign.center,
               style: Theme.of(context).textTheme.bodySmall?.copyWith(
                 color: scheme.onSurfaceVariant,
@@ -3097,26 +3436,37 @@ class _ShareOption extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Expanded(
+    return Semantics(
+      button: true,
+      label: 'Share $label',
       child: InkWell(
         borderRadius: BorderRadius.circular(AppRadius.field),
         onTap: onTap,
         child: Padding(
           padding: const EdgeInsets.symmetric(vertical: 12),
-          child: Column(
-            children: [
-              Container(
-                width: 56,
-                height: 56,
-                decoration: BoxDecoration(
-                  color: color.withValues(alpha: 0.12),
-                  shape: BoxShape.circle,
+          child: SizedBox(
+            width: 76,
+            child: Column(
+              children: [
+                Container(
+                  width: 56,
+                  height: 56,
+                  decoration: BoxDecoration(
+                    color: color.withValues(alpha: 0.12),
+                    shape: BoxShape.circle,
+                  ),
+                  child: Icon(icon, color: color, size: 26),
                 ),
-                child: Icon(icon, color: color, size: 26),
-              ),
-              const SizedBox(height: 8),
-              Text(label, style: Theme.of(context).textTheme.labelMedium),
-            ],
+                const SizedBox(height: 8),
+                Text(
+                  label,
+                  maxLines: 2,
+                  textAlign: TextAlign.center,
+                  overflow: TextOverflow.ellipsis,
+                  style: Theme.of(context).textTheme.labelMedium,
+                ),
+              ],
+            ),
           ),
         ),
       ),
@@ -3124,7 +3474,67 @@ class _ShareOption extends StatelessWidget {
   }
 }
 
-/// Thin banner shown while an album of attachments is uploading in order.
+/// Thin banner for sends that are stuck, never for sends that are simply on
+/// their way — a healthy message is already reported by the clock on its bubble.
+class _OutboxBar extends StatelessWidget {
+  const _OutboxBar({
+    required this.count,
+    required this.connected,
+    required this.onRetry,
+  });
+
+  final int count;
+  final bool connected;
+  final Future<void> Function() onRetry;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final subject = count == 1 ? 'message' : 'messages';
+    final label = connected
+        ? '$count $subject did not go through — tap to retry'
+        : '$count $subject ${count == 1 ? 'is' : 'are'} waiting for connection';
+    return Semantics(
+      liveRegion: true,
+      label: label,
+      child: Material(
+        color: scheme.secondaryContainer,
+        child: InkWell(
+          onTap: connected ? () => onRetry() : null,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+            child: Row(
+              children: [
+                Icon(
+                  connected ? Icons.sync_rounded : Icons.cloud_off_rounded,
+                  size: 17,
+                  color: scheme.onSecondaryContainer,
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    label,
+                    style: Theme.of(context).textTheme.labelMedium?.copyWith(
+                      color: scheme.onSecondaryContainer,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ),
+                if (connected)
+                  Icon(
+                    Icons.refresh_rounded,
+                    size: 17,
+                    color: scheme.onSecondaryContainer,
+                  ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 class _UploadProgressBar extends StatelessWidget {
   const _UploadProgressBar({
     required this.done,
@@ -3151,30 +3561,32 @@ class _UploadProgressBar extends StatelessWidget {
             bytesSent: bytesSent,
             bytesTotal: bytesTotal,
           );
-    return Container(
-      padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
-      color: scheme.surfaceContainerHighest,
-      child: Row(
-        children: [
-          SizedBox(
-            width: 18,
-            height: 18,
-            child: CircularProgressIndicator(strokeWidth: 2, value: value),
-          ),
-          const SizedBox(width: 12),
-          Expanded(
-            child: Text(
-              uploadProgressLabel(
-                filesDone: done,
-                filesTotal: total,
-                bytesSent: bytesSent,
-                bytesTotal: bytesTotal,
-                waiting: waiting,
-              ),
-              style: Theme.of(context).textTheme.bodyMedium,
+    final label = uploadProgressLabel(
+      filesDone: done,
+      filesTotal: total,
+      bytesSent: bytesSent,
+      bytesTotal: bytesTotal,
+      waiting: waiting,
+    );
+    return Semantics(
+      liveRegion: waiting,
+      label: label,
+      child: Container(
+        padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
+        color: scheme.surfaceContainerHighest,
+        child: Row(
+          children: [
+            SizedBox(
+              width: 18,
+              height: 18,
+              child: CircularProgressIndicator(strokeWidth: 2, value: value),
             ),
-          ),
-        ],
+            const SizedBox(width: 12),
+            Expanded(
+              child: Text(label, style: Theme.of(context).textTheme.bodyMedium),
+            ),
+          ],
+        ),
       ),
     );
   }

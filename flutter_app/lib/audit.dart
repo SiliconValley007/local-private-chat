@@ -338,9 +338,10 @@ String auditSentence(
     'conversation.wallpaper_dimmed' =>
       '$who dimmed the wallpaper$where to ${_dimLabel(after)}',
     'conversation.disappearing_set' => _disappearingSentence(who, where, after),
-    'conversation.anniversary_set' => after == null || after.isEmpty
-        ? '$who cleared the anniversary$where'
-        : '$who set the anniversary$where to ${_dateLabel(after)}',
+    'conversation.anniversary_set' =>
+      after == null || after.isEmpty
+          ? '$who cleared the anniversary$where'
+          : '$who set the anniversary$where to ${_dateLabel(after)}',
     'admin.designated' =>
       '$who handed the activity log to '
           '${after == null || after.isEmpty ? "nobody" : "@$after"}',
@@ -601,7 +602,12 @@ List<AuditTextBlock> auditTextBlocks(
       if (!entry.hasTextChange) return const [];
       return [
         if (before != null && before.isNotEmpty)
-          _messageBlock('Before', before, naming.revealedBefore, isBefore: true),
+          _messageBlock(
+            'Before',
+            before,
+            naming.revealedBefore,
+            isBefore: true,
+          ),
         if (after != null && after.isNotEmpty)
           _messageBlock('After', after, naming.revealedAfter),
       ];
@@ -711,7 +717,10 @@ List<AuditDetailRow> auditFactRows(
     // Somebody removing a message they did not write is the case a log exists
     // for, so it is said outright rather than left to be worked out from ids.
     rows.add(
-      const AuditDetailRow('Deleted by', 'a chat admin, not the person who sent it'),
+      const AuditDetailRow(
+        'Deleted by',
+        'a chat admin, not the person who sent it',
+      ),
     );
   }
   return rows;
@@ -746,15 +755,16 @@ List<AuditDetailRow> _partyRows(AuditEntry entry, AuditNaming naming) {
   final memberCount = (details['chat_member_count'] as num?)?.toInt();
   if (details['chat_is_self'] == true) {
     rows.add(
-      const AuditDetailRow('Who else is in that chat', 'nobody — it is a chat with yourself'),
+      const AuditDetailRow(
+        'Who else is in that chat',
+        'nobody — it is a chat with yourself',
+      ),
     );
   } else if (kind == 'group') {
     rows.add(
       AuditDetailRow(
         'That chat',
-        memberCount == null
-            ? 'a group'
-            : 'a group of $memberCount people',
+        memberCount == null ? 'a group' : 'a group of $memberCount people',
       ),
     );
   } else if (otherId != null || (otherName != null && otherName.isNotEmpty)) {
@@ -792,11 +802,7 @@ String _targetRowLabel(String action) => switch (action) {
 
 /// One account as this reader should see it: "You", a username, or an honest
 /// number when the name is not on this phone.
-String _personLabel({
-  int? id,
-  String? username,
-  required AuditNaming naming,
-}) {
+String _personLabel({int? id, String? username, required AuditNaming naming}) {
   final name = username?.trim();
   final me = naming.myUsername?.trim();
   final sameId = id != null && naming.myUserId != null && id == naming.myUserId;

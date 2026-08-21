@@ -517,7 +517,11 @@ class Conversation {
   /// Consecutive days both people messaged (DMs only).
   final int streakDays;
 
+  /// True for the signed-in person's private Saved messages vault.
+  bool get isNotes => type == 'notes';
+
   String get displayTitle {
+    if (type == 'notes') return 'Saved messages';
     if (type == 'dm') return peer?.displayName ?? title ?? 'Chat';
     return title ?? 'Group';
   }

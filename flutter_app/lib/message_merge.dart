@@ -42,7 +42,13 @@ List<ChatMessage> mergeConversationMessages({
   }
 
   final merged = List<ChatMessage>.from(slots)
-    ..sort((a, b) => a.id.compareTo(b.id));
+    ..sort((a, b) {
+      // A restored outbox row has no positive server id yet. Sorting solely by
+      // id put that newest bubble before the oldest confirmed message. Time is
+      // the common ordering key; id only breaks equal timestamps.
+      final byTime = a.createdAt.compareTo(b.createdAt);
+      return byTime != 0 ? byTime : a.id.compareTo(b.id);
+    });
   return merged;
 }
 

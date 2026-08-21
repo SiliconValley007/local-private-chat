@@ -209,16 +209,17 @@ object TailscaleExitPolicy {
      * The background timer fired: disconnect only if the user has not come back
      * and nothing is still using the tunnel.
      *
-     * A voice call with the screen off looks exactly like an abandoned app from
-     * the outside, and cutting its tunnel would drop the call.
+     * A voice call or upload with the screen off looks exactly like an
+     * abandoned app from the outside, and cutting its tunnel would drop it.
      */
     fun shouldDisconnectOnIdleAlarm(
         enabled: Boolean,
         phase: TailscaleOwnershipPhase,
         appForeground: Boolean,
         callActive: Boolean = false,
+        transferActive: Boolean = false,
     ): Boolean {
-        if (appForeground || callActive) return false
+        if (appForeground || callActive || transferActive) return false
         return shouldDisconnectOnExit(enabled, phase)
     }
 

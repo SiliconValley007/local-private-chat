@@ -17,6 +17,13 @@ const double newestMessageOffset = 0;
 /// Distance from the newest message before the "jump to latest" button appears.
 const double jumpToLatestThreshold = 320;
 
+/// Distance that still counts as deliberately staying at the bottom.
+///
+/// This is intentionally much smaller than [jumpToLatestThreshold]. Treating
+/// every reader within 320 pixels as "at the bottom" made an arrival pull them
+/// away from the messages they were reading.
+const double autoFollowLatestThreshold = 24;
+
 /// How close to the oldest loaded message triggers the next page.
 const double loadOlderThreshold = 40;
 
@@ -39,8 +46,8 @@ int? transcriptMessageIndex({
   return messageCount - 1 - row;
 }
 
-/// True while the newest message is on screen, so arrivals may follow it down.
-bool isAtNewest(double pixels) => pixels < jumpToLatestThreshold;
+/// True only while the reader is deliberately parked at the newest message.
+bool isAtNewest(double pixels) => pixels <= autoFollowLatestThreshold;
 
 /// True once the reader has moved far enough back for the jump button to help.
 bool shouldShowJumpToLatest(double pixels) => pixels >= jumpToLatestThreshold;

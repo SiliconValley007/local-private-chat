@@ -177,7 +177,10 @@ def conversation_out(
         from app.services import outgoing_receipt_level_for_message
 
         receipt_level = None
-        if last.sender_id == viewer.id:
+        # A call-log row describes an outcome; it is not content the peer can
+        # "read". Call logs share message storage and receipts for transport,
+        # but exporting that level makes clients display a false read claim.
+        if last.sender_id == viewer.id and last.type != "call":
             member_ids = {m.user_id for m in conv.members}
             receipt_level = outgoing_receipt_level_for_message(
                 db, last, member_ids=member_ids
@@ -212,6 +215,8 @@ def conversation_out(
     title = conv.title
     if conv.type == "dm" and peer:
         title = peer.display_name
+    elif conv.type == "notes":
+        title = "Saved messages"
 
     return ConversationOut(
         id=conv.id,
@@ -242,6 +247,15 @@ def event_message_updated(message: Message, viewer_id: int | None = None) -> dic
     return {
         "type": "message.updated",
         "message": message_out(message, viewer_id).model_dump(mode="json"),
+    }
+
+
+def event_message_removed(*, message_id: int, conversation_id: int) -> dict:
+    """A Saved Messages row was physically erased, so clients must drop it."""
+    return {
+        "type": "message.removed",
+        "message_id": message_id,
+        "conversation_id": conversation_id,
     }
 
 

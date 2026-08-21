@@ -8,6 +8,8 @@ from datetime import timedelta
 from pathlib import Path
 from typing import NamedTuple
 
+from .config import APP_DIR
+
 try:  # firebase-admin is optional: chat works fully without push wake-ups.
     import firebase_admin
     from firebase_admin import credentials, exceptions as fb_exceptions, messaging
@@ -39,7 +41,7 @@ _FCM_STATE = {"ready": False}
 def _credentials_path() -> str | None:
     cred_path = os.environ.get("LOCALCHAT_FIREBASE_CREDENTIALS", "").strip()
     if not cred_path:
-        default = Path(__file__).resolve().parent.parent / "firebase-service-account.json"
+        default = APP_DIR / "firebase-service-account.json"
         if default.is_file():
             cred_path = str(default)
     if not cred_path or not Path(cred_path).is_file():

@@ -455,11 +455,15 @@ class _GateDetails {
           title: 'Chat server is not running',
           body:
               'Tailscale is working on this phone, but nothing answered at '
-              '{host}. The server phone needs to be awake and running Local Chat.',
-          stepsTitle: 'On the server phone',
+              '{host}. The server needs to be awake, running Local Chat, and '
+              'allowed to accept connections.',
+          stepsTitle: 'On the server',
           steps: [
-            'Open Termux and run: python run.py',
-            'Leave that window running (tmux keeps it alive).',
+            'Android: run python run.py in Termux and leave it open '
+                '(tmux keeps it alive).',
+            'Windows: keep LocalChatServer.exe running, then run '
+                'LocalChatServer.exe allow-firewall once — Windows blocks '
+                'phones until you do.',
             'Check Tailscale is Connected there too.',
             'Then tap Try again here.',
           ],

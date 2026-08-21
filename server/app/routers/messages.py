@@ -34,6 +34,7 @@ from app.services import (
     list_shared_items,
     list_starred_messages,
     load_message,
+    permanently_delete_saved_message,
     pin_message,
     remove_reaction,
     require_membership,
@@ -166,7 +167,7 @@ async def send_message(
             status_code=400,
             detail="Use the call log endpoint for call messages.",
         )
-    if body.type != "text":
+    if body.type not in {"text", "list"}:
         raise HTTPException(
             status_code=400,
             detail="Photos, voice notes and files have to be sent as attachments.",
@@ -178,7 +179,7 @@ async def send_message(
         db,
         conversation_id=conversation_id,
         sender=current,
-        msg_type="text",
+        msg_type=body.type,
         body=text,
         client_id=body.client_id,
         reply_to_message_id=body.reply_to_message_id,
@@ -237,6 +238,20 @@ async def delete_message(
         raise HTTPException(status_code=400, detail="scope must be everyone or me.")
     message = await soft_delete_message(db, message_id=message_id, actor=current)
     return message_out(message, current.id)
+
+
+@router.delete("/api/messages/{message_id}/permanent", status_code=204)
+async def permanently_delete_message(
+    message_id: int,
+    db: Session = Depends(get_db),
+    current: User = Depends(get_current_user),
+) -> Response:
+    await permanently_delete_saved_message(
+        db,
+        message_id=message_id,
+        actor=current,
+    )
+    return Response(status_code=204)
 
 
 @router.get(

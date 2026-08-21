@@ -1,13 +1,13 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""PyInstaller spec for a one-folder Windows Local Chat server build.
+"""PyInstaller spec for a single-file Windows Local Chat server build.
 
 Build (from the server/ directory, with the project venv active)::
 
     pip install -r requirements.txt pyinstaller
     pyinstaller localchat.spec
 
-Output: ``dist/LocalChatServer/LocalChatServer.exe`` plus ``ResetPassword.exe``
-for admin password resets on hosts without Python installed.
+Output: ``dist/LocalChatServer.exe``. Double-clicking it starts the server;
+operator tools are subcommands of the same executable.
 """
 
 from PyInstaller.utils.hooks import collect_all, collect_submodules
@@ -62,6 +62,14 @@ hiddenimports = sorted(
             "app.db",
             "app.models",
             "app.fcm",
+            "app.admin",
+            "app.auth",
+            "app.sessions",
+            "reset_password",
+            "set_admin",
+            # Windows blocks inbound connections by default; this module is what
+            # tells the operator so and offers to open the port.
+            "firewall",
             "firebase_admin.messaging",
             "firebase_admin.credentials",
             "multipart",
@@ -111,128 +119,21 @@ pyz = PYZ(a.pure)
 exe = EXE(
     pyz,
     a.scripts,
-    [],
-    exclude_binaries=True,
-    name="LocalChatServer",
-    debug=False,
-    bootloader_ignore_signals=False,
-    strip=False,
-    upx=True,
-    console=True,
-    disable_windowed_traceback=False,
-    argv_emulation=False,
-    target_arch=None,
-    codesign_identity=None,
-    entitlements_file=None,
-)
-
-# Second entry point in the same folder: admin password reset without Python.
-reset = Analysis(
-    ["reset_password.py"],
-    pathex=["."],
-    binaries=[],
-    datas=[],
-    hiddenimports=sorted(
-        set(
-            passlib_hidden
-            + [
-                "app",
-                "app.auth",
-                "app.db",
-                "app.models",
-                "app.sessions",
-                "bcrypt",
-                "passlib.handlers.bcrypt",
-            ]
-        )
-    ),
-    hookspath=[],
-    hooksconfig={},
-    runtime_hooks=[],
-    excludes=["tkinter", "matplotlib", "numpy", "pandas"],
-    noarchive=False,
-    optimize=0,
-)
-reset_pyz = PYZ(reset.pure)
-
-reset_exe = EXE(
-    reset_pyz,
-    reset.scripts,
-    [],
-    exclude_binaries=True,
-    name="ResetPassword",
-    debug=False,
-    bootloader_ignore_signals=False,
-    strip=False,
-    upx=True,
-    console=True,
-    disable_windowed_traceback=False,
-    argv_emulation=False,
-    target_arch=None,
-    codesign_identity=None,
-    entitlements_file=None,
-)
-
-# Third entry: operator break-glass for admin username / device pin.
-set_admin = Analysis(
-    ["set_admin.py"],
-    pathex=["."],
-    binaries=[],
-    datas=[],
-    hiddenimports=sorted(
-        set(
-            passlib_hidden
-            + [
-                "app",
-                "app.admin",
-                "app.auth",
-                "app.db",
-                "app.models",
-                "app.sessions",
-                "bcrypt",
-                "passlib.handlers.bcrypt",
-            ]
-        )
-    ),
-    hookspath=[],
-    hooksconfig={},
-    runtime_hooks=[],
-    excludes=["tkinter", "matplotlib", "numpy", "pandas"],
-    noarchive=False,
-    optimize=0,
-)
-set_admin_pyz = PYZ(set_admin.pure)
-
-set_admin_exe = EXE(
-    set_admin_pyz,
-    set_admin.scripts,
-    [],
-    exclude_binaries=True,
-    name="SetAdmin",
-    debug=False,
-    bootloader_ignore_signals=False,
-    strip=False,
-    upx=True,
-    console=True,
-    disable_windowed_traceback=False,
-    argv_emulation=False,
-    target_arch=None,
-    codesign_identity=None,
-    entitlements_file=None,
-)
-
-coll = COLLECT(
-    exe,
     a.binaries,
     a.datas,
-    reset_exe,
-    reset.binaries,
-    reset.datas,
-    set_admin_exe,
-    set_admin.binaries,
-    set_admin.datas,
-    strip=False,
-    upx=True,
-    upx_exclude=[],
+    [],
+    exclude_binaries=False,
     name="LocalChatServer",
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    # UPX-compressed executables are commonly quarantined by Windows security
+    # products. Reliability matters more than a smaller download here.
+    upx=False,
+    console=True,
+    disable_windowed_traceback=False,
+    argv_emulation=False,
+    target_arch=None,
+    codesign_identity=None,
+    entitlements_file=None,
 )

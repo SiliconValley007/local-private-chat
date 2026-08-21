@@ -4,10 +4,27 @@ from __future__ import annotations
 
 import os
 import secrets
+import sys
 from pathlib import Path
 
-# server/ directory (parent of app/)
-APP_DIR = Path(__file__).resolve().parent.parent
+
+def resolve_app_dir(
+    *,
+    module_file: str | Path = __file__,
+    executable: str | Path | None = None,
+    frozen: bool | None = None,
+) -> Path:
+    """Return the durable server folder in source and PyInstaller builds."""
+    is_frozen = getattr(sys, "frozen", False) if frozen is None else frozen
+    if is_frozen:
+        binary = executable if executable is not None else sys.executable
+        return Path(binary).resolve().parent
+    return Path(module_file).resolve().parent.parent
+
+
+# Source: server/. Frozen Windows build: folder containing LocalChatServer.exe.
+# `_internal` is replaceable application code and must never hold user data.
+APP_DIR = resolve_app_dir()
 MEDIA_ROOT = APP_DIR / "media"
 DATA_DIR = APP_DIR / "data"
 DATABASE_PATH = DATA_DIR / "chat.db"
