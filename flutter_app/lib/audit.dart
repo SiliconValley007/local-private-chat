@@ -5,6 +5,8 @@
 /// and wording, with no mutation anywhere.
 library;
 
+import 'call_log.dart';
+import 'checklist.dart';
 import 'e2e_text.dart';
 import 'time_format.dart';
 
@@ -445,6 +447,7 @@ String _thingPhrase(AuditEntry entry) {
     'file' => 'a file$named',
     'doodle' => 'a doodle',
     'call' => 'a call record',
+    'list' => 'a checklist',
     _ => 'a message',
   };
 }
@@ -565,9 +568,15 @@ List<AuditTextBlock> auditTextBlocks(
           'What it said before the edit',
           before,
           naming.revealedBefore,
+          type: _messageType(entry),
           isBefore: true,
         ),
-        _messageBlock('What it says now', after, naming.revealedAfter),
+        _messageBlock(
+          'What it says now',
+          after,
+          naming.revealedAfter,
+          type: _messageType(entry),
+        ),
       ];
     case 'message.deleted':
     case 'message.hidden':
@@ -577,6 +586,7 @@ List<AuditTextBlock> auditTextBlocks(
           'What the deleted message said',
           before,
           naming.revealedBefore,
+          type: _messageType(entry),
           isBefore: true,
         ),
       ];
@@ -606,12 +616,43 @@ List<AuditTextBlock> auditTextBlocks(
             'Before',
             before,
             naming.revealedBefore,
+            type: _messageType(entry),
             isBefore: true,
           ),
         if (after != null && after.isNotEmpty)
-          _messageBlock('After', after, naming.revealedAfter),
+          _messageBlock(
+            'After',
+            after,
+            naming.revealedAfter,
+            type: _messageType(entry),
+          ),
       ];
   }
+}
+
+String? _messageType(AuditEntry entry) => entry.details?['type'] as String?;
+
+/// Turns stored message bodies into what a person should read in the log.
+///
+/// Checklists (and call records) live as JSON on the server. The chat already
+/// knows how to say those; the activity log used to dump the token instead.
+String formatAuditPlaintext(String raw, {String? type}) {
+  final kind = type?.trim() ?? '';
+  if (kind == 'list' || parseChecklist(raw) != null) {
+    final list = parseChecklist(raw);
+    if (list == null) return 'Checklist';
+    final title = list.title.isEmpty ? 'Checklist' : list.title;
+    return [
+      title,
+      for (final item in list.items)
+        '${item.done ? '☑' : '☐'} ${item.text}',
+    ].join('\n');
+  }
+  if (kind == 'call') {
+    return formatCallLogPreview(parseCallLogBody(raw));
+  }
+  if (kind == 'doodle') return 'Drawing';
+  return raw;
 }
 
 /// A block holding message text, which may be sealed.
@@ -619,13 +660,14 @@ AuditTextBlock _messageBlock(
   String label,
   String? stored,
   String? revealed, {
+  String? type,
   bool isBefore = false,
 }) {
   final opened = revealed?.trim();
   if (opened != null && opened.isNotEmpty) {
     return AuditTextBlock(
       label: label,
-      value: opened,
+      value: formatAuditPlaintext(opened, type: type),
       note: _openedHere,
       isBefore: isBefore,
     );
@@ -647,7 +689,11 @@ AuditTextBlock _messageBlock(
       sealed: true,
     );
   }
-  return AuditTextBlock(label: label, value: raw, isBefore: isBefore);
+  return AuditTextBlock(
+    label: label,
+    value: formatAuditPlaintext(raw, type: type),
+    isBefore: isBefore,
+  );
 }
 
 /// Old and new values for a setting, which are never encrypted.
@@ -688,7 +734,7 @@ List<AuditDetailRow> auditFactRows(
   if (sentAt != null) {
     rows.add(
       AuditDetailRow(
-        'That message was sent',
+        'Sent',
         formatTime?.call(sentAt) ?? sentAt.toLocal().toString(),
       ),
     );
@@ -742,7 +788,7 @@ List<AuditDetailRow> _partyRows(AuditEntry entry, AuditNaming naming) {
   if (senderId != null || (senderName != null && senderName.isNotEmpty)) {
     rows.add(
       AuditDetailRow(
-        'That message was sent by',
+        'Sender',
         _personLabel(id: senderId, username: senderName, naming: naming),
       ),
     );
@@ -756,21 +802,21 @@ List<AuditDetailRow> _partyRows(AuditEntry entry, AuditNaming naming) {
   if (details['chat_is_self'] == true) {
     rows.add(
       const AuditDetailRow(
-        'Who else is in that chat',
+        'With',
         'nobody — it is a chat with yourself',
       ),
     );
   } else if (kind == 'group') {
     rows.add(
       AuditDetailRow(
-        'That chat',
+        'With',
         memberCount == null ? 'a group' : 'a group of $memberCount people',
       ),
     );
   } else if (otherId != null || (otherName != null && otherName.isNotEmpty)) {
     rows.add(
       AuditDetailRow(
-        'The other person in that chat',
+        'With',
         _personLabel(id: otherId, username: otherName, naming: naming),
       ),
     );

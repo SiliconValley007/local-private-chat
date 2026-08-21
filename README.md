@@ -992,7 +992,10 @@ contract are tested (`tests/test_integration_ws.py`,
 
 ## GitHub Releases (APK + Windows server)
 
-**Current app version:** `1.8.8+41` (a locked app now offers the fingerprint by
+**Current app version:** `1.8.9+42` (the activity log now shows a checklist
+as its items, never the JSON the server stored, and names who sent a message
+as one readable line instead of wrapping mid-sentence;
+plus 1.8.8: a locked app now offers the fingerprint by
 itself on every launch instead of opening on a PIN field and waiting for a tap:
 where fingerprint unlock is on and no other choice was saved, fingerprint is the
 default, and the lock screen leads with it while keeping the PIN one tap away;

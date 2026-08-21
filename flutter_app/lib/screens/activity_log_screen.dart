@@ -884,7 +884,7 @@ class _AuditRowState extends State<_AuditRow> {
             ],
             if (facts.isNotEmpty) ...[
               const SizedBox(height: 10),
-              for (final row in facts) _DetailLine(row: row),
+              for (final row in facts) AuditFactLine(row: row),
             ],
             const SizedBox(height: 2),
             Row(
@@ -921,7 +921,7 @@ class _AuditRowState extends State<_AuditRow> {
               ),
               const SizedBox(height: 6),
               for (final row in auditTechnicalRows(entry))
-                _DetailLine(row: row, muted: true),
+                AuditFactLine(row: row, muted: true),
             ],
           ],
         ),
@@ -954,8 +954,8 @@ class _AuditRowState extends State<_AuditRow> {
   };
 }
 
-class _DetailLine extends StatelessWidget {
-  const _DetailLine({required this.row, this.muted = false});
+class AuditFactLine extends StatelessWidget {
+  const AuditFactLine({super.key, required this.row, this.muted = false});
 
   final AuditDetailRow row;
   final bool muted;
@@ -969,18 +969,16 @@ class _DetailLine extends StatelessWidget {
         : theme.textTheme.labelMedium;
     return Padding(
       padding: const EdgeInsets.only(bottom: 3),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          SizedBox(
-            width: 148,
-            child: Text(
-              row.label,
+      child: Text.rich(
+        TextSpan(
+          children: [
+            TextSpan(
+              text: '${row.label}: ',
               style: style?.copyWith(color: scheme.onSurfaceVariant),
             ),
-          ),
-          Expanded(child: Text(row.value, style: style)),
-        ],
+            TextSpan(text: row.value, style: style),
+          ],
+        ),
       ),
     );
   }
