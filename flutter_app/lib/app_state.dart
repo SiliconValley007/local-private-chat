@@ -13,6 +13,7 @@ import 'audit.dart';
 import 'chat_navigation.dart';
 import 'checklist.dart';
 import 'doodle_stroke.dart';
+import 'disconnect_copy.dart';
 import 'e2e_text.dart';
 import 'errors.dart';
 import 'load_state.dart';
@@ -37,9 +38,11 @@ import 'services/media_store.dart';
 import 'services/notification_service.dart';
 import 'services/outbox_store.dart';
 import 'services/pending_call_store.dart';
+import 'services/resumable_upload.dart';
 import 'services/tailscale_assist.dart';
 import 'services/tailscale_prefs_store.dart';
 import 'services/theme_store.dart';
+import 'services/upload_notice.dart';
 import 'services/video_thumbnail_service.dart';
 import 'services/voice_player.dart';
 import 'theme.dart';
@@ -79,7 +82,9 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     AppLockStore? appLockStore,
     LocalAuthentication? localAuthentication,
     AppLockSettings? initialLockSettings,
-  }) : e2e = e2e ?? E2EService(),
+    UploadNotice? uploadNotice,
+  }) : uploadNotice = uploadNotice ?? UploadNotice(),
+       e2e = e2e ?? E2EService(),
        appLockStore = appLockStore ?? AppLockStore(),
        localAuthentication = localAuthentication ?? LocalAuthentication(),
        realtime = RealtimeService(api),
@@ -88,7 +93,12 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
        media = MediaStore(api),
        incomingShares = incomingShares ?? IncomingShareService(),
        tailscale = tailscale ?? TailscaleAssist() {
-    calls = CallService(api, realtime)..bind();
+    calls = CallService(
+      api,
+      realtime,
+      onCallTunnelHold: this.tailscale.noteCall,
+      onCallExpectReturn: this.tailscale.noteExpectReturn,
+    )..bind();
     calls.peerNameFor = (cid) => _titleForConversation(cid) ?? 'Incoming call';
     calls.resolveCallerName = (username, displayName) =>
         nameFor(username, displayName);
@@ -100,7 +110,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       unawaited(NotificationService.instance.cancelIncomingCall());
       unawaited(PendingCallStore.instance.clear());
     };
-    calls.addListener(notifyListeners);
+    calls.addListener(_onCallStateChanged);
     realtime.addHandler(_onEvent);
     realtime.onAuthFailure = _onSessionRejected;
     api.onSessionRejected = () {
@@ -121,6 +131,9 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   final TailscaleAssist tailscale;
   final AppLockStore appLockStore;
   final LocalAuthentication localAuthentication;
+
+  /// The sending notification that keeps a minimised upload alive.
+  final UploadNotice uploadNotice;
 
   /// Shares and `localchat://` links handed over by Android.
   final IncomingShareService incomingShares;
@@ -394,6 +407,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
 
   int? activeConversationId;
   Timer? _healthTimer;
+  Timer? _callPresentationRetry;
 
   ChatUser? get me => api.currentUser;
   bool get isLoggedIn => api.token != null && api.currentUser != null;
@@ -542,6 +556,31 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   bool get _autoConnectAllowed =>
       tailscalePrefs.autoConnect && !_autoConnectPaused;
 
+  bool get _callNeedsRealtimeWhileBackgrounded {
+    final session = calls.active;
+    return session != null && callPhaseNeedsTunnelHold(session.phase);
+  }
+
+  void _onCallStateChanged() {
+    notifyListeners();
+    final session = calls.active;
+    if (WidgetsBinding.instance.lifecycleState == AppLifecycleState.resumed &&
+        session != null &&
+        session.phase == CallPhase.incoming) {
+      // A previous call route can still be finishing its pop animation when a
+      // new invite arrives. Keep asking until that stale route has gone rather
+      // than leaving the phone vibrating over an unchanged chat screen.
+      _presentCallScreen();
+    }
+    // SDP/ICE and terminal call events use the WebSocket. Keep it alive while
+    // a backgrounded call is ringing, connecting, or active, then release it as
+    // soon as that call ends so ordinary messages use push while the app is away.
+    if (WidgetsBinding.instance.lifecycleState != AppLifecycleState.resumed &&
+        !_callNeedsRealtimeWhileBackgrounded) {
+      realtime.disconnect();
+    }
+  }
+
   Future<bool> _nudgeTailscale({bool force = false}) async {
     if (!_autoConnectAllowed && !force) return false;
     final sent = await tailscale.nudgeIfNeeded(
@@ -669,6 +708,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       _consumePendingOpen();
       _consumePendingCall();
       unawaited(calls.recoverPendingCalls());
+      unawaited(refreshMediaPolicy());
     } on ApiException catch (e) {
       if (e.statusCode == 401) {
         await logout();
@@ -693,6 +733,10 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     error = null;
     notifyListeners();
   }
+
+  /// A refusal the server will keep making: retrying it changes nothing.
+  static bool _isRefusal(Object failure) =>
+      failure is ApiException && failure.statusCode == 403;
 
   /// Re-checks the server.
   ///
@@ -818,7 +862,24 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     }
   }
 
-  Future<bool> openTailscaleApp() => tailscale.openApp();
+  /// Opens Tailscale's own app, without reading that as leaving Local Chat.
+  ///
+  /// Switching the tunnel off on the way out would undo the reason the user is
+  /// being sent there.
+  Future<bool> openTailscaleApp() async {
+    await tailscale.noteExpectReturn(true);
+    return tailscale.openApp();
+  }
+
+  /// The host's record of what it asked Tailscale to do, newest first.
+  Future<List<TailscaleTunnelEvent>> tunnelActivity() async {
+    // This diagnostic reveals when this phone connected, disconnected, or kept
+    // its tunnel for a call/upload. Do not expose it through the state layer to
+    // signed-out or non-admin UI, even if a future screen forgets its own gate.
+    if (adminStatus?.isAdmin != true) return const [];
+    final events = await tailscale.readTunnelLog();
+    return events.reversed.toList();
+  }
 
   /// True when Local Chat is what switched the tunnel on, so closing the app is
   /// allowed to switch it back off. Surfaced in settings because the rule is
@@ -1007,6 +1068,9 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     _biometricPromptActive = true;
     notifyListeners();
     var unlocked = false;
+    // The fingerprint sheet stops our window like any other app would. Leaving
+    // the tunnel alone for it keeps unlocking from costing a reconnect.
+    await tailscale.noteExpectReturn(true);
     try {
       unlocked = await localAuthentication.authenticate(
         localizedReason: 'Unlock Local Chat',
@@ -1026,6 +1090,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     } finally {
       _biometricPromptActive = false;
       biometricUnlocking = false;
+      unawaited(tailscale.noteExpectReturn(false));
       if (!unlocked && _leftDuringBiometric) {
         _backgroundedAt ??= DateTime.now();
         if (appLockSettings.armed &&
@@ -1114,11 +1179,11 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
           notifyListeners();
         }
         unawaited(calls.onAppLifecycleBackground());
-        // Let the socket go while the app is away. Android can freeze our
-        // isolate at any moment, and a socket that looks alive to the server
-        // means it skips the push notification — so nothing would be shown.
+        // Let the socket go while the app is away, except while it is carrying
+        // SDP/ICE or terminal events for a call. The call listener disconnects
+        // it when that call ends so regular background messages still use push.
         _healthTimer?.cancel();
-        realtime.disconnect();
+        if (!_callNeedsRealtimeWhileBackgrounded) realtime.disconnect();
         clearAllTyping();
         unawaited(VoicePlayer.instance.stop());
         // This drop is deliberate, so it must not leave a warning waiting to
@@ -1283,6 +1348,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     _inboxResolved = false;
     adminStatus = null;
     _adminChecked = false;
+    mediaPolicy = null;
     notifyListeners();
   }
 
@@ -1292,6 +1358,8 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   /// inbox rather than with it.
   AdminStatus? adminStatus;
   bool _adminChecked = false;
+
+  MediaPolicy? mediaPolicy;
 
   /// Whether to offer the activity log in the menu.
   ///
@@ -1422,6 +1490,14 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   /// "You:" prefix for your own. Falls back to a locked note if a token can't
   /// be read yet (keys still being exchanged).
   String previewFor(Conversation conv) {
+    final disconnect = disconnectSubtitle(
+      removed: conv.removed,
+      unreachable: unreachableFor(conv),
+      notOnTailnet: conv.notOnTailnet,
+      serverAccessRevoked: conv.serverAccessRevoked,
+      tailnetPending: conv.tailnetPending,
+    );
+    if (disconnect != null) return disconnect;
     final last = conv.lastMessage;
     if (last == null) return 'No messages yet';
     String summary;
@@ -1550,6 +1626,12 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     _replaceConversation(updated);
   }
 
+  /// Sets this chat's shared attachment expiry in days.
+  Future<void> setMediaTtl(int conversationId, int days) async {
+    final updated = await api.setMediaTtl(conversationId, days);
+    _replaceConversation(updated);
+  }
+
   /// Sets a DM's anniversary date (`YYYY-MM-DD`); null clears it.
   Future<void> setAnniversary(int conversationId, String? isoDate) async {
     final updated = await api.setAnniversary(conversationId, isoDate);
@@ -1585,6 +1667,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     // blue ticks falsely claims that the peer read the call.
     final last = conv.lastMessage;
     if (last?.isCallLog ?? false) return null;
+    if (last?.isMediaTtlNotice ?? false) return null;
 
     final local = messagesByConv[conv.id];
     if (local != null && local.isNotEmpty) {
@@ -1618,6 +1701,79 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     }
 
     return last.serverReceiptLevel ?? 0;
+  }
+
+  /// Fresh unreachable from merged presence; authorized offline is never this.
+  bool unreachableFor(Conversation conv) {
+    // Last-seen is the offline signal. Push can still reach an authorized peer
+    // after days away, so inbox/chat never use "Can't reach them" for that.
+    return conv.removed ? false : false;
+  }
+
+  @visibleForTesting
+  void applyPresenceForTest({
+    required int userId,
+    required bool online,
+    DateTime? lastSeenAt,
+  }) {
+    _mergePresence(
+      userId: userId,
+      online: online,
+      lastSeenAt: lastSeenAt,
+      authoritativeOffline: true,
+    );
+    _reconcilePeerPresenceInConversations(userId);
+  }
+
+  @visibleForTesting
+  void patchUserInConversationsForTest(ChatUser user) {
+    _mergePresence(
+      userId: user.id,
+      online: user.isOnline,
+      lastSeenAt: user.lastSeenAt,
+    );
+    _patchUserInConversations(user);
+  }
+
+  void _reconcilePeerPresenceInConversations(int userId) {
+    var changed = false;
+    conversations = conversations.map((c) {
+      if (c.type != 'dm' || c.peer?.id != userId) return c;
+      final peer = c.peer!;
+      final mergedPeer = peer.copyWith(
+        isOnline: isUserOnline(peer),
+        lastSeenAt: lastSeenFor(peer),
+      );
+      if (mergedPeer.isOnline == peer.isOnline &&
+          mergedPeer.lastSeenAt == peer.lastSeenAt &&
+          !c.unreachable) {
+        return c;
+      }
+      changed = true;
+      return Conversation(
+        id: c.id,
+        type: c.type,
+        title: c.title,
+        peer: mergedPeer,
+        lastMessage: c.lastMessage,
+        unreadCount: c.unreadCount,
+        updatedAt: c.updatedAt,
+        members: c.members,
+        wallpaperVersion: c.wallpaperVersion,
+        wallpaperDim: c.wallpaperDim,
+        hasWallpaper: c.hasWallpaper,
+        disappearAfterSeconds: c.disappearAfterSeconds,
+        anniversaryOn: c.anniversaryOn,
+        streakDays: c.streakDays,
+        unreachable: false,
+        removed: c.removed,
+        notOnTailnet: c.notOnTailnet,
+        serverAccessRevoked: c.serverAccessRevoked,
+        tailnetPending: c.tailnetPending,
+        mediaTtlDays: c.mediaTtlDays,
+      );
+    }).toList();
+    if (changed) notifyListeners();
   }
 
   /// Adds, changes, or clears your emoji reaction on a message.
@@ -1671,6 +1827,8 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
         );
       }).toList();
 
+      final nextUnreachable = false;
+
       return Conversation(
         id: c.id,
         type: c.type,
@@ -1686,6 +1844,12 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
         disappearAfterSeconds: c.disappearAfterSeconds,
         anniversaryOn: c.anniversaryOn,
         streakDays: c.streakDays,
+        unreachable: nextUnreachable,
+        removed: c.removed,
+        notOnTailnet: c.notOnTailnet,
+        serverAccessRevoked: c.serverAccessRevoked,
+        tailnetPending: c.tailnetPending,
+        mediaTtlDays: c.mediaTtlDays,
       );
     }).toList();
   }
@@ -2533,6 +2697,68 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     await refreshInbox();
   }
 
+  Future<ChatMessage> retainMedia(ChatMessage message) async {
+    final updated = await api.retainMedia(message.id);
+    await upsertFromWire(updated);
+    return updated;
+  }
+
+  Future<ChatMessage> dropMediaRetain(ChatMessage message) async {
+    final updated = await api.dropMediaRetain(message.id);
+    await upsertFromWire(updated);
+    return updated;
+  }
+
+  Future<void> refreshMediaPolicy() async {
+    try {
+      mediaPolicy = await api.fetchMediaPolicy();
+      notifyListeners();
+    } catch (_) {
+      // Policy is a hint in the composer; a miss is not a login failure.
+    }
+  }
+
+  Future<void> setMyMediaTtl(int? days) async {
+    mediaPolicy = await api.setMyMediaTtl(days);
+    notifyListeners();
+  }
+
+  Future<void> setServerMediaTtl(int days) async {
+    mediaPolicy = await api.setServerMediaTtl(days);
+    notifyListeners();
+  }
+
+  Future<void> deleteConversation(
+    int conversationId, {
+    String scope = 'me',
+  }) async {
+    await api.deleteConversation(conversationId, scope: scope);
+    conversations = [
+      for (final c in conversations)
+        if (c.id != conversationId) c,
+    ];
+    messagesByConv.remove(conversationId);
+    notifyListeners();
+    await refreshInbox();
+  }
+
+  Future<void> blockContact(
+    int userId, {
+    int? conversationId,
+    bool alsoDeleteChat = false,
+  }) async {
+    if (alsoDeleteChat && conversationId != null) {
+      await deleteConversation(conversationId, scope: 'everyone');
+    }
+    await api.blockUser(userId);
+    await refreshInbox();
+  }
+
+  Future<void> unblockContact(int userId) async {
+    await api.unblockUser(userId);
+    await refreshInbox();
+  }
+
   /// Updates one shared checklist immediately, then reconciles with the server.
   ///
   /// One request per list is allowed at a time. This prevents two rapid taps
@@ -2837,7 +3063,10 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
         for (final message in messagesByConv[conversationId] ?? const [])
           if (message.clientId != item.clientId) message,
       ];
-      error = friendlyMessage(failure);
+      // A refusal is rethrown to the chat, which says so where the message was
+      // typed. Setting the inbox banner as well would report it twice, in a
+      // place that cannot say which chat it came from.
+      if (!_isRefusal(failure)) error = friendlyMessage(failure);
       rethrow;
     } finally {
       _outboxInFlight.remove(item.clientId);
@@ -2861,8 +3090,12 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     mediaUploadBytesTotal = 0;
     mediaUploadWaiting = false;
     notifyListeners();
-    _setUploadBytes(0, await file.length());
-    await tailscale.noteTransfer(true);
+    final size = await file.length();
+    _setUploadBytes(0, size);
+    await _beginUploadSession(
+      label: uploadLabelFor(file.path),
+      sizeBytes: size,
+    );
     try {
       final preview = await _previewFor(file, type);
       final wireCaption = await _wireCaptionFor(conversationId, caption);
@@ -2883,9 +3116,12 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       await upsertFromWire(msg);
       await refreshInbox();
       return msg;
+    } on UploadCancelled {
+      error = 'Send stopped. Nothing was added to the chat.';
+      notifyListeners();
+      throw ApiException(error!);
     } finally {
-      await tailscale.noteTransfer(false);
-      _clearUploadProgress();
+      await _endUploadSession();
     }
   }
 
@@ -2911,8 +3147,12 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     notifyListeners();
   }
 
-  /// Sends [file], and if the tunnel drops mid-transfer waits and retries once
-  /// from the start. True byte-resume is not available on this protocol.
+  /// Sends [file], continuing where it stopped if the connection drops.
+  ///
+  /// Anything large goes up in pieces against a server-side session, so an
+  /// interruption costs one piece instead of the whole transfer; a phone that
+  /// spends ten minutes on a video cannot afford to start again. Small
+  /// attachments keep the single request, which is cheaper and has little to lose.
   Future<ChatMessage> _uploadMediaWithRetry({
     required int conversationId,
     required File file,
@@ -2923,36 +3163,133 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     String? clientId,
     int? replyToMessageId,
   }) async {
+    final total = await file.length();
+    final inPieces = shouldSendResumably(total);
+    String? resumeId;
     Object? lastError;
-    for (var attempt = 0; attempt < 3; attempt++) {
+    // A resumable send may be picked up again several times: each attempt
+    // continues from the server's offset rather than repeating what arrived.
+    final attempts = inPieces ? 5 : 3;
+    for (var attempt = 0; attempt < attempts; attempt++) {
       try {
         if (attempt > 0) {
           mediaUploadWaiting = true;
           notifyListeners();
           await _waitForUploadPath();
           mediaUploadWaiting = false;
-          _setUploadBytes(0, await file.length());
+          if (!inPieces) _setUploadBytes(0, total);
           notifyListeners();
         }
-        return await api.uploadMedia(
+        if (!inPieces) {
+          return await api.uploadMedia(
+            conversationId: conversationId,
+            file: file,
+            type: type,
+            thumbnail: thumbnail,
+            durationMs: durationMs,
+            caption: caption,
+            clientId: clientId,
+            replyToMessageId: replyToMessageId,
+            onProgress: _onUploadProgress,
+          );
+        }
+        final sender = ResumableUpload(
+          transport: api,
+          onProgress: _onUploadProgress,
+          isCancelled: () => uploadCancelRequested,
+        );
+        return await sender.send(
           conversationId: conversationId,
           file: file,
           type: type,
-          thumbnail: thumbnail,
+          mime: mimeTypeForUpload(file.path, type),
           durationMs: durationMs,
+          thumbnail: thumbnail,
           caption: caption,
           clientId: clientId,
           replyToMessageId: replyToMessageId,
-          onProgress: _setUploadBytes,
+          resumeUploadId: resumeId,
+          onSessionOpened: (id) => resumeId = id,
         );
+      } on UploadCancelled {
+        rethrow;
       } catch (e) {
         lastError = e;
-        if (!_looksLikeTransientUploadFailure(e) || attempt == 2) {
+        if (!_looksLikeTransientUploadFailure(e) || attempt == attempts - 1) {
           rethrow;
         }
       }
     }
     throw lastError ?? StateError('upload failed');
+  }
+
+  /// True once the user has asked to stop the send, from the app or the notice.
+  bool uploadCancelRequested = false;
+
+  Timer? _uploadCancelPoll;
+  String? _uploadLabel;
+
+  void _onUploadProgress(int sent, int total) {
+    _setUploadBytes(sent, total);
+    // The notice drops repeats itself, so this can be called per chunk.
+    unawaited(
+      uploadNotice.show(
+        title: _uploadLabel,
+        sent: sent,
+        total: total,
+        count: mediaUploadTotal,
+      ),
+    );
+  }
+
+  /// Called as a send begins: hold the tunnel, and put up the notice that keeps
+  /// the transfer running once the app is no longer on screen.
+  Future<void> _beginUploadSession({
+    String? label,
+    int count = 1,
+    int sizeBytes = 0,
+  }) async {
+    _uploadLabel = label;
+    uploadCancelRequested = false;
+    await tailscale.noteTransfer(true);
+    await uploadNotice.clearCancel();
+    await uploadNotice.show(
+      title: label,
+      sent: 0,
+      total: sizeBytes,
+      count: count,
+      force: true,
+    );
+    // Cancel lives on a notification, so the answer has to be fetched. A second
+    // between checks is imperceptible on a transfer measured in minutes.
+    _uploadCancelPoll?.cancel();
+    _uploadCancelPoll = Timer.periodic(const Duration(seconds: 1), (_) async {
+      if (await uploadNotice.cancelRequested()) uploadCancelRequested = true;
+    });
+  }
+
+  Future<void> _endUploadSession() async {
+    _uploadCancelPoll?.cancel();
+    _uploadCancelPoll = null;
+    _uploadLabel = null;
+    uploadCancelRequested = false;
+    await tailscale.noteTransfer(false);
+    await uploadNotice.stop();
+    _clearUploadProgress();
+  }
+
+  /// True while the send in flight is one that can actually be stopped.
+  ///
+  /// A small single attachment is one request that will be over before a tap
+  /// could land, and offering a button that does nothing is worse than not
+  /// offering one. Anything sent in pieces, and any album, stops between pieces.
+  bool get canStopUpload =>
+      mediaUploadTotal > 1 || shouldSendResumably(mediaUploadBytesTotal);
+
+  /// Stop the attachment now going up, from a button inside the app.
+  void cancelCurrentUpload() {
+    uploadCancelRequested = true;
+    notifyListeners();
   }
 
   bool _looksLikeTransientUploadFailure(Object error) {
@@ -3097,12 +3434,21 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     mediaUploadDone = 0;
     mediaUploadWaiting = false;
     notifyListeners();
-    await tailscale.noteTransfer(true);
+    await _beginUploadSession(
+      label: files.length == 1 ? uploadLabelFor(files.first.path) : null,
+      count: files.length,
+    );
 
     var failures = 0;
     var tooLarge = 0;
+    var cancelled = false;
     try {
       for (var i = 0; i < files.length; i++) {
+        if (uploadCancelRequested) {
+          // Whatever already went up stays; the rest of the album does not.
+          cancelled = true;
+          break;
+        }
         final clientId = '${DateTime.now().microsecondsSinceEpoch}_$i';
         final actualType = typeOf?.call(files[i]) ?? type;
         try {
@@ -3114,6 +3460,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
           notifyListeners();
           continue;
         }
+        _uploadLabel = uploadLabelFor(files[i].path);
         _setUploadBytes(0, await files[i].length());
         final preview = await _previewFor(files[i], actualType);
         final wireCaption = await _wireCaptionFor(
@@ -3132,6 +3479,8 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
             replyToMessageId: i == 0 ? replyTo?.id : null,
           );
           await upsertFromWire(msg);
+        } on UploadCancelled {
+          cancelled = true;
         } catch (_) {
           failures++;
         } finally {
@@ -3139,13 +3488,20 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
           mediaUploadDone = i + 1;
           notifyListeners();
         }
+        if (cancelled) break;
       }
     } finally {
-      await tailscale.noteTransfer(false);
-      _clearUploadProgress();
+      await _endUploadSession();
     }
 
     await refreshInbox();
+    if (cancelled) {
+      error = files.length == 1
+          ? 'Send stopped. Nothing was added to the chat.'
+          : 'Sending stopped. Anything already sent stays in the chat.';
+      notifyListeners();
+      return;
+    }
     final unsent = failures + tooLarge;
     if (unsent > 0) {
       // The size refusal already explains itself; only add the tally when other
@@ -3408,6 +3764,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   }
 
   Future<void> _presentIncomingCall(CallSession session) async {
+    if (calls.active != session || session.phase != CallPhase.incoming) return;
     final muted = conversationPrefs[session.conversationId]?.muted ?? false;
     // Foreground already gets the full-screen CallScreen. A heads-up
     // notification on top of Accept/Decline is a second surface for the same
@@ -3415,6 +3772,10 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     final lifecycle = WidgetsBinding.instance.lifecycleState;
     final appVisible =
         lifecycle == null || lifecycle == AppLifecycleState.resumed;
+    // Foreground presentation must not wait behind notification or local-store
+    // plugins. Those calls can yield long enough for the user to hear/feel the
+    // ring while the chat remains on screen.
+    if (appVisible) _presentCallScreen();
     if (!muted && !appVisible) {
       await NotificationService.instance.showIncomingCall(
         callId: session.callId,
@@ -3423,8 +3784,9 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
         isVideo: session.isVideo,
       );
     } else {
-      await NotificationService.instance.cancelIncomingCall();
+      unawaited(NotificationService.instance.cancelIncomingCall());
     }
+    if (calls.active != session || session.phase != CallPhase.incoming) return;
     await PendingCallStore.instance.save(
       PendingCall(
         callId: session.callId,
@@ -3435,6 +3797,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
         callerUsername: _peerUsernameForConversation(session.conversationId),
       ),
     );
+    if (calls.active != session || session.phase != CallPhase.incoming) return;
     _presentCallScreen();
     // Fullscreen owns the invite now — clear any heads-up that raced in.
     if (appVisible) {
@@ -3443,8 +3806,31 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   }
 
   void _presentCallScreen() {
+    final session = calls.active;
+    if (session == null || session.phase == CallPhase.ended) {
+      _callPresentationRetry?.cancel();
+      _callPresentationRetry = null;
+      return;
+    }
+    if (callScreenRouteOpen) {
+      // Keep one retry alive for as long as the invite is alive. A fixed retry
+      // count can still expire during a slow route pop or permission overlay.
+      _callPresentationRetry ??= Timer(const Duration(milliseconds: 150), () {
+        _callPresentationRetry = null;
+        _presentCallScreen();
+      });
+      return;
+    }
     final nav = appNavigatorKey.currentState;
-    if (nav == null) return;
+    if (nav == null) {
+      _callPresentationRetry ??= Timer(const Duration(milliseconds: 150), () {
+        _callPresentationRetry = null;
+        _presentCallScreen();
+      });
+      return;
+    }
+    _callPresentationRetry?.cancel();
+    _callPresentationRetry = null;
     unawaited(presentCallScreen(nav.context));
   }
 
@@ -3669,6 +4055,25 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     return e2e.decryptFrom(peerId, text);
   }
 
+  /// Readies this phone to open a sealed entry, whichever side carries the text.
+  ///
+  /// Kept separate from [revealSealedAuditText] because the work belongs to the
+  /// entry, not to one version of it: an entry that only records the text after
+  /// the change — every "Message sent" — has nothing in `before_text`, and
+  /// asking to prepare while handing over that empty side used to do nothing at
+  /// all, leaving the reader's own message sealed on their own phone.
+  Future<void> prepareSealedReveal(int? conversationId) async {
+    if (conversationId == null) return;
+    try {
+      await _prepareSealedReveal(conversationId);
+    } catch (e) {
+      // Getting ready is a best effort — the keystore or the inbox can refuse.
+      // What is already on this phone is often enough to open the entry, so a
+      // failure here must not stop the attempt that follows it.
+      debugPrint('sealed reveal prepare failed: $e');
+    }
+  }
+
   /// True when a sealed entry from [conversationId] can be opened right now,
   /// from keys already on this phone. The log retries on this, so an entry that
   /// was looked at a moment too early is not left reading "not readable" once
@@ -3677,6 +4082,29 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
     if (conversationId == null || !e2e.isReady) return false;
     final peerId = _dmPeerId(conversationId);
     return peerId != null && e2e.hasPeerKey(peerId);
+  }
+
+  /// Why a sealed entry from [conversationId] cannot be opened on this phone.
+  ///
+  /// This account is a party to its own chats and derives the same key both
+  /// ways, so its own messages are expected to open here. When one does not,
+  /// the log is told which reason applies — waiting on a key swap, a chat this
+  /// account is not in, or a key that no longer exists — because they call for
+  /// three different things from the reader.
+  AuditSealedReason sealedChatReason(int? conversationId) {
+    if (conversationId == null) return AuditSealedReason.otherChat;
+    final conv = conversationById(conversationId);
+    // A chat this account is not in — and, until the inbox has answered, one it
+    // cannot yet claim either. The wording for it only talks about encryption,
+    // so it stays true in both cases; a first look also gets the inbox fetched
+    // and tries again.
+    if (conv == null) return AuditSealedReason.otherChat;
+    final peerId = conv.type == 'dm' ? conv.peer?.id : null;
+    if (peerId == null) return AuditSealedReason.otherChat;
+    if (!e2e.isReady || !e2e.hasPeerKey(peerId)) {
+      return AuditSealedReason.needsChatVisit;
+    }
+    return AuditSealedReason.keyGone;
   }
 
   /// Gets this phone ready to open its own sealed history.
@@ -3929,6 +4357,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
           lastSeenAt: seen,
           authoritativeOffline: true,
         );
+        _reconcilePeerPresenceInConversations(uid);
         // Going offline mid-typing must not leave a stuck indicator.
         if (!online) _clearTypingForUser(uid);
         notifyListeners();
@@ -3950,6 +4379,10 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
         } else {
           unawaited(refreshStarred());
         }
+        break;
+      case 'membership.changed':
+        unawaited(refreshUsers());
+        unawaited(refreshInbox());
         break;
       case 'user.updated':
         final u = ChatUser.fromJson(event['user'] as Map<String, dynamic>);
@@ -4039,7 +4472,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       event['message'] as Map<String, dynamic>,
       meId: me?.id,
     );
-    if (raw.isDeleted) await media.evict(raw.id);
+    if (raw.isDeleted || raw.mediaGone) await media.evict(raw.id);
     await upsertFromWire(raw);
     await refreshInbox();
   }
@@ -4312,6 +4745,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   @override
   void dispose() {
     _healthTimer?.cancel();
+    _callPresentationRetry?.cancel();
     _reconnectNotice?.cancel();
     _nudges.close();
     _doodleRelay.close();

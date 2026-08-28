@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
@@ -42,6 +42,8 @@ CALL_EVENTS = frozenset(
         "call.busy",
         "call.ringing",
         "call.cancel",
+        "call.timeout",
+        "call.failed",
     }
 )
 E2E_EVENTS = frozenset({"e2e.hello", "e2e.reply", "e2e.need_key"})
@@ -140,11 +142,22 @@ async def websocket_endpoint(websocket: WebSocket, token: str | None = None) -> 
             await websocket.accept()
             await websocket.close(code=UNAUTHORIZED_CLOSE_CODE)
             return
+        try:
+            from app.tailscale_membership import enforce_authenticated_user
+
+            ip = websocket.client.host if websocket.client else None
+            enforce_authenticated_user(db, user, ip=ip)
+        except HTTPException:
+            await websocket.accept()
+            await websocket.close(code=UNAUTHORIZED_CLOSE_CODE)
+            return
 
         await hub.connect(user.id, websocket)
-        user.last_seen_at = None
-        db.commit()
-        await notify_shared_contacts(db, user.id, online=True, last_seen_at=None)
+        # Keep the previous offline instant — clearing it made a fresh disconnect
+        # look like "never seen here" and the inbox cried unreachable too soon.
+        await notify_shared_contacts(
+            db, user.id, online=True, last_seen_at=user.last_seen_at
+        )
         await _notify_call_timeouts(db)
         await _deliver_pending_calls(db, user)
 
@@ -284,9 +297,13 @@ async def _handle_call_event(db: Session, user: User, data: dict) -> None:
         if hub.is_online(peer_id):
             delivery_state = "websocket"
         else:
-            tokens = db.scalars(
-                select(DeviceToken.token).where(DeviceToken.user_id == peer_id)
-            ).all()
+            from app.tailscale_membership import push_targets
+
+            tokens = []
+            if push_targets(db, {peer_id}):
+                tokens = db.scalars(
+                    select(DeviceToken.token).where(DeviceToken.user_id == peer_id)
+                ).all()
             if tokens:
                 result = send_call_incoming_push(
                     list(tokens),
@@ -342,11 +359,20 @@ async def _handle_call_event(db: Session, user: User, data: dict) -> None:
         await hub.send_to_user(peer_id, events.event_call_relay(event_type, relay))
         return
 
-    if event_type in {"call.reject", "call.busy", "call.cancel", "call.end"}:
+    if event_type in {
+        "call.reject",
+        "call.busy",
+        "call.cancel",
+        "call.timeout",
+        "call.failed",
+        "call.end",
+    }:
         reason = {
             "call.reject": "rejected",
             "call.busy": "busy",
             "call.cancel": "cancelled",
+            "call.timeout": "timeout",
+            "call.failed": "failed",
             "call.end": "ended",
         }[event_type]
         record = call_registry.end(call_id, reason)

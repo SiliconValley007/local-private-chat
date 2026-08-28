@@ -37,6 +37,8 @@ String formatMessagePreview({
         viewerUserId: viewerUserId,
         endedByName: endedByName,
       );
+    case 'media_ttl':
+      return 'Attachment expiry changed';
     case 'list':
       if (sealed) return encryptedPreview;
       final checklist = parseChecklist(body);

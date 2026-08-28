@@ -76,6 +76,24 @@ UPLOAD_CHUNK_BYTES = int(
     )
 ) * 1024
 
+# Size of the pieces a phone sends a large attachment in, so an interrupted
+# send continues from the last piece instead of starting again. Big enough that
+# a 500 MB file is a few hundred requests, small enough that losing one costs
+# little.
+RESUMABLE_CHUNK_BYTES = int(
+    os.environ.get(
+        "LOCALCHAT_RESUMABLE_CHUNK_KB",
+        "2048" if LOW_MEMORY else "4096",
+    )
+) * 1024
+
+# How long a half-finished upload is kept so it can be continued. Long enough
+# to survive a night with no signal; short enough that abandoned bytes are not
+# left on a phone-sized disk for good.
+UPLOAD_SESSION_TTL_SECONDS = int(
+    os.environ.get("LOCALCHAT_UPLOAD_SESSION_TTL_HOURS", "24")
+) * 3600
+
 #: Below this, ordinary browsing starts getting 503s instead of thumbnails.
 MIN_SAFE_CONCURRENCY = 32
 
@@ -124,6 +142,70 @@ def _load_jwt_secret() -> str:
 
 
 JWT_SECRET = _load_jwt_secret()
+
+
+def _env_or_file(name: str, file_values: dict[str, str]) -> str:
+    return (os.environ.get(name) or file_values.get(name) or "").strip()
+
+
+def load_tailscale_oauth_file(path: Path) -> dict[str, str]:
+    """Parse KEY=VALUE lines from a file next to the server (no export syntax)."""
+    out: dict[str, str] = {}
+    if not path.is_file():
+        return out
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip().strip("'").strip('"')
+        if key:
+            out[key] = value
+    return out
+
+
+# Tailscale Admin API (OAuth). Empty means membership is not enforced — LAN
+# servers keep working. When set, the server polls the tailnet and binds
+# authenticated 100.x callers to a Tailscale identity.
+#
+# Values come from process environment first, else tailscale-oauth.env beside
+# the EXE / server folder (same idea as jwt_secret.txt). Never put secrets in
+# the release ZIP; copy the example file and fill it in on the host.
+TAILSCALE_OAUTH_PATH = APP_DIR / "tailscale-oauth.env"
+_TAILSCALE_FILE = load_tailscale_oauth_file(TAILSCALE_OAUTH_PATH)
+TAILSCALE_OAUTH_CLIENT_ID = _env_or_file(
+    "TAILSCALE_OAUTH_CLIENT_ID", _TAILSCALE_FILE
+)
+TAILSCALE_OAUTH_CLIENT_SECRET = _env_or_file(
+    "TAILSCALE_OAUTH_CLIENT_SECRET", _TAILSCALE_FILE
+)
+TAILSCALE_TAILNET = _env_or_file("TAILSCALE_TAILNET", _TAILSCALE_FILE)
+TAILSCALE_POLL_SECONDS = int(
+    os.environ.get("TAILSCALE_POLL_SECONDS")
+    or _TAILSCALE_FILE.get("TAILSCALE_POLL_SECONDS")
+    or "60"
+)
+TAILSCALE_STALE_AFTER_SECONDS = int(
+    os.environ.get("TAILSCALE_STALE_AFTER_SECONDS")
+    or _TAILSCALE_FILE.get("TAILSCALE_STALE_AFTER_SECONDS")
+    or "180"
+)
+#: How long an already-verified account keeps working while the server cannot
+#: reach api.tailscale.com at all.
+#:
+#: A server running on a phone loses public DNS regularly — dozing, changing
+#: networks, a tailnet up but no internet. Pausing every chat seconds after such
+#: a blip is a worse failure than it prevents, because reaching this server at
+#: all already requires being on the tailnet: Tailscale itself refuses everyone
+#: else at the network layer. So an account whose device was confirmed while the
+#: snapshot was fresh keeps working through an outage this long, then stops.
+#: Accounts that were never confirmed are refused throughout.
+TAILSCALE_GRACE_SECONDS = int(
+    os.environ.get("TAILSCALE_GRACE_SECONDS")
+    or _TAILSCALE_FILE.get("TAILSCALE_GRACE_SECONDS")
+    or "86400"
+)
 
 
 def ensure_dirs() -> None:

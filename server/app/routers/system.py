@@ -7,7 +7,10 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends
 
+from sqlalchemy.orm import Session
+
 from app import config, host_info
+from app.db import get_db
 from app.deps import get_current_user
 from app.doodle_media import MAX_DOODLE_BYTES
 from app.models import User
@@ -59,6 +62,23 @@ def upload_limits(
         "max_doodle_bytes": MAX_DOODLE_BYTES,
         "free_bytes": allowance.free_bytes,
         "disk_bound": allowance.disk_bound,
+    }
+
+
+@router.get("/media-policy")
+def media_policy(
+    db: Annotated[Session, Depends(get_db)],
+    current: Annotated[User, Depends(get_current_user)],
+) -> dict[str, int | None]:
+    """How long attachments stay on this server unless someone keeps them."""
+    from app.media_retention import load_policy
+
+    policy = load_policy(db)
+    return {
+        "default_days": policy.default_days,
+        "min_days": policy.min_days,
+        "max_days": policy.max_days,
+        "my_days": current.media_ttl_days,
     }
 
 

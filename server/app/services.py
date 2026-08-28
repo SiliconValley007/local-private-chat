@@ -62,7 +62,7 @@ def get_membership(db: Session, conversation_id: int, user_id: int) -> Conversat
 
 def require_membership(db: Session, conversation_id: int, user_id: int) -> ConversationMember:
     m = get_membership(db, conversation_id, user_id)
-    if m is None:
+    if m is None or m.hidden_at is not None:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="You're not part of this chat anymore.",
@@ -260,6 +260,11 @@ async def create_and_broadcast_message(
     reply_to_message_id: int | None = None,
 ) -> Message:
     reply_to_message_id = resolve_reply_target(db, conversation_id, reply_to_message_id)
+    from app.contact_sever import refuse_if_blocked
+    from app.tailscale_membership import refuse_if_peer_unavailable
+
+    refuse_if_blocked(db, conversation_id, sender.id)
+    refuse_if_peer_unavailable(db, conversation_id, sender.id)
     if client_id:
         existing = db.scalar(
             select(Message).where(
@@ -295,6 +300,9 @@ async def create_and_broadcast_message(
     )
     db.add(message)
     db.flush()
+    from app.media_retention import apply_media_timer
+
+    apply_media_timer(db, message, sender)
 
     recipients = member_user_ids(db, conversation_id) - {sender.id}
     for uid in recipients:
@@ -364,6 +372,9 @@ def _push_to_offline_members(
     offline: set[int],
 ) -> None:
     """Send a content-free push and forget any token FCM says is dead."""
+    from app.tailscale_membership import push_targets
+
+    offline = push_targets(db, offline)
     tokens = db.scalars(
         select(DeviceToken.token).where(DeviceToken.user_id.in_(offline))
     ).all()
@@ -551,6 +562,9 @@ def _push_nudge_to_offline(
     offline: set[int],
     variant: str = "wave",
 ) -> None:
+    from app.tailscale_membership import push_targets
+
+    offline = push_targets(db, offline)
     tokens = db.scalars(
         select(DeviceToken.token).where(DeviceToken.user_id.in_(offline))
     ).all()
@@ -652,6 +666,7 @@ async def soft_delete_message(
     *,
     message_id: int,
     actor: User,
+    bypass_sender_check: bool = False,
 ) -> Message:
     """Replace a message with a tombstone visible to everyone in the chat."""
     message = load_message(db, message_id)
@@ -663,7 +678,7 @@ async def soft_delete_message(
     membership = require_membership(db, message.conversation_id, actor.id)
     is_sender = message.sender_id == actor.id
     is_admin = membership.role == "admin"
-    if not is_sender and not is_admin:
+    if not is_sender and not is_admin and not bypass_sender_check:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="You can only delete messages you sent.",
@@ -683,6 +698,9 @@ async def soft_delete_message(
     }
     deleted_description = audit.describe_message(message)
     db.execute(delete(MessagePin).where(MessagePin.message_id == message.id))
+    from app.media_retention import drop_retains_for_message
+
+    drop_retains_for_message(db, message.id)
     message.deleted_at = utcnow()
     message.body = None
     message.media_path = None
@@ -691,6 +709,8 @@ async def soft_delete_message(
     message.media_size = None
     message.media_mime = None
     message.media_duration_ms = None
+    message.media_gone_at = utcnow()
+    message.media_gone_reason = "deleted"
     message.edited_at = None
     db.commit()
     audit.record(
@@ -1125,6 +1145,77 @@ async def set_disappearing(
     return conv
 
 
+async def set_media_ttl(
+    db: Session,
+    *,
+    conversation_id: int,
+    user: User,
+    days: int,
+) -> Conversation:
+    from datetime import timezone as tz
+
+    from app.media_retention import MEDIA_TYPES, has_retains, load_policy
+
+    policy = load_policy(db)
+    wanted = policy.clamp(days)
+    conv = load_conversation(db, conversation_id)
+    if conv is None:
+        raise HTTPException(status_code=404, detail="That chat is no longer available.")
+    require_membership(db, conversation_id, user.id)
+    previous = (
+        conv.media_ttl_days if conv.media_ttl_days is not None else policy.default_days
+    )
+    if previous == wanted:
+        return conv
+    conv.media_ttl_days = wanted
+    conv.media_ttl_set_by = user.id
+    conv.media_ttl_set_at = utcnow()
+    now = utcnow()
+    rows = db.scalars(
+        select(Message).where(
+            Message.conversation_id == conversation_id,
+            Message.type.in_(MEDIA_TYPES),
+            Message.media_path.is_not(None),
+            Message.media_gone_at.is_(None),
+        )
+    ).all()
+    for message in rows:
+        if has_retains(db, message.id):
+            continue
+        created = message.created_at or now
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=tz.utc)
+        message.media_ttl_days = wanted
+        message.media_expires_at = created + timedelta(days=wanted)
+    notice = Message(
+        conversation_id=conversation_id,
+        sender_id=user.id,
+        type="media_ttl",
+        body=json.dumps({"from_days": previous, "to_days": wanted, "at": now.isoformat()}),
+        created_at=now,
+    )
+    db.add(notice)
+    db.commit()
+    db.refresh(conv)
+    audit.record(
+        db,
+        action="conversation.media_ttl_set",
+        summary=(
+            f"{user.username} changed attachment expiry in chat {conversation_id} "
+            f"from {previous} days to {wanted} days"
+        ),
+        actor=user,
+        conversation_id=conversation_id,
+        message_id=notice.id,
+        before_text=str(previous),
+        after_text=str(wanted),
+    )
+    members = member_user_ids(db, conversation_id)
+    await hub.broadcast_to_users(members, events.event_conversation_updated(conversation_id))
+    await hub.broadcast_to_users(members, events.event_message_new(notice))
+    return conv
+
+
 async def set_anniversary(
     db: Session,
     *,
@@ -1308,6 +1399,9 @@ def _push_reaction_to_offline(
     actor: User,
     offline: set[int],
 ) -> None:
+    from app.tailscale_membership import push_targets
+
+    offline = push_targets(db, offline)
     tokens = db.scalars(
         select(DeviceToken.token).where(DeviceToken.user_id.in_(offline))
     ).all()
@@ -1497,7 +1591,8 @@ def search_messages(
     needle = query.strip()
     memberships = db.scalars(
         select(ConversationMember.conversation_id).where(
-            ConversationMember.user_id == user_id
+            ConversationMember.user_id == user_id,
+            ConversationMember.hidden_at.is_(None),
         )
     ).all()
     allowed = set(memberships)
@@ -1617,6 +1712,12 @@ def list_shared_items(
     items: list[SharedItemOut] = []
     for message in rows:
         if message.id in hidden_ids:
+            continue
+        from app.media_retention import should_index_shared_media
+
+        if message.type in ("image", "video", "doodle", "file") and not should_index_shared_media(
+            message
+        ):
             continue
         # Videos join photos in the Media tab, the way a gallery mixes both.
         if message.type in ("image", "video", "doodle"):
@@ -1811,7 +1912,8 @@ def list_starred_messages(
     membership_conv_ids = set(
         db.scalars(
             select(ConversationMember.conversation_id).where(
-                ConversationMember.user_id == user_id
+                ConversationMember.user_id == user_id,
+                ConversationMember.hidden_at.is_(None),
             )
         ).all()
     )

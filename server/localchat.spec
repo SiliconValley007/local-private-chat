@@ -67,6 +67,7 @@ hiddenimports = sorted(
             "app.sessions",
             "reset_password",
             "set_admin",
+            "tailscale_check",
             # Windows blocks inbound connections by default; this module is what
             # tells the operator so and offers to open the port.
             "firewall",

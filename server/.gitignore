@@ -1,5 +1,6 @@
 # Local overrides — keep secrets and machine paths here.
 jwt_secret.txt
+tailscale-oauth.env
 firebase-service-account.json
 data/
 media/

@@ -13,6 +13,11 @@
     <!-- Lets Firebase deliver a push that wakes the phone while it is dozing. -->
     <uses-permission android:name="android.permission.WAKE_LOCK"/>
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>
+    <!-- A large attachment keeps sending while the app is off screen; Android
+         only allows that for work the user can see, which is what the sending
+         notification is. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC"/>
     <application
         android:label="Local Chat"
         android:name="${applicationName}"
@@ -78,6 +83,14 @@
             android:name=".TailscaleGuardService"
             android:exported="false"
             android:stopWithTask="false" />
+        <!-- Carries a send through being minimised. stopWithTask=true: swiping the
+             app away is a deliberate "stop", and an upload with no app left to
+             report to has nowhere to put the message it would create. -->
+        <service
+            android:name=".UploadService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync"
+            android:stopWithTask="true" />
         <!-- Alarm backstop: Android reaps a cached process minutes after the app
              leaves the foreground, so a later swipe from Recents reaches no
              running code. This receiver restarts the process to switch the

@@ -2,10 +2,19 @@ import 'package:flutter/material.dart';
 
 /// Inline error message with the same look everywhere in the app.
 class ErrorBanner extends StatelessWidget {
-  const ErrorBanner({super.key, required this.message, this.onRetry});
+  const ErrorBanner({
+    super.key,
+    required this.message,
+    this.onRetry,
+    this.onDismiss,
+  });
 
   final String message;
   final VoidCallback? onRetry;
+
+  /// Lets the reader put the banner away. Without this, a failure that retrying
+  /// cannot fix — someone leaving the tailnet, say — sits there for good.
+  final VoidCallback? onDismiss;
 
   @override
   Widget build(BuildContext context) {
@@ -35,6 +44,14 @@ class ErrorBanner extends StatelessWidget {
             const SizedBox(width: 4),
             TextButton(onPressed: onRetry, child: const Text('Retry')),
           ],
+          if (onDismiss != null)
+            IconButton(
+              onPressed: onDismiss,
+              icon: const Icon(Icons.close_rounded, size: 18),
+              color: scheme.onErrorContainer,
+              tooltip: 'Dismiss',
+              visualDensity: VisualDensity.compact,
+            ),
         ],
       ),
     );

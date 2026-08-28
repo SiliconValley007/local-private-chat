@@ -64,8 +64,8 @@ Inspired by the deployment model of [local-drive](https://github.com/SiliconVall
 - **Reply / quote**, **edit**, and **delete** (tombstone) for messages
 - Delivery and read receipts (monotonic — a read on a newer message ticks every
   older one, so a dropped socket frame cannot leave a stale single tick), with
-  the latest outgoing status also shown in the Chats list; typing, online /
-  last-seen presence, and partner mood as secondary text
+  the latest outgoing status also shown in the Chats list; typing and online /
+  last-seen presence in the chat header (mood stays in the profile)
 - **Profile screens** — edit your photo, display name, and mood in one place;
   contact profiles keep private aliases, real identity, full last-seen, shared
   media, and call actions together
@@ -312,7 +312,8 @@ app, install the new APK and leave the server running.
 12. Call someone who is offline: you must hear a ringback while it tries, see
     **Waking their phone…** or **Can't reach \<name\>** rather than a silent
     screen, and the call must end by itself.
-13. On a chat with a mood set, the header's third line must be fully visible.
+13. On a chat with a mood set, the header shows only typing/online/last-seen;
+    the mood remains visible on the contact profile.
 14. Tap **Search chats**, type, then tap the list or the empty space below it —
     the keyboard must close.
 15. A parent's or colleague's chat menu must not mention couple details at all.
@@ -799,6 +800,26 @@ The same single Windows executable also provides the operator tool:
 Environment
 `LOCALCHAT_ADMIN_USERNAME` still wins over the database when set.
 
+### Tailnet membership check (operator)
+
+With `tailscale-oauth.env` in place the server only lets accounts chat while it
+can confirm they are still on the tailnet. If that confirmation fails — wrong
+client secret, missing **Devices: Read** scope, wrong tailnet, or no route to
+`api.tailscale.com` — sign-in reports *"Tailnet membership cannot be verified
+right now"* for everyone except the admin. Ask the server what went wrong:
+
+```bash
+python run.py tailscale-check              # config + live API result + bindings
+python run.py tailscale-check --apply      # suspend/restore from that result now
+python run.py tailscale-check --unsuspend alice   # break glass for one account
+python run.py tailscale-check --disable    # park the env file, enforcement off
+```
+
+The same subcommands exist on the Windows build
+(`.\LocalChatServer.exe tailscale-check`). The admin account is never suspended
+by the tailnet and always survives a closed gate, so the server stays
+administrable; appoint one with `set-admin` before enabling OAuth.
+
 ### Encrypted backup / restore
 
 1. Inbox ⋮ → **Backup & restore**
@@ -846,7 +867,8 @@ On both client phones:
    chat; self and contact profiles edit/show the right identity; long last-seen
    text scrolls horizontally.
 7. **Presence** — typing replaces inbox preview and chat subtitle; online /
-   last-seen / mood priority; typing clears after ~4s or socket drop.
+   last-seen priority; mood is profile-only; typing clears after ~4s or socket
+   drop.
 8. **Emoji** — send a brand-new emoji (for example 🫩): it renders in composer
    and bubble; one emoji plays its expressive entrance/idle motion and replays
    on tap, while two remain still.
@@ -992,7 +1014,62 @@ contract are tested (`tests/test_integration_ws.py`,
 
 ## GitHub Releases (APK + Windows server)
 
-**Current app version:** `1.8.9+42` (the activity log now shows a checklist
+Before publishing, use
+[`docs/release-regression-matrix.md`](docs/release-regression-matrix.md) for the
+full history of reported issues and complete
+[`docs/manual-release-checklist.md`](docs/manual-release-checklist.md) on the
+target phones, Windows host, and Termux host.
+The separately scoped WhatsApp-style companion/web design is in
+[`docs/linked-device-architecture.md`](docs/linked-device-architecture.md); it
+is not represented as implemented in this release.
+
+**Current app version:** `1.11.0+48` (Photos and videos now leave the server
+after a timer — 30 days by default — unless someone keeps them there; a save to
+the phone survives that expiry. Inbox can say they can't be reached, and a DM
+can be deleted or the contact removed without touching Tailscale.
+plus 1.10.0: A large attachment now survives being
+minimised, which is what makes sending one from a phone realistic. Anything from
+8 MB up goes to the server in pieces against an upload session, so an
+interruption costs the piece in flight rather than the whole transfer, and the
+send picks up from the exact byte the server holds — a 500 MB video no longer
+starts again from zero because a tunnel blinked. While a send is running there is
+a notification with its progress and a Cancel button, and that notification is
+also what stops Android freezing the app the moment it leaves the screen; the
+tunnel is held for the duration as before. Stopping is available in the chat too,
+and stopping reclaims the part-sent file on the server rather than leaving it
+there. Half-finished uploads nobody came back for are cleared after a day;
+plus 1.9.3: leaving the app switches an app-started
+tunnel off immediately, instead of scheduling it for half a minute later. The
+countdown ran in a background service and the alarm behind it was deliberately
+inexact, so on a phone that freezes cached apps neither arrived and the tunnel
+stayed up — measured at 40 seconds and counting in a screen recording. The
+decision now happens where Android promises to run it, as the last window goes
+away, with the countdown and alarm kept only as backstops. A rotation, a call or
+upload in progress, and the app opening Tailscale or the fingerprint sheet still
+keep the tunnel. Server settings gained "Recent tunnel activity": a timestamped
+record of every connect and disconnect the app asked for and why, so this is
+visible on the phone without a cable and `logcat`;
+plus 1.9.2: opening the app no longer asks Tailscale to
+disconnect. The 1.9.1 cold-start retry raced the connect that follows a launch
+and then blocked it through the exit guard, which left Tailscale running while
+the app reported the tunnel as none of its business — so closing the app no
+longer switched it off. A tunnel the app switched on is also kept as its own
+however long routing takes to appear: the previous half-minute limit handed slow
+and roaming connections back to "unowned", with the same result. A tunnel the
+user connected themselves is still never touched;
+plus 1.9.1: Activity Log facts and technical details
+are left-aligned again on narrow phones, its filter chips are fully visible,
+and its actions wrap instead of overflowing. The app-owned Tailscale exit alarm
+uses a durable activity-stop clock rather than mistaking a receiver process
+for a visible app;
+plus 1.9.0: a message you sent now opens in your own
+activity log: the phone that sealed it derives the same key both ways, and the
+log now gets those keys ready for an entry that records only the text after the
+change — every "Message sent" — instead of leaving your own words reading "Not
+readable on this device". Text this phone genuinely cannot open now says which of
+the very different reasons applies: still opening, one chat visit away, another
+chat's message, or sealed for an install that is gone;
+plus 1.8.9: the activity log shows a checklist
 as its items, never the JSON the server stored, and names who sent a message
 as one readable line instead of wrapping mid-sentence;
 plus 1.8.8: a locked app now offers the fingerprint by
@@ -1149,6 +1226,7 @@ Chat/
     start.bat                    Windows helper
     reset_password.py            Admin password reset (on the server host)
     set_admin.py                 Operator break-glass for admin username / device pin
+    tailscale_check.py           Why membership is paused; --disable / --unsuspend
   flutter_app/                   Flutter Android client
     android/app/google-services.json.example
     assets/fonts/NotoColorEmoji.ttf         Bundled emoji font, behind every style

@@ -21,9 +21,12 @@ from app.schemas import (
     AuditEventOut,
     AuditSummaryOut,
     ForceLogoutOut,
+    MediaTtlRequest,
     OnlineUserOut,
     SetAdminDeviceRequest,
     SetAdminRequest,
+    TailscaleBindRequest,
+    UserOut,
 )
 from app.sessions import bump_token_version
 
@@ -54,7 +57,51 @@ def admin_status(
     offer the activity log at all before it can ask for it.
     """
 
-    return AdminStatusOut(**admin_rules.status_fields(db, current, device_id=device_id))
+    fields = admin_rules.status_fields(db, current, device_id=device_id)
+    return AdminStatusOut(**fields, **_tailnet_fields(fields, db))
+
+
+def _tailnet_fields(fields: dict, db: Session) -> dict:
+    """The membership gate, for the admin only.
+
+    Without this the operator has no way to tell "your contact left the tailnet"
+    apart from "this server cannot reach the Tailscale API", which are the same
+    silence from inside the app.
+    """
+    if not fields.get("is_admin"):
+        return {}
+    from app.tailscale_membership import membership_status
+
+    doc = membership_status(db)
+    if not doc["configured"]:
+        return {"tailnet_configured": False}
+    verified = not doc["stale"] and doc["snapshot_at"] is not None
+    reason = doc["last_error"]
+    if doc["foreign_tailnet"]:
+        verified = False
+        reason = (
+            "These OAuth credentials are for a different tailnet, so membership "
+            "is not being enforced. Generate the OAuth client in the tailnet "
+            f"that lists this server ({doc['own_address']})."
+        )
+    elif not verified and reason is None:
+        reason = "The server has not checked the tailnet yet."
+    return {
+        "tailnet_configured": True,
+        "tailnet_verified": verified,
+        "tailnet_reason": reason,
+        "tailnet_devices": doc["devices"],
+        "tailnet_shared_logins": doc["shared_logins"],
+        "tailnet_shares_verified": doc["shares_verified"],
+        "tailnet_shares_reason": doc["shares_error"],
+        "tailnet_accounts": [
+            row
+            for row in doc["accounts"]
+            if row["username"].casefold()
+            != str(fields.get("admin_username") or "").casefold()
+        ],
+        "tailnet_checked_at": doc["snapshot_at"],
+    }
 
 
 @router.put("/username", response_model=AdminStatusOut)
@@ -134,6 +181,57 @@ def set_admin_device(
             after_text=device_id[-8:],
         )
     return AdminStatusOut(**admin_rules.status_fields(db, current, device_id=device_id))
+
+
+@router.put("/media-ttl")
+def set_media_ttl(
+    payload: MediaTtlRequest,
+    current: Annotated[User, Depends(admin_rules.require_admin)],
+    db: Annotated[Session, Depends(get_db)],
+) -> dict[str, int]:
+    """Server default for how long new attachments stay unless someone keeps them."""
+    from app.media_retention import set_server_ttl_days
+
+    if payload.days is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Set how many days attachments should stay.",
+        )
+    policy = set_server_ttl_days(db, days=payload.days, actor=current)
+    audit.record(
+        db,
+        action="settings.media_ttl",
+        summary=f"{current.username} set the media timer to {policy.default_days} days",
+        actor=current,
+        details={"days": policy.default_days},
+    )
+    return {
+        "default_days": policy.default_days,
+        "min_days": policy.min_days,
+        "max_days": policy.max_days,
+    }
+
+
+@router.put("/tailscale-bind", response_model=UserOut)
+def bind_tailscale_identity(
+    payload: TailscaleBindRequest,
+    current: Annotated[User, Depends(admin_rules.require_admin)],
+    db: Annotated[Session, Depends(get_db)],
+) -> UserOut:
+    """Admin override: bind one Local Chat account to one Tailscale login."""
+    from app.realtime.events import user_out
+    from app.tailscale_membership import admin_bind_user
+
+    target = db.get(User, payload.user_id)
+    if target is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="That account is no longer on this server.",
+        )
+    bound = admin_bind_user(
+        db, user=target, login=payload.login, actor=current
+    )
+    return user_out(bound, db=db)
 
 
 @router.get("/online", response_model=list[OnlineUserOut])

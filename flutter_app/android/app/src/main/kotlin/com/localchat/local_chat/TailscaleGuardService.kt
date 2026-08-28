@@ -84,7 +84,7 @@ class TailscaleGuardService : Service() {
             Log.i(TAG, "task removed while keep-alive work is active; tunnel held")
             TailscaleIdleExit.arm(this)
         } else if (disconnect) {
-            TailscaleExit.disconnectIfAllowed(this, "task removed")
+            TailscaleExit.disconnectIfAllowed(this, "task removed", authoritative = true)
             // Keep the already-armed alarm: it sends one later fallback nudge
             // if Tailscale ignored this best-effort broadcast.
         }
@@ -116,18 +116,41 @@ class TailscaleGuardService : Service() {
     ): Boolean {
         val snap = TailscaleExit.readOwnership(this)
         val now = System.currentTimeMillis()
+        val backgroundedForMs = TailscaleExit.durableBackgroundedForMs(this, now)
+        val callActive = AppForeground.callStillActive(now)
+        val transferActive = AppForeground.transferStillActive(now)
+        val expectingReturn = AppForeground.expectingReturn(now)
         val disconnect = TailscaleExitPolicy.shouldDisconnectAfterBackground(
             enabled = snap.enabled,
             phase = snap.phase,
             appForeground = AppForeground.isForeground(this),
-            callActive = AppForeground.callStillActive(now),
-            backgroundedForMs = AppForeground.backgroundedForMs(now),
+            callActive = callActive,
+            backgroundedForMs = backgroundedForMs,
             delayMs = delayMs,
-            transferActive = AppForeground.transferStillActive(now),
+            transferActive = transferActive,
+            expectingReturn = expectingReturn,
         )
-        if (!disconnect) return false
+        if (!disconnect) {
+            if (TailscaleExitPolicy.shouldRetryPendingDisconnect(
+                    pendingDisconnect = TailscaleExit.isPendingDisconnect(this),
+                    enabled = snap.enabled,
+                    phase = snap.phase,
+                    backgroundedForMs = backgroundedForMs,
+                    callActive = callActive,
+                    transferActive = transferActive,
+                    expectingReturn = expectingReturn,
+                )
+            ) {
+                Log.i(TAG, "$reason: retrying pending disconnect")
+                TailscaleExit.retryPendingDisconnectIfNeeded(this, authoritative = true)
+                watching = false
+                stopSelf()
+                return true
+            }
+            return false
+        }
         Log.i(TAG, "$reason: closing the tunnel this app opened")
-        TailscaleExit.disconnectIfAllowed(this, reason)
+        TailscaleExit.disconnectIfAllowed(this, reason, authoritative = true)
         // Keep the alarm armed after this best-effort broadcast. Tailscale's
         // receiver sends no acknowledgement, so the later alarm doubles as one
         // process-death-safe delivery retry. Returning to the app cancels it.

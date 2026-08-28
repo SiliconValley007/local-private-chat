@@ -29,12 +29,14 @@ object TailscaleIdleExit {
             return
         }
         val alarms = alarmManager(app) ?: return
-        val at = System.currentTimeMillis() + TailscaleExitPolicy.IDLE_EXIT_DELAY_MS
+        val awayMs = TailscaleExit.durableBackgroundedForMs(app)
+        val delayMs = TailscaleExitPolicy.idleExitArmDelayMs(awayMs)
+        val at = System.currentTimeMillis() + delayMs
         try {
             // Inexact on purpose: exact alarms need a user-granted permission,
             // and a late disconnect is still a disconnect.
             alarms.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, at, pending(app))
-            Log.i(TAG, "idle exit armed in ${TailscaleExitPolicy.IDLE_EXIT_DELAY_MS} ms")
+            Log.i(TAG, "idle exit armed in $delayMs ms (away ${awayMs}ms)")
         } catch (e: Exception) {
             Log.w(TAG, "could not arm idle exit: ${e.message}")
         }
@@ -57,24 +59,57 @@ object TailscaleIdleExit {
      */
     fun onAlarm(
         context: Context,
-        appForeground: Boolean,
         callActive: Boolean,
         transferActive: Boolean,
     ) {
         val app = context.applicationContext
         val snap = TailscaleExit.readOwnership(app)
-        if (!TailscaleExitPolicy.shouldDisconnectOnIdleAlarm(
+        val backgroundedForMs = TailscaleExit.durableBackgroundedForMs(app)
+        val expectingReturn = AppForeground.expectingReturn()
+        val pending = TailscaleExit.isPendingDisconnect(app)
+        if (TailscaleExitPolicy.shouldDisconnectOnIdleAlarm(
                 snap.enabled,
                 snap.phase,
-                appForeground,
+                backgroundedForMs,
                 callActive,
                 transferActive,
+                expectingReturn = expectingReturn,
             )
         ) {
-            if (appForeground || callActive || transferActive) arm(app)
+            TailscaleExit.disconnectIfAllowed(app, "idle in background", authoritative = true)
             return
         }
-        TailscaleExit.disconnectIfAllowed(app, "idle in background")
+        if (TailscaleExitPolicy.shouldRetryPendingDisconnect(
+                pendingDisconnect = pending,
+                enabled = snap.enabled,
+                phase = snap.phase,
+                backgroundedForMs = backgroundedForMs,
+                callActive = callActive,
+                transferActive = transferActive,
+                expectingReturn = expectingReturn,
+            )
+        ) {
+            TailscaleExit.retryPendingDisconnectIfNeeded(app, authoritative = true)
+            if (TailscaleExitPolicy.shouldRearmIdleExitOnAlarm(
+                    backgroundedForMs = backgroundedForMs,
+                    callActive = callActive,
+                    transferActive = transferActive,
+                    expectingReturn = expectingReturn,
+                )
+            ) {
+                arm(app)
+            }
+            return
+        }
+        if (TailscaleExitPolicy.shouldRearmIdleExitOnAlarm(
+                backgroundedForMs = backgroundedForMs,
+                callActive = callActive,
+                transferActive = transferActive,
+                expectingReturn = expectingReturn,
+            )
+        ) {
+            arm(app)
+        }
     }
 
     private fun alarmManager(context: Context): AlarmManager? =

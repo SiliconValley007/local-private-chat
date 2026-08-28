@@ -50,9 +50,25 @@ object AppForeground {
     @Volatile
     private var transferActiveSinceMs: Long = 0L
 
+    /**
+     * True while Local Chat itself sent the user to another screen it expects
+     * them straight back from — Tailscale's own app, or the system fingerprint
+     * sheet. Those look identical to leaving, and disconnecting for them would
+     * undo the very thing the user asked for.
+     */
+    @Volatile
+    var expectReturn: Boolean = false
+        private set
+
+    @Volatile
+    private var expectReturnSinceMs: Long = 0L
+
     fun markResumed() {
         resumed = true
         leftForegroundAtMs = 0L
+        // Back on screen: whatever we were waiting to return from has happened.
+        expectReturn = false
+        expectReturnSinceMs = 0L
     }
 
     fun markStopped(nowMs: Long = System.currentTimeMillis()) {
@@ -69,6 +85,19 @@ object AppForeground {
         transferActive = active
         transferActiveSinceMs = if (active) nowMs else 0L
     }
+
+    fun noteExpectReturn(active: Boolean, nowMs: Long = System.currentTimeMillis()) {
+        expectReturn = active
+        expectReturnSinceMs = if (active) nowMs else 0L
+    }
+
+    /** The expect-return flag, ignored once the return clearly is not coming. */
+    fun expectingReturn(nowMs: Long = System.currentTimeMillis()): Boolean =
+        TailscaleExitPolicy.isExpectReturnStillActive(
+            expectReturn,
+            nowMs,
+            expectReturnSinceMs,
+        )
 
     /**
      * How long the app has been without a window, in milliseconds.

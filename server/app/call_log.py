@@ -21,6 +21,8 @@ def call_log_outcome(
     was_active: bool,
 ) -> str:
     """Map a terminal signaling event to a persisted call-log outcome."""
+    if terminal_event == "call.failed":
+        return "failed"
     if was_active or terminal_event == "call.end":
         return "answered"
     mapping = {

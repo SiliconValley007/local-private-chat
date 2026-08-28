@@ -71,6 +71,32 @@ class TailscaleOwnershipSnapshot {
   }
 }
 
+/// One line of the host's record of what it asked Tailscale to do.
+class TailscaleTunnelEvent {
+  const TailscaleTunnelEvent({required this.at, required this.text});
+
+  final DateTime at;
+  final String text;
+
+  static List<TailscaleTunnelEvent> listFromChannel(List<Object?>? raw) {
+    if (raw == null) return const [];
+    final events = <TailscaleTunnelEvent>[];
+    for (final entry in raw) {
+      if (entry is! Map) continue;
+      final at = (entry['atMs'] as num?)?.toInt();
+      final text = entry['text'] as String?;
+      if (at == null || at <= 0 || text == null || text.isEmpty) continue;
+      events.add(
+        TailscaleTunnelEvent(
+          at: DateTime.fromMillisecondsSinceEpoch(at),
+          text: text,
+        ),
+      );
+    }
+    return events;
+  }
+}
+
 /// Drives the separate Tailscale Android app on this phone.
 ///
 /// Local Chat cannot own the system VPN — only Tailscale can. What we can do is
@@ -95,7 +121,14 @@ class TailscaleAssist {
 
   /// How long [pendingConnect] may wait before routing that appears is treated
   /// as someone else's tunnel.
-  static const connectClaimWindow = Duration(seconds: 30);
+  ///
+  /// Generous on purpose. A pending connect is only ever recorded when routing
+  /// was down, so routing that rises afterwards is almost always the answer to
+  /// our own request — and on a weak or roaming connection Tailscale can take
+  /// far longer than half a minute to route. The old 30-second window handed
+  /// those tunnels back to "unowned", which is how an app-started tunnel ended
+  /// up surviving the app.
+  static const connectClaimWindow = Duration(minutes: 3);
 
   DateTime? _lastNudgeAt;
 
@@ -145,14 +178,23 @@ class TailscaleAssist {
     return check.requiresTailscale && check.isReachable;
   }
 
+  /// Did our connect request bring this routing up?
+  ///
+  /// Routing we watched rise while pending is ours however long it took —
+  /// [pendingConnect] is only ever recorded when routing was down, so nothing
+  /// else asked for it. Only the ambiguous first observation of a fresh process,
+  /// where routing may already have been up before we looked, is bounded by
+  /// [connectClaimWindow].
   static bool requestRaisedTunnel({
     required bool awaitingRequest,
     required bool? previousRouting,
     required ServerCheck check,
-  }) =>
-      awaitingRequest &&
-      (previousRouting ?? false) == false &&
-      tunnelRoutingIsUp(check);
+  }) {
+    if (!tunnelRoutingIsUp(check)) return false;
+    if (previousRouting == false) return true;
+    if (previousRouting == null) return awaitingRequest;
+    return false;
+  }
 
   static bool provedNoTunnel(ServerCheck? check) =>
       check?.status == ServerStatus.tailscaleOff;
@@ -215,6 +257,8 @@ class TailscaleAssist {
       );
       if (weRaisedIt) return TailscaleOwnershipPhase.owned;
 
+      // Routing that was already up the first time we looked, and stayed up
+      // past the window without us ever seeing it rise, is someone else's.
       if (routingUp && !awaiting && connectRequestedAt != null) {
         return TailscaleOwnershipPhase.unowned;
       }
@@ -360,6 +404,47 @@ class TailscaleAssist {
     } catch (e) {
       debugPrint('Host disconnect failed, sending broadcast instead: $e');
       return _broadcast(disconnectAction);
+    }
+  }
+
+  /// Tell the host the app is sending the user somewhere it expects them back
+  /// from, so leaving the screen does not switch the tunnel off.
+  Future<void> noteExpectReturn(bool active) async {
+    if (!Platform.isAndroid) return;
+    try {
+      await _exitChannel.invokeMethod<void>('noteExpectReturn', {
+        'active': active,
+      });
+    } on MissingPluginException {
+      // Older host build without the flag.
+    } catch (e) {
+      debugPrint('Could not note expected return: $e');
+    }
+  }
+
+  /// Holds the Tailscale tunnel for ringing/connecting/active calls.
+  Future<void> noteCall(bool active) async {
+    if (!Platform.isAndroid) return;
+    try {
+      await _exitChannel.invokeMethod<void>('noteCall', {'active': active});
+    } on MissingPluginException {
+      // Older host build without the flag.
+    } catch (e) {
+      debugPrint('Could not note call tunnel hold: $e');
+    }
+  }
+
+  /// What was asked of Tailscale, and why, newest last.
+  Future<List<TailscaleTunnelEvent>> readTunnelLog() async {
+    if (!Platform.isAndroid) return const [];
+    try {
+      final raw = await _exitChannel.invokeMethod<List<Object?>>('getTunnelLog');
+      return TailscaleTunnelEvent.listFromChannel(raw);
+    } on MissingPluginException {
+      return const [];
+    } catch (e) {
+      debugPrint('Could not read the tunnel log: $e');
+      return const [];
     }
   }
 

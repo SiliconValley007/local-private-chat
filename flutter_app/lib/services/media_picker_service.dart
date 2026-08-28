@@ -147,16 +147,24 @@ class MediaPickerService {
     final assets = await AssetPicker.pickAssets(
       context,
       permissionRequestOption: _requestOption,
-      pickerConfig: _config(
-        maxAssets: AppState.maxAttachmentsPerSend,
-        requestType: RequestType.common,
-        includeCameraShortcut: true,
-      ),
+      pickerConfig: chatAttachmentsConfig(),
     );
     if (assets == null || assets.isEmpty) return null;
     if (!context.mounted) return assetsToFiles(assets);
     return _resolveSelection(context, assets);
   }
+
+  /// Chat picker where tapping a thumbnail selects it immediately.
+  ///
+  /// Preview mode opens the asset first and adds a second top-right "Select"
+  /// action. Review/caption still happens after this picker, so that extra step
+  /// adds friction without protecting the send.
+  static AssetPickerConfig chatAttachmentsConfig() => _config(
+    maxAssets: AppState.maxAttachmentsPerSend,
+    requestType: RequestType.common,
+    includeCameraShortcut: true,
+    specialPickerType: SpecialPickerType.noPreview,
+  );
 
   /// Turns a selection into files, saying so while it takes time or falls short.
   ///

@@ -11,6 +11,7 @@ import 'audit.dart';
 import 'errors.dart';
 import 'models.dart';
 import 'nudge_log.dart';
+import 'services/resumable_upload.dart';
 import 'upload_limits.dart';
 
 class OnlineAdminUser {
@@ -41,7 +42,7 @@ class ApiException implements Exception {
   String toString() => message;
 }
 
-class ApiClient {
+class ApiClient implements ResumableUploadTransport {
   ApiClient();
 
   static const _tokenKey = 'auth_token';
@@ -247,6 +248,21 @@ class ApiClient {
         headers: _headers(jsonBody: false),
       ),
     );
+  }
+
+  /// Map a Local Chat account to an accepted share of the server device.
+  Future<ChatUser> bindTailnetAccount({
+    required int userId,
+    required String login,
+  }) async {
+    final res = await _send(
+      () => http.put(
+        _uri('/api/admin/tailscale-bind'),
+        headers: _headers(),
+        body: jsonEncode({'user_id': userId, 'login': login}),
+      ),
+    );
+    return ChatUser.fromJson(await _decode(res));
   }
 
   /// One page of the activity log, newest first.
@@ -1047,6 +1063,126 @@ class ApiClient {
   /// Above this, an upload is timed by progress rather than by the clock.
   static const _largeUploadBytes = 8 * 1024 * 1024;
 
+  // ---------------------------------------------------------------------------
+  // Resumable uploads. A large attachment is sent as a series of pieces against
+  // a server-side session, so an interruption costs one piece rather than the
+  // whole file. See services/resumable_upload.dart for the sending loop.
+  // ---------------------------------------------------------------------------
+
+  @override
+  Future<UploadHandle> beginUpload({
+    required int conversationId,
+    required String filename,
+    required int size,
+    required String type,
+    String? mime,
+    int? durationMs,
+  }) async {
+    final res = await _send(
+      () => http.post(
+        _uri('/api/conversations/$conversationId/uploads'),
+        headers: _headers(),
+        body: jsonEncode({
+          'type': type,
+          'filename': filename,
+          'size': size,
+          if (mime != null && mime.isNotEmpty) 'mime': mime,
+          if (durationMs != null && durationMs > 0) 'duration_ms': durationMs,
+        }),
+      ),
+    );
+    return UploadHandle.fromJson(await _decode(res));
+  }
+
+  @override
+  Future<UploadHandle> uploadProgress(String uploadId) async {
+    final res = await _send(
+      () => http.get(
+        _uri('/api/uploads/$uploadId'),
+        headers: _headers(jsonBody: false),
+      ),
+    );
+    return UploadHandle.fromJson(await _decode(res));
+  }
+
+  @override
+  Future<UploadHandle> appendUploadChunk({
+    required String uploadId,
+    required int offset,
+    required List<int> bytes,
+  }) async {
+    final res = await _send(
+      () => http.patch(
+        _uri('/api/uploads/$uploadId', {'offset': '$offset'}),
+        headers: {
+          ..._headers(jsonBody: false),
+          'Content-Type': 'application/octet-stream',
+        },
+        body: bytes,
+      ),
+      timeout: _uploadTimeout,
+    );
+    // 409 is not a failure: it is the server saying where this upload actually
+    // is, which is exactly what a resend needs to hear.
+    if (res.statusCode == 409) {
+      throw UploadOffsetMismatch(_offsetFrom(res) ?? offset);
+    }
+    return UploadHandle.fromJson(await _decode(res));
+  }
+
+  @override
+  Future<ChatMessage> finishUpload({
+    required String uploadId,
+    File? thumbnail,
+    String? caption,
+    String? clientId,
+    int? replyToMessageId,
+  }) async {
+    final req = http.MultipartRequest(
+      'POST',
+      _uri('/api/uploads/$uploadId/complete'),
+    );
+    req.headers.addAll(_headers(jsonBody: false));
+    if (caption != null && caption.isNotEmpty) req.fields['caption'] = caption;
+    if (clientId != null) req.fields['client_id'] = clientId;
+    if (replyToMessageId != null) {
+      req.fields['reply_to_message_id'] = '$replyToMessageId';
+    }
+    if (thumbnail != null) {
+      req.files.add(
+        await http.MultipartFile.fromPath(
+          'thumbnail',
+          thumbnail.path,
+          filename: 'preview.jpg',
+        ),
+      );
+    }
+    final res = await _send(
+      () async => http.Response.fromStream(await req.send()),
+      timeout: _uploadTimeout,
+    );
+    if (res.statusCode == 409) {
+      throw UploadOffsetMismatch(_offsetFrom(res) ?? 0);
+    }
+    final data = await _decode(res);
+    return ChatMessage.fromJson(data, meId: meId);
+  }
+
+  @override
+  Future<void> abandonUpload(String uploadId) async {
+    await _send(
+      () => http.delete(
+        _uri('/api/uploads/$uploadId'),
+        headers: _headers(jsonBody: false),
+      ),
+    );
+  }
+
+  int? _offsetFrom(http.Response res) {
+    final header = res.headers['x-upload-offset'];
+    return header == null ? null : int.tryParse(header);
+  }
+
   /// Multipart needs a name; a path may be a content-provider temp file.
   String _uploadFilename(String path) {
     final slash = path.lastIndexOf(Platform.pathSeparator);
@@ -1188,6 +1324,19 @@ class ApiClient {
     return Conversation.fromJson(data);
   }
 
+  /// Sets this chat's shared attachment expiry (days).
+  Future<Conversation> setMediaTtl(int conversationId, int days) async {
+    final res = await _send(
+      () => http.patch(
+        _uri('/api/conversations/$conversationId/media-ttl'),
+        headers: _headers(),
+        body: jsonEncode({'days': days}),
+      ),
+    );
+    final data = await _decode(res);
+    return Conversation.fromJson(data);
+  }
+
   /// Sets a DM's anniversary date as `YYYY-MM-DD`; null clears it.
   Future<Conversation> setAnniversary(
     int conversationId,
@@ -1236,6 +1385,93 @@ class ApiClient {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(_userKey, jsonEncode(_userToJson(user)));
     return user;
+  }
+
+  Future<ChatMessage> retainMedia(int messageId) async {
+    final res = await _send(
+      () => http.put(
+        _uri('/api/messages/$messageId/retain'),
+        headers: _headers(jsonBody: false),
+      ),
+    );
+    final data = await _decode(res);
+    return ChatMessage.fromJson(data, meId: meId);
+  }
+
+  Future<ChatMessage> dropMediaRetain(int messageId) async {
+    final res = await _send(
+      () => http.delete(
+        _uri('/api/messages/$messageId/retain'),
+        headers: _headers(jsonBody: false),
+      ),
+    );
+    final data = await _decode(res);
+    return ChatMessage.fromJson(data, meId: meId);
+  }
+
+  Future<MediaPolicy> fetchMediaPolicy() async {
+    final res = await _send(
+      () => http.get(
+        _uri('/api/system/media-policy'),
+        headers: _headers(jsonBody: false),
+      ),
+    );
+    final data = await _decode(res);
+    return MediaPolicy.fromJson(data);
+  }
+
+  Future<MediaPolicy> setMyMediaTtl(int? days) async {
+    final res = await _send(
+      () => http.patch(
+        _uri('/api/users/me/media-ttl'),
+        headers: _headers(),
+        body: jsonEncode({'days': days}),
+      ),
+    );
+    final data = await _decode(res);
+    return MediaPolicy.fromJson(data);
+  }
+
+  Future<MediaPolicy> setServerMediaTtl(int days) async {
+    final res = await _send(
+      () => http.put(
+        _uri('/api/admin/media-ttl'),
+        headers: _headers(),
+        body: jsonEncode({'days': days}),
+      ),
+    );
+    final data = await _decode(res);
+    return MediaPolicy.fromJson(data);
+  }
+
+  Future<void> deleteConversation(
+    int conversationId, {
+    String scope = 'me',
+  }) async {
+    await _send(
+      () => http.delete(
+        _uri('/api/conversations/$conversationId', {'scope': scope}),
+        headers: _headers(jsonBody: false),
+      ),
+    ).then(_parse);
+  }
+
+  Future<void> blockUser(int userId) async {
+    await _send(
+      () => http.post(
+        _uri('/api/users/$userId/block'),
+        headers: _headers(jsonBody: false),
+      ),
+    ).then(_parse);
+  }
+
+  Future<void> unblockUser(int userId) async {
+    await _send(
+      () => http.delete(
+        _uri('/api/users/$userId/block'),
+        headers: _headers(jsonBody: false),
+      ),
+    ).then(_parse);
   }
 
   String? get wsUrl {

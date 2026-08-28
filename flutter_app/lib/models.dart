@@ -12,6 +12,9 @@ class ChatUser {
     this.hasAvatar = false,
     this.avatarVersion,
     this.mood,
+    this.onTailnet = true,
+    this.tailnetPending = false,
+    this.suspended = false,
   });
 
   final int id;
@@ -29,6 +32,16 @@ class ChatUser {
   /// A short private status a person shows only to their DM partners.
   final String? mood;
 
+  /// Bound to an active Tailscale identity (or membership is not enforced).
+  final bool onTailnet;
+
+  /// On the tailnet as far as anyone knows, but has not opened the app here
+  /// yet, so nothing has arrived from them to match to a device.
+  final bool tailnetPending;
+
+  /// Account preserved after the Tailscale identity left the tailnet.
+  final bool suspended;
+
   factory ChatUser.fromJson(Map<String, dynamic> json) {
     return ChatUser(
       id: json['id'] as int,
@@ -41,6 +54,9 @@ class ChatUser {
       mood: (json['mood'] as String?)?.trim().isEmpty ?? true
           ? null
           : (json['mood'] as String).trim(),
+      onTailnet: json['on_tailnet'] as bool? ?? true,
+      tailnetPending: json['tailnet_pending'] as bool? ?? false,
+      suspended: json['suspended'] as bool? ?? false,
     );
   }
 
@@ -51,6 +67,9 @@ class ChatUser {
     int? avatarVersion,
     String? mood,
     String? displayName,
+    bool? onTailnet,
+    bool? tailnetPending,
+    bool? suspended,
     bool clearAvatar = false,
     bool clearMood = false,
   }) {
@@ -63,6 +82,9 @@ class ChatUser {
       hasAvatar: clearAvatar ? false : (hasAvatar ?? this.hasAvatar),
       avatarVersion: clearAvatar ? null : (avatarVersion ?? this.avatarVersion),
       mood: clearMood ? null : (mood ?? this.mood),
+      onTailnet: onTailnet ?? this.onTailnet,
+      tailnetPending: tailnetPending ?? this.tailnetPending,
+      suspended: suspended ?? this.suspended,
     );
   }
 }
@@ -162,6 +184,47 @@ class QuotedMessage {
   );
 }
 
+class MediaRetainer {
+  const MediaRetainer({
+    required this.userId,
+    required this.username,
+    required this.displayName,
+  });
+
+  final int userId;
+  final String username;
+  final String displayName;
+
+  factory MediaRetainer.fromJson(Map<String, dynamic> json) => MediaRetainer(
+    userId: json['user_id'] as int,
+    username: json['username'] as String,
+    displayName: json['display_name'] as String,
+  );
+}
+
+class MediaPolicy {
+  const MediaPolicy({
+    required this.defaultDays,
+    required this.minDays,
+    required this.maxDays,
+    this.myDays,
+  });
+
+  final int defaultDays;
+  final int minDays;
+  final int maxDays;
+  final int? myDays;
+
+  int get effectiveDays => myDays ?? defaultDays;
+
+  factory MediaPolicy.fromJson(Map<String, dynamic> json) => MediaPolicy(
+    defaultDays: json['default_days'] as int? ?? 30,
+    minDays: json['min_days'] as int? ?? 1,
+    maxDays: json['max_days'] as int? ?? 365,
+    myDays: json['my_days'] as int?,
+  );
+}
+
 class ChatMessage {
   ChatMessage({
     required this.id,
@@ -180,6 +243,13 @@ class ChatMessage {
     this.editedAt,
     this.deletedAt,
     this.expiresAt,
+    this.mediaExpiresAt,
+    this.mediaTtlDays,
+    this.mediaGoneAt,
+    this.mediaGoneReason,
+    this.mediaAvailable = true,
+    this.retainedByMe = false,
+    this.retainers = const [],
     this.replyTo,
     this.receipts = const [],
     this.reactions = const [],
@@ -220,6 +290,25 @@ class ChatMessage {
   /// When a disappearing message will vanish, or null if it stays.
   final DateTime? expiresAt;
 
+  /// When the attachment is due to leave the server (independent of chat timers).
+  final DateTime? mediaExpiresAt;
+  final int? mediaTtlDays;
+  final DateTime? mediaGoneAt;
+  final String? mediaGoneReason;
+  final bool mediaAvailable;
+  final bool retainedByMe;
+  final List<MediaRetainer> retainers;
+
+  bool get isMediaType =>
+      type == 'image' ||
+      type == 'video' ||
+      type == 'file' ||
+      type == 'voice' ||
+      type == 'doodle';
+
+  bool get mediaGone =>
+      isMediaType && (mediaGoneAt != null || !mediaAvailable);
+
   /// The message this one replies to, or null for a normal message.
   final QuotedMessage? replyTo;
   final List<Receipt> receipts;
@@ -238,6 +327,8 @@ class ChatMessage {
 
   /// True for a call-log entry ("Video call · 21 secs" / "Missed call").
   bool get isCallLog => type == 'call';
+
+  bool get isMediaTtlNotice => type == 'media_ttl';
 
   static List<ReactionAgg> _reactionsFrom(dynamic raw, {int? meId}) {
     final list = raw as List<dynamic>? ?? const [];
@@ -266,6 +357,15 @@ class ChatMessage {
       editedAt: tryParseServerTime(json['edited_at'] as String?),
       deletedAt: tryParseServerTime(json['deleted_at'] as String?),
       expiresAt: tryParseServerTime(json['expires_at'] as String?),
+      mediaExpiresAt: tryParseServerTime(json['media_expires_at'] as String?),
+      mediaTtlDays: json['media_ttl_days'] as int?,
+      mediaGoneAt: tryParseServerTime(json['media_gone_at'] as String?),
+      mediaGoneReason: json['media_gone_reason'] as String?,
+      mediaAvailable: json['media_available'] as bool? ?? true,
+      retainedByMe: json['retained_by_me'] as bool? ?? false,
+      retainers: (json['retainers'] as List<dynamic>? ?? [])
+          .map((e) => MediaRetainer.fromJson(e as Map<String, dynamic>))
+          .toList(),
       replyTo: reply == null ? null : QuotedMessage.fromJson(reply),
       receipts: receiptsJson
           .map((e) => Receipt.fromJson(e as Map<String, dynamic>))
@@ -289,6 +389,13 @@ class ChatMessage {
     DateTime? editedAt,
     DateTime? deletedAt,
     DateTime? expiresAt,
+    DateTime? mediaExpiresAt,
+    int? mediaTtlDays,
+    DateTime? mediaGoneAt,
+    String? mediaGoneReason,
+    bool? mediaAvailable,
+    bool? retainedByMe,
+    List<MediaRetainer>? retainers,
     QuotedMessage? replyTo,
     List<Receipt>? receipts,
     List<ReactionAgg>? reactions,
@@ -315,6 +422,13 @@ class ChatMessage {
       editedAt: clearEditedAt ? null : (editedAt ?? this.editedAt),
       deletedAt: clearDeletedAt ? null : (deletedAt ?? this.deletedAt),
       expiresAt: expiresAt ?? this.expiresAt,
+      mediaExpiresAt: mediaExpiresAt ?? this.mediaExpiresAt,
+      mediaTtlDays: mediaTtlDays ?? this.mediaTtlDays,
+      mediaGoneAt: mediaGoneAt ?? this.mediaGoneAt,
+      mediaGoneReason: mediaGoneReason ?? this.mediaGoneReason,
+      mediaAvailable: mediaAvailable ?? this.mediaAvailable,
+      retainedByMe: retainedByMe ?? this.retainedByMe,
+      retainers: retainers ?? this.retainers,
       replyTo: replyTo ?? this.replyTo,
       receipts: receipts ?? this.receipts,
       reactions: reactions ?? this.reactions,
@@ -491,6 +605,12 @@ class Conversation {
     this.disappearAfterSeconds,
     this.anniversaryOn,
     this.streakDays = 0,
+    this.unreachable = false,
+    this.removed = false,
+    this.notOnTailnet = false,
+    this.serverAccessRevoked = false,
+    this.tailnetPending = false,
+    this.mediaTtlDays,
   });
 
   final int id;
@@ -516,6 +636,25 @@ class Conversation {
 
   /// Consecutive days both people messaged (DMs only).
   final int streakDays;
+
+  /// Unused for inbox copy. Older servers sent this for long-offline peers.
+  final bool unreachable;
+
+  /// This pair blocked each other in-app.
+  final bool removed;
+
+  /// Peer is not an active bound member of this tailnet.
+  final bool notOnTailnet;
+
+  /// Their accepted external share of the server device was revoked.
+  final bool serverAccessRevoked;
+
+  /// Peer has never connected over the tailnet, so the server knows nothing
+  /// about them yet. Unreachable, but not gone.
+  final bool tailnetPending;
+
+  /// Shared attachment expiry for this chat.
+  final int? mediaTtlDays;
 
   /// True for the signed-in person's private Saved messages vault.
   bool get isNotes => type == 'notes';
@@ -561,6 +700,12 @@ class Conversation {
       disappearAfterSeconds: json['disappear_after_seconds'] as int?,
       anniversaryOn: json['anniversary_on'] as String?,
       streakDays: json['streak_days'] as int? ?? 0,
+      unreachable: json['unreachable'] as bool? ?? false,
+      removed: json['removed'] as bool? ?? false,
+      notOnTailnet: json['not_on_tailnet'] as bool? ?? false,
+      serverAccessRevoked: json['server_access_revoked'] as bool? ?? false,
+      tailnetPending: json['tailnet_pending'] as bool? ?? false,
+      mediaTtlDays: json['media_ttl_days'] as int?,
     );
   }
 }

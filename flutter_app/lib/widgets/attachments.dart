@@ -3,6 +3,7 @@ import 'dart:math' as math;
 
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 
 import '../app_state.dart';
@@ -13,6 +14,58 @@ import '../services/media_store.dart';
 import '../services/voice_player.dart';
 import '../theme.dart';
 import 'media_shape.dart';
+
+/// Edge-to-edge while chrome is up; nothing but the picture when it is away.
+void applyMediaViewerSystemBars({required bool hidden}) {
+  SystemChrome.setEnabledSystemUIMode(
+    hidden ? SystemUiMode.immersiveSticky : SystemUiMode.edgeToEdge,
+  );
+}
+
+/// Top actions and captions over a full-screen photo, video, or doodle.
+///
+/// Fades out and stops receiving taps while the viewer chrome is hidden.
+class MediaViewerChrome extends StatelessWidget {
+  const MediaViewerChrome({
+    super.key,
+    required this.shown,
+    required this.child,
+  });
+
+  final bool shown;
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    return IgnorePointer(
+      key: const Key('media-viewer-chrome'),
+      ignoring: !shown,
+      child: AnimatedOpacity(
+        opacity: shown ? 1 : 0,
+        duration: const Duration(milliseconds: 180),
+        child: child,
+      ),
+    );
+  }
+}
+
+/// Tap layer for viewers where pinch and pan live underneath.
+class MediaViewerChromeToggle extends StatelessWidget {
+  const MediaViewerChromeToggle({super.key, required this.onTap});
+
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return Positioned.fill(
+      child: GestureDetector(
+        key: const Key('media-viewer-chrome-toggle'),
+        behavior: HitTestBehavior.opaque,
+        onTap: onTap,
+      ),
+    );
+  }
+}
 
 /// "1.4 MB" — short enough to sit under a file name.
 String formatFileSize(int? bytes) {
@@ -144,39 +197,58 @@ mixin _DownloadState<T extends StatefulWidget> on State<T> {
 /// Open / save / share actions for attachment messages.
 enum AttachmentAction { open, save, share }
 
-bool messageHasAttachmentActions(ChatMessage msg) =>
-    !msg.isDeleted &&
-    (msg.type == 'image' ||
-        msg.type == 'video' ||
-        msg.type == 'doodle' ||
-        msg.type == 'voice' ||
-        msg.type == 'file');
+bool messageHasAttachmentActions(ChatMessage msg, {bool keptOnPhone = false}) {
+  if (msg.isDeleted) return false;
+  if (msg.type != 'image' &&
+      msg.type != 'video' &&
+      msg.type != 'doodle' &&
+      msg.type != 'voice' &&
+      msg.type != 'file') {
+    return false;
+  }
+  if (msg.mediaGone && !keptOnPhone) return false;
+  return true;
+}
 
 Future<void> runAttachmentAction(
   BuildContext context,
   ChatMessage msg,
   AttachmentAction action,
 ) async {
-  final store = context.read<AppState>().media;
+  final state = context.read<AppState>();
+  final store = state.media;
   final cached = await store.cached(msg);
   if (cached == null && context.mounted) {
     _toast(context, 'Downloading ${msg.mediaName ?? 'attachment'}…');
   }
 
+  var reachedSystemUi = false;
+  await state.tailscale.noteTransfer(true);
+  await state.tailscale.noteExpectReturn(true);
   try {
     switch (action) {
       case AttachmentAction.open:
         await store.openExternally(msg);
+        reachedSystemUi = true;
       case AttachmentAction.save:
         final outcome = await store.saveToDevice(msg);
+        reachedSystemUi = true;
         if (outcome == SaveOutcome.saved && context.mounted) {
           _toast(context, 'Saved to your phone');
         }
       case AttachmentAction.share:
         await store.share(msg);
+        reachedSystemUi = true;
     }
   } catch (error) {
     if (context.mounted) _report(context, error);
+  } finally {
+    await state.tailscale.noteTransfer(false);
+    // Successful Open/Save/Share returns through Android's lifecycle, whose
+    // onResume clears expect-return. If preparation failed before any system UI
+    // was reached, clear it here so a later real Home press is not mistaken for
+    // an attachment picker.
+    if (!reachedSystemUi) await state.tailscale.noteExpectReturn(false);
   }
 }
 
@@ -493,11 +565,18 @@ class ImageViewerScreen extends StatefulWidget {
 class _ImageViewerScreenState extends State<ImageViewerScreen> {
   final _transform = TransformationController();
   TapDownDetails? _doubleTap;
+  bool _chromeHidden = false;
 
   ChatMessage get message => widget.message;
 
+  void _toggleChrome() {
+    setState(() => _chromeHidden = !_chromeHidden);
+    applyMediaViewerSystemBars(hidden: _chromeHidden);
+  }
+
   @override
   void dispose() {
+    if (_chromeHidden) applyMediaViewerSystemBars(hidden: false);
     _transform.dispose();
     super.dispose();
   }
@@ -518,43 +597,18 @@ class _ImageViewerScreenState extends State<ImageViewerScreen> {
     final state = context.read<AppState>();
     final caption = readableBody(message.body)?.trim() ?? '';
 
+    final chromeShown = !_chromeHidden;
+
     return Scaffold(
       backgroundColor: Colors.black,
-      appBar: AppBar(
-        backgroundColor: Colors.black,
-        foregroundColor: Colors.white,
-        surfaceTintColor: Colors.black,
-        title: Text(
-          message.mediaName ?? 'Photo',
-          style: const TextStyle(fontSize: 15, color: Colors.white),
-          overflow: TextOverflow.ellipsis,
-        ),
-        actions: [
-          if (widget.onShowInChat != null)
-            IconButton(
-              tooltip: 'Show in chat',
-              onPressed: widget.onShowInChat,
-              icon: const Icon(Icons.chat_bubble_outline_rounded),
-            ),
-          IconButton(
-            tooltip: 'Save to phone',
-            onPressed: () => _save(context),
-            icon: const Icon(Icons.download_rounded),
-          ),
-          IconButton(
-            tooltip: 'Share',
-            onPressed: () => _share(context),
-            icon: const Icon(Icons.share_outlined),
-          ),
-        ],
-      ),
-      body: Column(
+      body: Stack(
+        fit: StackFit.expand,
         children: [
-          Expanded(
+          Positioned.fill(
             child: GestureDetector(
+              key: const Key('media-viewer-chrome-toggle'),
               behavior: HitTestBehavior.opaque,
-              onDoubleTapDown: (details) => _doubleTap = details,
-              onDoubleTap: _onDoubleTap,
+              onTap: _toggleChrome,
               child: InteractiveViewer(
                 transformationController: _transform,
                 minScale: 1,
@@ -562,20 +616,24 @@ class _ImageViewerScreenState extends State<ImageViewerScreen> {
                 panEnabled: true,
                 scaleEnabled: true,
                 boundaryMargin: const EdgeInsets.all(80),
-                child: Center(
-                  child: Hero(
-                    tag: 'media-hero-${message.id}',
-                    child: Image(
-                      image: CachedNetworkImageProvider(
-                        state.api.mediaUrl(message.id),
-                        headers: state.api.imageAuthHeaders,
-                      ),
-                      errorBuilder: (context, _, _) => const Padding(
-                        padding: EdgeInsets.all(24),
-                        child: Text(
-                          "This photo couldn't be loaded from the server.",
-                          style: TextStyle(color: Colors.white70),
-                          textAlign: TextAlign.center,
+                child: GestureDetector(
+                  onDoubleTapDown: (details) => _doubleTap = details,
+                  onDoubleTap: _onDoubleTap,
+                  child: Center(
+                    child: Hero(
+                      tag: 'media-hero-${message.id}',
+                      child: Image(
+                        image: CachedNetworkImageProvider(
+                          state.api.mediaUrl(message.id),
+                          headers: state.api.imageAuthHeaders,
+                        ),
+                        errorBuilder: (context, _, _) => const Padding(
+                          padding: EdgeInsets.all(24),
+                          child: Text(
+                            "This photo couldn't be loaded from the server.",
+                            style: TextStyle(color: Colors.white70),
+                            textAlign: TextAlign.center,
+                          ),
                         ),
                       ),
                     ),
@@ -584,14 +642,38 @@ class _ImageViewerScreenState extends State<ImageViewerScreen> {
               ),
             ),
           ),
-          if (caption.isNotEmpty)
-            Padding(
-              padding: const EdgeInsets.fromLTRB(20, 12, 20, 24),
-              child: Text(
-                caption,
-                style: const TextStyle(color: Colors.white, height: 1.4),
+          MediaViewerChrome(
+            shown: chromeShown,
+            child: SafeArea(
+              child: Stack(
+                children: [
+                  Align(
+                    alignment: Alignment.topCenter,
+                    child: MediaViewerTopBar(
+                      title: message.mediaName ?? 'Photo',
+                      onShowInChat: widget.onShowInChat,
+                      onSave: () => _save(context),
+                      onShare: () => _share(context),
+                    ),
+                  ),
+                  if (caption.isNotEmpty)
+                    Align(
+                      alignment: Alignment.bottomCenter,
+                      child: Padding(
+                        padding: const EdgeInsets.fromLTRB(20, 12, 20, 24),
+                        child: Text(
+                          caption,
+                          style: const TextStyle(
+                            color: Colors.white,
+                            height: 1.4,
+                          ),
+                        ),
+                      ),
+                    ),
+                ],
               ),
             ),
+          ),
         ],
       ),
     );
@@ -616,6 +698,62 @@ class _ImageViewerScreenState extends State<ImageViewerScreen> {
     } catch (error) {
       if (context.mounted) _report(context, error);
     }
+  }
+}
+
+/// Back, title, and save/share actions shared by full-screen media viewers.
+class MediaViewerTopBar extends StatelessWidget {
+  const MediaViewerTopBar({
+    super.key,
+    required this.title,
+    this.onShowInChat,
+    this.onSave,
+    required this.onShare,
+    this.saveAction,
+  });
+
+  final String title;
+  final VoidCallback? onShowInChat;
+  final VoidCallback? onSave;
+  final VoidCallback onShare;
+  final Widget? saveAction;
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: Colors.black,
+      child: Row(
+        children: [
+          const BackButton(color: Colors.white),
+          Expanded(
+            child: Text(
+              title,
+              style: const TextStyle(fontSize: 15, color: Colors.white),
+              overflow: TextOverflow.ellipsis,
+            ),
+          ),
+          if (onShowInChat != null)
+            IconButton(
+              tooltip: 'Show in chat',
+              onPressed: onShowInChat,
+              icon: const Icon(Icons.chat_bubble_outline_rounded),
+            ),
+          if (saveAction != null)
+            saveAction!
+          else if (onSave != null)
+            IconButton(
+              tooltip: 'Save to phone',
+              onPressed: onSave,
+              icon: const Icon(Icons.download_rounded),
+            ),
+          IconButton(
+            tooltip: 'Share',
+            onPressed: onShare,
+            icon: const Icon(Icons.share_outlined),
+          ),
+        ],
+      ),
+    );
   }
 }
 

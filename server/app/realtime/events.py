@@ -12,6 +12,7 @@ from app.image_shape import media_pixel_size
 from app.models import Conversation, ConversationMember, Message, User
 from app.schemas import (
     ConversationOut,
+    MediaRetainerOut,
     MemberOut,
     MessageOut,
     QuotedMessage,
@@ -54,7 +55,19 @@ def aggregate_reactions(
     return result
 
 
-def user_out(user: User, is_online: bool = False) -> UserOut:
+def user_out(user: User, is_online: bool = False, db=None) -> UserOut:
+    session = db
+    if session is None:
+        from sqlalchemy.orm import object_session
+
+        session = object_session(user)
+    on_tailnet = True
+    pending = False
+    if session is not None:
+        from app.tailscale_membership import peer_is_pending, peer_left_tailnet
+
+        on_tailnet = not peer_left_tailnet(session, user)
+        pending = on_tailnet and peer_is_pending(session, user)
     return UserOut(
         id=user.id,
         username=user.username,
@@ -64,6 +77,9 @@ def user_out(user: User, is_online: bool = False) -> UserOut:
         has_avatar=has_avatar(user),
         avatar_version=avatar_version_for(user),
         mood=user.mood,
+        on_tailnet=on_tailnet,
+        tailnet_pending=pending,
+        suspended=user.suspended_at is not None,
     )
 
 
@@ -121,6 +137,21 @@ def message_out(
     deleted = message.deleted_at is not None
     reactions = aggregate_reactions(message, viewer_id)
     shape = None if deleted else preview_pixel_size(message)
+    from sqlalchemy.orm import object_session
+
+    from app.media_retention import media_is_available, retainers_for
+
+    session = object_session(message)
+    retainers = retainers_for(session, message.id) if session is not None else []
+    retainer_outs = [
+        MediaRetainerOut(
+            user_id=user.id,
+            username=user.username,
+            display_name=user.display_name,
+        )
+        for user in retainers
+    ]
+    available = (not deleted) and media_is_available(message)
     return MessageOut(
         id=message.id,
         conversation_id=message.conversation_id,
@@ -138,6 +169,14 @@ def message_out(
         edited_at=None if deleted else message.edited_at,
         deleted_at=message.deleted_at,
         expires_at=message.expires_at,
+        media_expires_at=None if deleted else message.media_expires_at,
+        media_ttl_days=None if deleted else message.media_ttl_days,
+        media_gone_at=None if deleted else message.media_gone_at,
+        media_gone_reason=None if deleted else message.media_gone_reason,
+        media_available=available,
+        retained_by_me=viewer_id is not None
+        and any(user.id == viewer_id for user in retainers),
+        retainers=[] if deleted else retainer_outs,
         reply_to=quoted_message(message.reply_to),
         receipts=receipts,
         reactions=reactions,
@@ -172,11 +211,11 @@ def conversation_out(
     )
     last_preview = None
     updated_at = conv.created_at
+    receipt_level = None
     if last:
         from app.schemas import MessagePreview
         from app.services import outgoing_receipt_level_for_message
 
-        receipt_level = None
         # A call-log row describes an outcome; it is not content the peer can
         # "read". Call logs share message storage and receipts for transport,
         # but exporting that level makes clients display a false read claim.
@@ -218,6 +257,32 @@ def conversation_out(
     elif conv.type == "notes":
         title = "Saved messages"
 
+    unreachable = False
+    removed = False
+    if conv.type == "dm" and peer_user is not None:
+        from app.contact_sever import is_blocked
+
+        removed = is_blocked(db, viewer.id, peer_user.id)
+
+    not_on_tailnet = False
+    server_access_revoked = False
+    tailnet_pending = False
+    if conv.type == "dm" and peer_user is not None and not removed:
+        from app.tailscale_membership import (
+            peer_is_pending,
+            peer_left_tailnet,
+            peer_server_access_revoked,
+        )
+
+        server_access_revoked = peer_server_access_revoked(peer_user)
+        not_on_tailnet = (
+            not server_access_revoked and peer_left_tailnet(db, peer_user)
+        )
+        tailnet_pending = (
+            not server_access_revoked
+            and not not_on_tailnet
+            and peer_is_pending(db, peer_user)
+        )
     return ConversationOut(
         id=conv.id,
         type=conv.type,
@@ -233,6 +298,12 @@ def conversation_out(
         disappear_after_seconds=conv.disappear_after_seconds,
         anniversary_on=conv.anniversary_on if conv.type == "dm" else None,
         streak_days=compute_dm_streak(db, conv) if conv.type == "dm" else 0,
+        unreachable=unreachable,
+        removed=removed,
+        not_on_tailnet=not_on_tailnet,
+        server_access_revoked=server_access_revoked,
+        tailnet_pending=tailnet_pending,
+        media_ttl_days=conv.media_ttl_days,
     )
 
 
@@ -298,6 +369,11 @@ def event_pins_changed(conversation_id: int) -> dict:
 def event_stars_changed() -> dict:
     """Tell one user their private starred list changed (sent via send_to_user)."""
     return {"type": "stars.changed"}
+
+
+def event_membership_changed() -> dict:
+    """Directory and inbox must refresh: someone joined or left the tailnet."""
+    return {"type": "membership.changed"}
 
 
 def event_user_updated(user: User, *, is_online: bool = False) -> dict:

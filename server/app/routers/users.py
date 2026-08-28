@@ -23,7 +23,14 @@ from app.deps import get_current_user
 from app.models import User, utcnow
 from app.realtime.events import user_out
 from app.realtime.hub import hub
-from app.schemas import DisplayNameRequest, MoodRequest, UserOut
+from app.schemas import (
+    BlockOut,
+    DisplayNameRequest,
+    MediaPolicyOut,
+    MediaTtlRequest,
+    MoodRequest,
+    UserOut,
+)
 from app.services import broadcast_user_updated, set_user_display_name, set_user_mood
 
 router = APIRouter(prefix="/api/users", tags=["users"])
@@ -40,7 +47,13 @@ def list_users(
         term = f"%{q.strip()}%"
         stmt = stmt.where(or_(User.username.ilike(term), User.display_name.ilike(term)))
     users = db.scalars(stmt.order_by(User.username).limit(50)).all()
-    return [user_out(u, is_online=hub.is_online(u.id)) for u in users]
+    from app.tailscale_membership import user_is_listable
+
+    return [
+        user_out(u, is_online=hub.is_online(u.id), db=db)
+        for u in users
+        if user_is_listable(db, u)
+    ]
 
 
 @router.get("/by-username/{username}", response_model=UserOut)
@@ -157,3 +170,63 @@ async def get_user_avatar(
         media_type=avatar_media_type(user.avatar_path),
         content_disposition_type="inline",
     )
+
+
+@router.patch("/me/media-ttl", response_model=MediaPolicyOut)
+def set_my_media_ttl(
+    body: MediaTtlRequest,
+    db: Session = Depends(get_db),
+    current: User = Depends(get_current_user),
+) -> MediaPolicyOut:
+    """How long this person's new attachments stay on the server."""
+    from app.media_retention import load_policy
+
+    policy = load_policy(db)
+    if body.days is None:
+        current.media_ttl_days = None
+    else:
+        current.media_ttl_days = policy.clamp(body.days)
+    db.commit()
+    db.refresh(current)
+    return MediaPolicyOut(
+        default_days=policy.default_days,
+        min_days=policy.min_days,
+        max_days=policy.max_days,
+        my_days=current.media_ttl_days,
+    )
+
+
+@router.post("/{user_id}/block", response_model=BlockOut)
+async def block_user(
+    user_id: int,
+    db: Session = Depends(get_db),
+    current: User = Depends(get_current_user),
+) -> BlockOut:
+    from app.contact_sever import set_block
+
+    other = db.get(User, user_id)
+    if other is None:
+        raise HTTPException(status_code=404, detail="That user isn't on this server anymore.")
+    try:
+        await set_block(db, actor=current, other=other, blocked=True)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return BlockOut(blocked=True, user_id=user_id)
+
+
+@router.delete("/{user_id}/block", response_model=BlockOut)
+async def unblock_user(
+    user_id: int,
+    db: Session = Depends(get_db),
+    current: User = Depends(get_current_user),
+) -> BlockOut:
+    from app.contact_sever import set_block
+
+    other = db.get(User, user_id)
+    if other is None:
+        raise HTTPException(status_code=404, detail="That user isn't on this server anymore.")
+    try:
+        await set_block(db, actor=current, other=other, blocked=False)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return BlockOut(blocked=False, user_id=user_id)

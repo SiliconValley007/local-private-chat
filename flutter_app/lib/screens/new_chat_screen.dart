@@ -181,7 +181,12 @@ class _NewChatScreenState extends State<NewChatScreen> {
                             c.username,
                             c.displayName,
                           );
+                          final onTailnet = state.users.any(
+                            (u) =>
+                                u.id == c.userId || u.username == c.username,
+                          );
                           return ListTile(
+                            enabled: onTailnet,
                             leading: Avatar(
                               name: shown,
                               seed: c.username,
@@ -191,9 +196,11 @@ class _NewChatScreenState extends State<NewChatScreen> {
                             ),
                             title: Text(shown),
                             subtitle: Text(
-                              state.hasCustomName(c.username)
-                                  ? '@${c.username} · really ${c.displayName}'
-                                  : '@${c.username}',
+                              onTailnet
+                                  ? (state.hasCustomName(c.username)
+                                        ? '@${c.username} · really ${c.displayName}'
+                                        : '@${c.username}')
+                                  : 'Not on this tailnet',
                             ),
                             trailing: IconButton(
                               tooltip: 'Rename',
@@ -206,20 +213,24 @@ class _NewChatScreenState extends State<NewChatScreen> {
                                 serverName: c.displayName,
                               ),
                             ),
-                            onTap: () async {
-                              try {
-                                final user = await state.resolveUsername(
-                                  c.username,
-                                );
-                                await _openUser(user);
-                              } catch (e) {
-                                setState(() => _error = friendlyMessage(e));
-                              }
-                            },
+                            onTap: onTailnet
+                                ? () async {
+                                    try {
+                                      final user = await state.resolveUsername(
+                                        c.username,
+                                      );
+                                      await _openUser(user);
+                                    } catch (e) {
+                                      setState(
+                                        () => _error = friendlyMessage(e),
+                                      );
+                                    }
+                                  }
+                                : null,
                           );
                         }),
                       ],
-                      _SectionLabel('On this server'),
+                      _SectionLabel('Available on this tailnet'),
                       if (state.users.isEmpty)
                         const Padding(
                           padding: EdgeInsets.all(24),
@@ -247,7 +258,10 @@ class _NewChatScreenState extends State<NewChatScreen> {
                             subtitle: Text(
                               '@${u.username}'
                               '${state.hasCustomName(u.username) ? ' · really ${u.displayName}' : ''}'
-                              '${online ? ' · online' : ''}',
+                              '${online ? ' · online' : ''}'
+                              // Startable, and honest about the wait: their
+                              // first sign-in here is what delivers anything.
+                              '${u.tailnetPending ? ' · has not opened the app yet' : ''}',
                             ),
                             trailing: IconButton(
                               tooltip: 'Save contact',

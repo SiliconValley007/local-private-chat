@@ -21,6 +21,13 @@ class MainActivity : FlutterFragmentActivity() {
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+        // Opening the app means the user wants the tunnel up, so nothing here
+        // may broadcast DISCONNECT_VPN: it races the CONNECT sent moments later
+        // and arms the exit guard that then refuses it, which leaves the tunnel
+        // running with nobody claiming it. A leftover tunnel from a previous run
+        // keeps its durable OWNED phase, so this run still closes it on exit.
+        // Only the stale away-clock is cleared, before any policy reads it.
+        TailscaleExit.noteActivityResumed(this)
 
         incomingChannel =
             MethodChannel(flutterEngine.dartExecutor.binaryMessenger, IncomingIntents.CHANNEL)
@@ -129,6 +136,45 @@ class MainActivity : FlutterFragmentActivity() {
                     "noteTransfer" -> {
                         val active = call.argument<Boolean>("active") ?: false
                         AppForeground.noteTransfer(active)
+                        result.success(null)
+                    }
+                    "noteExpectReturn" -> {
+                        val active = call.argument<Boolean>("active") ?: false
+                        AppForeground.noteExpectReturn(active)
+                        result.success(null)
+                    }
+                    "noteCall" -> {
+                        val active = call.argument<Boolean>("active") ?: false
+                        AppForeground.noteCall(active)
+                        result.success(null)
+                    }
+                    "getTunnelLog" -> result.success(TailscaleExit.readEventLog(this))
+                    else -> result.notImplemented()
+                }
+            }
+
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "local_chat/upload_notice")
+            .setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "show" -> {
+                        UploadService.show(
+                            this,
+                            call.argument<String>("title"),
+                            (call.argument<Number>("sent") ?: 0).toLong(),
+                            (call.argument<Number>("total") ?: 0).toLong(),
+                            call.argument<Int>("count") ?: 1,
+                        )
+                        result.success(null)
+                    }
+                    "stop" -> {
+                        UploadService.stop(this)
+                        result.success(null)
+                    }
+                    // Polled between pieces of a send: the Cancel button lives in a
+                    // notification, so the answer has to come back across here.
+                    "cancelRequested" -> result.success(UploadService.cancelRequested)
+                    "clearCancel" -> {
+                        UploadService.clearCancel()
                         result.success(null)
                     }
                     else -> result.notImplemented()
@@ -267,6 +313,7 @@ class MainActivity : FlutterFragmentActivity() {
     override fun onResume() {
         super.onResume()
         AppForeground.markResumed()
+        TailscaleExit.noteActivityResumed(this)
         // The user is back, so the background timer that would have dropped the
         // tunnel is no longer wanted.
         TailscaleIdleExit.cancel(this)
@@ -276,12 +323,76 @@ class MainActivity : FlutterFragmentActivity() {
         TailscaleGuardService.watch(this)
     }
 
+    /**
+     * Deliberate Home/app-switch happens here while our process is still in the
+     * foreground and allowed to deliver the explicit Tailscale broadcast.
+     *
+     * Waiting for onStop was not sufficient on the target phone: the recording
+     * shows an OWNED tunnel and an enabled exit rule, followed by Home, yet the
+     * tunnel is still connected five seconds later. A delayed Recents swipe can
+     * then freeze/kill the process before onTaskRemoved or the alarm gets a turn.
+     * This hook closes the tunnel before entering that unreliable lifecycle
+     * window. onStop and the alarm remain idempotent fallbacks.
+     */
+    override fun onUserLeaveHint() {
+        disconnectOwnedTunnelForExit(
+            reason = "user left the app",
+            changingConfigurations = false,
+            authoritative = true,
+        )
+        super.onUserLeaveHint()
+    }
+
     override fun onStop() {
         AppForeground.markStopped()
-        // Belt to the guard's braces: an alarm for the case this process is gone
-        // before the guard's own countdown gets there.
+        TailscaleExit.noteActivityStopped(this)
+        // The tunnel goes now, not in half a minute. This is the last code
+        // Android promises to run: a cached process can be frozen a moment
+        // later, taking the guard's countdown and its handler with it.
+        disconnectOwnedTunnelForExit(
+            reason = "left the app",
+            changingConfigurations = isChangingConfigurations,
+            authoritative = false,
+        )
+        // Belt to the guard's braces: an alarm for the cases skipped above, and
+        // one later retry if Tailscale ignored the broadcast just sent.
         if (!isFinishing) TailscaleIdleExit.arm(this)
         super.onStop()
+    }
+
+    private fun disconnectOwnedTunnelForExit(
+        reason: String,
+        changingConfigurations: Boolean,
+        authoritative: Boolean,
+    ) {
+        val snap = TailscaleExit.readOwnership(this)
+        val keepTunnelAlive = AppForeground.keepTunnelAlive()
+        val expectingReturn = AppForeground.expectingReturn()
+        if (TailscaleExitPolicy.shouldDisconnectOnLeavingApp(
+                enabled = snap.enabled,
+                phase = snap.phase,
+                changingConfigurations = changingConfigurations,
+                keepTunnelAlive = keepTunnelAlive,
+                expectingReturn = expectingReturn,
+            )
+        ) {
+            // onUserLeaveHint is the foreground delivery. onStop is the fallback
+            // and shares the ordinary debounce so the two adjacent hooks do not
+            // spam Tailscale's receiver. Resume clears the old debounce stamp,
+            // therefore onStop still sends when user-leave was not delivered.
+            TailscaleExit.disconnectIfAllowed(this, reason, authoritative)
+            return
+        }
+        TailscaleExit.noteExitSkipped(
+            this,
+            reason = reason,
+            enabled = snap.enabled,
+            phase = snap.phase,
+            changingConfigurations = changingConfigurations,
+            callActive = AppForeground.callStillActive(),
+            transferActive = AppForeground.transferStillActive(),
+            expectingReturn = expectingReturn,
+        )
     }
 
     override fun onDestroy() {
@@ -301,7 +412,7 @@ class MainActivity : FlutterFragmentActivity() {
                 // onStop deliberately skips arming while isFinishing, so make
                 // sure even a direct close from the foreground gets a fallback.
                 TailscaleIdleExit.arm(this)
-                TailscaleExit.disconnectIfAllowed(this, "activity finishing")
+                TailscaleExit.disconnectIfAllowed(this, "activity finishing", authoritative = true)
                 // Do not cancel the background alarm here. DISCONNECT_VPN has
                 // no acknowledgement, so that later delivery is the fallback
                 // if Tailscale ignored this immediate best-effort broadcast.

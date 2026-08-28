@@ -22,7 +22,9 @@ from app.schemas import (
     ConversationOut,
     CreateDmRequest,
     CreateGroupRequest,
+    DeleteConversationOut,
     DisappearingRequest,
+    MediaTtlDaysRequest,
     MemberOut,
     NudgeOut,
     WallpaperDimRequest,
@@ -37,6 +39,7 @@ from app.services import (
     set_anniversary,
     set_conversation_wallpaper,
     set_disappearing,
+    set_media_ttl,
     update_wallpaper_dim,
 )
 from app.wallpapers import (
@@ -73,7 +76,10 @@ def list_conversations(
     current: User = Depends(get_current_user),
 ) -> list[ConversationOut]:
     conv_ids = db.scalars(
-        select(ConversationMember.conversation_id).where(ConversationMember.user_id == current.id)
+        select(ConversationMember.conversation_id).where(
+            ConversationMember.user_id == current.id,
+            ConversationMember.hidden_at.is_(None),
+        )
     ).all()
     if not conv_ids:
         return []
@@ -106,16 +112,28 @@ async def create_or_get_dm(
             status_code=404,
             detail="That user isn't on this server anymore.",
         )
+    from app.contact_sever import is_blocked, unhide_membership
+
+    if is_blocked(db, current.id, other.id):
+        raise HTTPException(
+            status_code=403,
+            detail="This contact was removed. You can't start a chat.",
+        )
 
     a, b = sorted([current.id, body.user_id])
     dm_key = f"{a}:{b}"
     existing = db.scalar(select(Conversation).where(Conversation.dm_key == dm_key))
     if existing:
+        unhide_membership(db, conversation_id=existing.id, user_id=current.id)
+        db.commit()
         conv = _load_conv(db, existing.id)
         assert conv is not None
         return _conversation_out(db, conv, current)
 
     conv = Conversation(type="dm", title=None, dm_key=dm_key, created_by=current.id)
+    from app.media_retention import ttl_days_for_sender
+
+    conv.media_ttl_days = ttl_days_for_sender(db, current)
     db.add(conv)
     db.flush()
     db.add(ConversationMember(conversation_id=conv.id, user_id=current.id, role="member"))
@@ -396,6 +414,22 @@ async def patch_disappearing(
     return _conversation_out(db, conv, current)
 
 
+@router.patch("/{conversation_id}/media-ttl", response_model=ConversationOut)
+async def patch_media_ttl(
+    conversation_id: int,
+    body: MediaTtlDaysRequest,
+    db: Session = Depends(get_db),
+    current: User = Depends(get_current_user),
+) -> ConversationOut:
+    conv = await set_media_ttl(
+        db,
+        conversation_id=conversation_id,
+        user=current,
+        days=body.days,
+    )
+    return _conversation_out(db, conv, current)
+
+
 @router.patch("/{conversation_id}/anniversary", response_model=ConversationOut)
 async def patch_anniversary(
     conversation_id: int,
@@ -448,3 +482,26 @@ def list_nudges(
         payload = nudge_out(row, sender)
         out.append(NudgeOut.model_validate(payload))
     return out
+
+
+@router.delete("/{conversation_id}", response_model=DeleteConversationOut)
+async def delete_conversation(
+    conversation_id: int,
+    scope: str = Query(default="me"),
+    db: Session = Depends(get_db),
+    current: User = Depends(get_current_user),
+) -> DeleteConversationOut:
+    """Remove this chat from the inbox. everyone also clears a DM for both people."""
+    from app.contact_sever import delete_conversation_for
+
+    if scope not in {"me", "everyone"}:
+        raise HTTPException(status_code=400, detail="scope must be me or everyone.")
+    conv = _load_conv(db, conversation_id)
+    if conv is None:
+        raise HTTPException(status_code=404, detail=CHAT_NOT_FOUND)
+    require_membership(db, conversation_id, current.id)
+    try:
+        await delete_conversation_for(db, conv=conv, actor=current, scope=scope)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return DeleteConversationOut(deleted=True, scope=scope)

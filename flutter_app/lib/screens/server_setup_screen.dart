@@ -1,9 +1,13 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
 import '../app_config.dart';
 import '../app_state.dart';
 import '../errors.dart';
+import '../services/tailscale_assist.dart';
+import '../time_format.dart';
 import '../widgets/error_banner.dart';
 
 /// Settings screen: change the Tailscale/LAN server URL (optional).
@@ -212,9 +216,10 @@ class _TailscaleAutomationCard extends StatelessWidget {
           ),
           title: const Text('Disconnect when you leave the app'),
           subtitle: const Text(
-            'About half a minute after Local Chat goes out of sight, and only '
-            'when Local Chat switched Tailscale on. A tunnel you turned on '
-            'yourself is left alone, and a call in progress keeps its tunnel.',
+            'As soon as Local Chat goes out of sight, and only when Local Chat '
+            'switched Tailscale on. A tunnel you turned on yourself is left '
+            'alone; a call or an upload in progress keeps its tunnel until the '
+            'work ends.',
           ),
         ),
         const SizedBox(height: 4),
@@ -264,6 +269,105 @@ class _TailscaleAutomationCard extends StatelessWidget {
             height: 1.4,
           ),
         ),
+        if (state.adminStatus?.isAdmin == true) ...[
+          const SizedBox(height: 4),
+          const _TunnelActivityLog(),
+        ],
+      ],
+    );
+  }
+}
+
+/// What this phone actually asked Tailscale to do, and when.
+///
+/// Without it, "it did not switch the tunnel off" and "it switched the tunnel
+/// off a moment after you stopped watching" look exactly the same, and telling
+/// them apart needed a cable and `logcat`.
+class _TunnelActivityLog extends StatefulWidget {
+  const _TunnelActivityLog();
+
+  @override
+  State<_TunnelActivityLog> createState() => _TunnelActivityLogState();
+}
+
+class _TunnelActivityLogState extends State<_TunnelActivityLog> {
+  List<TailscaleTunnelEvent>? _events;
+  bool _loading = false;
+
+  Future<void> _load() async {
+    if (_loading) return;
+    setState(() => _loading = true);
+    final events = await context.read<AppState>().tunnelActivity();
+    if (!mounted) return;
+    setState(() {
+      _events = events;
+      _loading = false;
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final events = _events;
+    return ExpansionTile(
+      key: const Key('tunnel-activity-log'),
+      tilePadding: EdgeInsets.zero,
+      childrenPadding: const EdgeInsets.only(bottom: 8),
+      expandedAlignment: Alignment.topLeft,
+      expandedCrossAxisAlignment: CrossAxisAlignment.stretch,
+      title: const Text('Recent tunnel activity'),
+      subtitle: const Text('Every connect and disconnect this app asked for'),
+      onExpansionChanged: (open) {
+        if (open) unawaited(_load());
+      },
+      children: [
+        if (_loading && events == null)
+          const Padding(
+            padding: EdgeInsets.symmetric(vertical: 8),
+            child: Text('Reading…'),
+          )
+        else if (events == null || events.isEmpty)
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: 8),
+            child: Text(
+              'Nothing yet. Connect or leave the app once and look again.',
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
+            ),
+          )
+        else
+          for (final event in events)
+            Padding(
+              padding: const EdgeInsets.symmetric(vertical: 4),
+              child: Text.rich(
+                TextSpan(
+                  children: [
+                    TextSpan(
+                      text: '${formatClockTime(context, event.at)}  ',
+                      style: theme.textTheme.bodySmall?.copyWith(
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                    TextSpan(
+                      text: event.text,
+                      style: theme.textTheme.bodySmall?.copyWith(
+                        color: theme.colorScheme.onSurfaceVariant,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+        if (events != null && events.isNotEmpty)
+          Align(
+            alignment: Alignment.centerLeft,
+            child: TextButton.icon(
+              onPressed: _loading ? null : () => unawaited(_load()),
+              icon: const Icon(Icons.refresh_rounded, size: 18),
+              label: const Text('Refresh'),
+            ),
+          ),
       ],
     );
   }

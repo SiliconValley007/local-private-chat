@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -25,7 +25,9 @@ router = APIRouter(prefix="/api/auth", tags=["auth"])
 
 
 @router.post("/register", response_model=AuthResponse)
-def register(body: RegisterRequest, db: Session = Depends(get_db)) -> AuthResponse:
+def register(
+    body: RegisterRequest, request: Request, db: Session = Depends(get_db)
+) -> AuthResponse:
     existing = db.scalar(select(User).where(User.username == body.username))
     if existing:
         raise HTTPException(
@@ -50,11 +52,14 @@ def register(body: RegisterRequest, db: Session = Depends(get_db)) -> AuthRespon
         details={"device_id": body.device_id} if body.device_id else None,
     )
     token = create_access_token(user.id, user.username, token_version=user.token_version)
-    return AuthResponse(token=token, user=user_out(user, is_online=True))
+    from app.tailscale_membership import bind_on_login
+
+    bind_on_login(db, user, request)
+    return AuthResponse(token=token, user=user_out(user, is_online=True, db=db))
 
 
 @router.post("/login", response_model=AuthResponse)
-def login(body: LoginRequest, db: Session = Depends(get_db)) -> AuthResponse:
+def login(body: LoginRequest, request: Request, db: Session = Depends(get_db)) -> AuthResponse:
     user = db.scalar(select(User).where(User.username == body.username.strip()))
     if user is None or not verify_password(body.password, user.password_hash):
         raise HTTPException(
@@ -69,7 +74,13 @@ def login(body: LoginRequest, db: Session = Depends(get_db)) -> AuthResponse:
         details={"device_id": body.device_id} if body.device_id else None,
     )
     token = create_access_token(user.id, user.username, token_version=user.token_version)
-    return AuthResponse(token=token, user=user_out(user, is_online=hub.is_online(user.id)))
+    from app.tailscale_membership import bind_on_login
+
+    bind_on_login(db, user, request)
+    return AuthResponse(
+        token=token,
+        user=user_out(user, is_online=hub.is_online(user.id), db=db),
+    )
 
 
 @router.get("/me", response_model=UserOut)

@@ -5,6 +5,7 @@ import 'package:provider/provider.dart';
 import '../app_state.dart';
 import '../chat_navigation.dart';
 import '../errors.dart';
+import '../media_ttl.dart';
 import '../services/app_lock_store.dart';
 import '../services/privacy_onboarding_store.dart';
 import '../widgets/change_password_dialog.dart';
@@ -655,6 +656,26 @@ class SettingsScreen extends StatelessWidget {
             ),
           ),
           ListTile(
+            leading: const Icon(Icons.timer_outlined),
+            title: const Text('Default for chats I start'),
+            subtitle: Text(
+              state.mediaPolicy == null
+                  ? 'How long they stay on the server'
+                  : composerMediaTimerLabel(state.mediaPolicy),
+            ),
+            onTap: () => _chooseMyMediaTtl(context, state),
+          ),
+          if (state.offersActivityLog)
+            ListTile(
+              leading: const Icon(Icons.admin_panel_settings_outlined),
+              title: const Text('Server attachment expiry'),
+              subtitle: Text(
+                'Default for everyone: '
+                '${state.mediaPolicy?.defaultDays ?? 30} days',
+              ),
+              onTap: () => _chooseServerMediaTtl(context, state),
+            ),
+          ListTile(
             leading: const Icon(Icons.cloud_upload_outlined),
             title: const Text('Backup and restore'),
             subtitle: const Text('Client-encrypted backup'),
@@ -693,6 +714,68 @@ class SettingsScreen extends StatelessWidget {
       ),
     );
   }
+}
+
+Future<int?> _pickTtlDays(
+  BuildContext context, {
+  required String title,
+  required int? selected,
+  bool includeServerDefault = false,
+}) {
+  return showModalBottomSheet<int>(
+    context: context,
+    showDragHandle: true,
+    builder: (ctx) => SafeArea(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          ListTile(title: Text(title)),
+          if (includeServerDefault)
+            ListTile(
+              title: const Text('Use server default'),
+              trailing: selected == null
+                  ? const Icon(Icons.check_rounded)
+                  : null,
+              onTap: () => Navigator.pop(ctx, 0),
+            ),
+          for (final days in const [1, 7, 30, 90, 365])
+            ListTile(
+              title: Text(days == 1 ? '1 day' : '$days days'),
+              trailing: selected == days
+                  ? const Icon(Icons.check_rounded)
+                  : null,
+              onTap: () => Navigator.pop(ctx, days),
+            ),
+          const SizedBox(height: 8),
+        ],
+      ),
+    ),
+  );
+}
+
+Future<void> _chooseMyMediaTtl(BuildContext context, AppState state) async {
+  await state.refreshMediaPolicy();
+  if (!context.mounted) return;
+  final picked = await _pickTtlDays(
+    context,
+    title: 'New photos and videos leave the server after',
+    selected: state.mediaPolicy?.myDays,
+    includeServerDefault: true,
+  );
+  if (picked == null) return;
+  await state.setMyMediaTtl(picked == 0 ? null : picked);
+}
+
+Future<void> _chooseServerMediaTtl(BuildContext context, AppState state) async {
+  await state.refreshMediaPolicy();
+  if (!context.mounted) return;
+  final picked = await _pickTtlDays(
+    context,
+    title: 'Server default for new attachments',
+    selected: state.mediaPolicy?.defaultDays,
+  );
+  if (picked == null) return;
+  await state.setServerMediaTtl(picked);
 }
 
 class _SectionTitle extends StatelessWidget {

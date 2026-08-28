@@ -7,6 +7,7 @@ import 'package:provider/provider.dart';
 import '../app_state.dart';
 import '../models.dart';
 import '../services/media_store.dart';
+import 'attachments.dart';
 
 /// Tallest and shortest a drawing may be drawn in a chat row.
 const double doodleMaxHeight = 360;
@@ -204,7 +205,7 @@ class _DoodleFailed extends StatelessWidget {
 }
 
 /// Full-screen doodle viewer with save/share like photos.
-class DoodleViewerScreen extends StatelessWidget {
+class DoodleViewerScreen extends StatefulWidget {
   const DoodleViewerScreen({
     super.key,
     required this.message,
@@ -215,53 +216,76 @@ class DoodleViewerScreen extends StatelessWidget {
   final VoidCallback? onShowInChat;
 
   @override
+  State<DoodleViewerScreen> createState() => _DoodleViewerScreenState();
+}
+
+class _DoodleViewerScreenState extends State<DoodleViewerScreen> {
+  bool _chromeHidden = false;
+
+  ChatMessage get message => widget.message;
+
+  void _toggleChrome() {
+    setState(() => _chromeHidden = !_chromeHidden);
+    applyMediaViewerSystemBars(hidden: _chromeHidden);
+  }
+
+  @override
+  void dispose() {
+    if (_chromeHidden) applyMediaViewerSystemBars(hidden: false);
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
     final state = context.read<AppState>();
+    final chromeShown = !_chromeHidden;
+    final surface = Theme.of(context).colorScheme.surface.withValues(alpha: 0.92);
+
     return Scaffold(
       backgroundColor: Colors.transparent,
-      extendBodyBehindAppBar: true,
-      appBar: AppBar(
-        backgroundColor: Colors.black54,
-        foregroundColor: Colors.white,
-        title: const Text('Drawing', style: TextStyle(fontSize: 15)),
-        actions: [
-          if (onShowInChat != null)
-            IconButton(
-              tooltip: 'Show in chat',
-              onPressed: onShowInChat,
-              icon: const Icon(Icons.chat_bubble_outline_rounded),
-            ),
-          IconButton(
-            tooltip: 'Save to phone',
-            onPressed: () => _save(context),
-            icon: const Icon(Icons.download_rounded),
-          ),
-          IconButton(
-            tooltip: 'Share',
-            onPressed: () => _share(context),
-            icon: const Icon(Icons.share_outlined),
-          ),
-        ],
-      ),
       body: Container(
-        decoration: BoxDecoration(
-          color: Theme.of(context).colorScheme.surface.withValues(alpha: 0.92),
-        ),
-        child: InteractiveViewer(
-          minScale: 0.5,
-          maxScale: 4,
-          child: Center(
-            child: Hero(
-              tag: 'media-hero-${message.id}',
-              child: Image(
-                image: CachedNetworkImageProvider(
-                  state.api.mediaUrl(message.id),
-                  headers: state.api.imageAuthHeaders,
+        decoration: BoxDecoration(color: surface),
+        child: Stack(
+          fit: StackFit.expand,
+          children: [
+            Positioned.fill(
+              child: GestureDetector(
+                key: const Key('media-viewer-chrome-toggle'),
+                behavior: HitTestBehavior.opaque,
+                onTap: _toggleChrome,
+                child: InteractiveViewer(
+                  minScale: 0.5,
+                  maxScale: 4,
+                  child: Center(
+                    child: Hero(
+                      tag: 'media-hero-${message.id}',
+                      child: Image(
+                        image: CachedNetworkImageProvider(
+                          state.api.mediaUrl(message.id),
+                          headers: state.api.imageAuthHeaders,
+                        ),
+                        fit: BoxFit.contain,
+                      ),
+                    ),
+                  ),
                 ),
-                fit: BoxFit.contain,
               ),
             ),
-          ),
+            MediaViewerChrome(
+              shown: chromeShown,
+              child: SafeArea(
+                child: Align(
+                  alignment: Alignment.topCenter,
+                  child: MediaViewerTopBar(
+                    title: 'Drawing',
+                    onShowInChat: widget.onShowInChat,
+                    onSave: () => _save(context),
+                    onShare: () => _share(context),
+                  ),
+                ),
+              ),
+            ),
+          ],
         ),
       ),
     );

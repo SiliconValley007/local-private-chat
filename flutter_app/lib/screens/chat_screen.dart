@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
@@ -17,6 +18,8 @@ import 'package:share_plus/share_plus.dart';
 import '../call_log.dart';
 import '../app_state.dart';
 import '../chat_navigation.dart';
+import '../disconnect_copy.dart';
+import '../media_ttl.dart';
 import '../chat_scroll.dart';
 import '../checklist.dart';
 import '../couple_details.dart';
@@ -49,11 +52,13 @@ import '../widgets/doodle_overlay.dart';
 import '../widgets/loading_placeholders.dart';
 import '../widgets/message_highlight.dart' show messageHighlightHold;
 import '../widgets/rich_message_text.dart';
+import '../widgets/sever_dialogs.dart';
 import '../widgets/nudge_overlay.dart';
 import '../widgets/quoted_message.dart';
 import '../widgets/reaction_picker.dart';
 import '../widgets/receipt_ticks.dart';
 import '../widgets/rename_dialog.dart';
+import '../widgets/scrollable_action_sheet.dart';
 import '../widgets/storage_strip.dart';
 import '../widgets/streak_tile.dart';
 import '../widgets/video_attachment.dart';
@@ -63,19 +68,6 @@ import 'message_info_screen.dart';
 import 'nudge_history_screen.dart';
 import 'shared_media_screen.dart';
 import 'wallpaper_crop_screen.dart';
-
-/// Toolbar height when the header carries a name, presence and a mood line.
-///
-/// The default 56 fits two lines; the mood's italic descenders were being
-/// sliced off by the bottom edge of the bar.
-const double chatHeaderHeightWithMood = 68;
-
-/// The same height, grown for a phone set to larger text.
-///
-/// Clamped because past a point the bar would eat the chat rather than the
-/// three lines it is there to show; the mood ellipsises instead.
-double chatHeaderHeightForScale(TextScaler scaler) =>
-    chatHeaderHeightWithMood * scaler.scale(1).clamp(1.0, 1.4);
 
 class ChatScreen extends StatefulWidget {
   const ChatScreen({
@@ -994,20 +986,20 @@ class _ChatScreenState extends State<ChatScreen> {
     final typing = state.typingLabelFor(conv);
     if (typing != null) return typing;
     if (conv.type == 'group') return '${conv.members.length} members';
+    final disconnect = disconnectSubtitle(
+      removed: conv.removed,
+      unreachable: state.unreachableFor(conv),
+      notOnTailnet: conv.notOnTailnet,
+      serverAccessRevoked: conv.serverAccessRevoked,
+      tailnetPending: conv.tailnetPending,
+    );
+    if (disconnect != null) return disconnect;
     final peer = conv.peer;
     if (peer == null) return '';
     if (state.isUserOnline(peer)) return 'online';
     final seen = state.lastSeenFor(peer);
     if (seen == null) return '';
     return formatLastSeen(context, seen);
-  }
-
-  String? _moodLine(Conversation conv, AppState state) {
-    // Mood is secondary: never replace typing/online/last-seen.
-    if (state.typingLabelFor(conv) != null) return null;
-    final mood = conv.peer?.mood?.trim();
-    if (mood == null || mood.isEmpty) return null;
-    return mood;
   }
 
   /// Shows the other person's (or the group's) photo full screen.
@@ -1266,6 +1258,8 @@ class _ChatScreenState extends State<ChatScreen> {
         _startDoodleMode();
       case 'disappearing':
         await _openDisappearingSheet(conv);
+      case 'media_ttl':
+        await _openMediaTtlSheet(conv);
       case 'anniversary':
         await _pickAnniversary(conv);
       case 'couple':
@@ -1274,7 +1268,31 @@ class _ChatScreenState extends State<ChatScreen> {
         await _startCall(conv, video: false);
       case 'video_call':
         await _startCall(conv, video: true);
+      case 'delete_chat':
+        await _deleteChat(conv);
+      case 'remove_contact':
+        await _removeContact(conv);
     }
+  }
+
+  Future<void> _deleteChat(Conversation conv) async {
+    final scope = await showDeleteChatDialog(context, isDm: conv.type == 'dm');
+    if (scope == null || !mounted) return;
+    await context.read<AppState>().deleteConversation(conv.id, scope: scope);
+    if (mounted) Navigator.of(context).pop();
+  }
+
+  Future<void> _removeContact(Conversation conv) async {
+    final peer = conv.peer;
+    if (peer == null) return;
+    final alsoDelete = await showRemoveContactDialog(context);
+    if (alsoDelete == null || !mounted) return;
+    await context.read<AppState>().blockContact(
+      peer.id,
+      conversationId: conv.id,
+      alsoDeleteChat: alsoDelete,
+    );
+    if (mounted) Navigator.of(context).pop();
   }
 
   Future<void> _startCall(Conversation conv, {required bool video}) async {
@@ -1385,6 +1403,45 @@ class _ChatScreenState extends State<ChatScreen> {
     await _guard(
       () => _appState.setDisappearing(conv.id, choice == 0 ? null : choice),
     );
+  }
+
+  Future<void> _openMediaTtlSheet(Conversation conv) async {
+    final live = _appState.conversationById(conv.id) ?? conv;
+    final current =
+        live.mediaTtlDays ?? _appState.mediaPolicy?.effectiveDays ?? 30;
+    final choice = await showModalBottomSheet<int>(
+      context: context,
+      showDragHandle: true,
+      builder: (sheetContext) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Padding(
+              padding: EdgeInsets.fromLTRB(16, 0, 16, 8),
+              child: Align(
+                alignment: Alignment.centerLeft,
+                child: Text(
+                  'Photos, videos, files, voice notes and drawings in this '
+                  'chat leave the server after this many days. Everyone here '
+                  'sees when it changes.',
+                ),
+              ),
+            ),
+            for (final days in const [1, 7, 30, 90, 180, 365])
+              ListTile(
+                title: Text(days == 1 ? '1 day' : '$days days'),
+                trailing: current == days
+                    ? const Icon(Icons.check_rounded)
+                    : null,
+                onTap: () => Navigator.pop(sheetContext, days),
+              ),
+            const SizedBox(height: 8),
+          ],
+        ),
+      ),
+    );
+    if (choice == null || !mounted) return;
+    await _guard(() => _appState.setMediaTtl(conv.id, choice));
   }
 
   /// Sets or clears a DM's anniversary date.
@@ -1773,6 +1830,18 @@ class _ChatScreenState extends State<ChatScreen> {
         ),
       ],
       PopupMenuItem(
+        value: 'media_ttl',
+        child: ListTile(
+          dense: true,
+          contentPadding: EdgeInsets.zero,
+          leading: const Icon(Icons.hourglass_bottom_outlined),
+          title: const Text('Attachment expiry'),
+          subtitle: Text(
+            '${conv.mediaTtlDays ?? state.mediaPolicy?.effectiveDays ?? 30} days',
+          ),
+        ),
+      ),
+      PopupMenuItem(
         value: 'disappearing',
         child: ListTile(
           dense: true,
@@ -1799,6 +1868,25 @@ class _ChatScreenState extends State<ChatScreen> {
             ),
             title: Text(coupleLabel.title),
             subtitle: Text(coupleLabel.subtitle),
+          ),
+        ),
+      const PopupMenuItem(
+        value: 'delete_chat',
+        child: ListTile(
+          dense: true,
+          contentPadding: EdgeInsets.zero,
+          leading: Icon(Icons.delete_outline_rounded),
+          title: Text('Delete chat'),
+        ),
+      ),
+      if (conv.type == 'dm')
+        const PopupMenuItem(
+          value: 'remove_contact',
+          child: ListTile(
+            dense: true,
+            contentPadding: EdgeInsets.zero,
+            leading: Icon(Icons.person_off_outlined),
+            title: Text('Remove contact'),
           ),
         ),
     ];
@@ -1841,8 +1929,20 @@ class _ChatScreenState extends State<ChatScreen> {
     final scheme = Theme.of(context).colorScheme;
     final title = state.titleFor(conv);
     final presence = _subtitleFor(conv, state);
-    final mood = _moodLine(conv, state);
     final typing = (state.typingUsers[conv.id] ?? const {}).isNotEmpty;
+    // The title, not the peer's own display name: this chat is headed "Hmm"
+    // because that is what its owner calls her, and a notice underneath calling
+    // her "Faye" reads as being about somebody else entirely.
+    final closedReason = composerClosedReason(
+      removed: conv.removed,
+      notOnTailnet: conv.notOnTailnet,
+      serverAccessRevoked: conv.serverAccessRevoked,
+      peerName: title,
+    );
+    final pendingNote = pendingDeliveryNote(
+      tailnetPending: conv.tailnetPending,
+      peerName: title,
+    );
     _followTranscript(messages, typing: typing);
 
     return PopScope(
@@ -1854,11 +1954,6 @@ class _ChatScreenState extends State<ChatScreen> {
       child: Scaffold(
         backgroundColor: AppColors.chatCanvasFor(context),
         appBar: AppBar(
-          // A name, a presence line and a mood do not fit in the default bar,
-          // and the third line was being cut through its descenders.
-          toolbarHeight: mood != null && !_searching
-              ? chatHeaderHeightForScale(MediaQuery.textScalerOf(context))
-              : null,
           leading: _searching
               ? IconButton(
                   tooltip: 'Cancel search',
@@ -1925,7 +2020,7 @@ class _ChatScreenState extends State<ChatScreen> {
                               ),
                               overflow: TextOverflow.ellipsis,
                             ),
-                            if (presence.isNotEmpty || mood != null)
+                            if (presence.isNotEmpty)
                               AnimatedSize(
                                 duration: const Duration(milliseconds: 180),
                                 curve: Curves.easeOut,
@@ -1959,25 +2054,6 @@ class _ChatScreenState extends State<ChatScreen> {
                                               ),
                                             ),
                                           ),
-                                        ),
-                                      ),
-                                    if (mood != null)
-                                      Padding(
-                                        padding: const EdgeInsets.only(top: 1),
-                                        child: Text(
-                                          mood,
-                                          maxLines: 1,
-                                          style: TextStyle(
-                                            fontSize: 11.5,
-                                            // Italics need room under the
-                                            // baseline; the default line height
-                                            // clipped their tails.
-                                            height: 1.25,
-                                            color: scheme.onSurfaceVariant
-                                                .withValues(alpha: 0.9),
-                                            fontStyle: FontStyle.italic,
-                                          ),
-                                          overflow: TextOverflow.ellipsis,
                                         ),
                                       ),
                                   ],
@@ -2118,6 +2194,8 @@ class _ChatScreenState extends State<ChatScreen> {
                 bytesSent: state.mediaUploadBytesSent,
                 bytesTotal: state.mediaUploadBytesTotal,
                 waiting: state.mediaUploadWaiting,
+                onStop: state.canStopUpload ? state.cancelCurrentUpload : null,
+                stopping: state.uploadCancelRequested,
               ),
             if (state.outboxCountFor(conv.id) > 0)
               _OutboxBar(
@@ -2141,19 +2219,30 @@ class _ChatScreenState extends State<ChatScreen> {
                     : senderColor(_replyTo!.senderId),
                 onCancel: () => setState(() => _replyTo = null),
               ),
-            _Composer(
-              key: const ValueKey('composer'),
-              controller: _text,
-              focusNode: _composerFocus,
-              recording: _recording,
-              recordedFor: _recorded,
-              onChanged: _onTypingChanged,
-              onSend: _send,
-              onAttach: _openAttachmentSheet,
-              onStartRecording: _startRecording,
-              onStopRecording: () => _finishRecording(send: true),
-              onCancelRecording: () => _finishRecording(send: false),
-            ),
+            if (closedReason == null && pendingNote != null)
+              _PendingDeliveryNote(text: pendingNote),
+            if (closedReason != null)
+              Material(
+                child: Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 10, 16, 12),
+                  child: Text(closedReason, textAlign: TextAlign.center),
+                ),
+              )
+            else
+              _Composer(
+                key: const ValueKey('composer'),
+                controller: _text,
+                focusNode: _composerFocus,
+                recording: _recording,
+                recordedFor: _recorded,
+                ttlHint: null,
+                onChanged: _onTypingChanged,
+                onSend: _send,
+                onAttach: _openAttachmentSheet,
+                onStartRecording: _startRecording,
+                onStopRecording: () => _finishRecording(send: true),
+                onCancelRecording: () => _finishRecording(send: false),
+              ),
           ],
         ),
       ),
@@ -2345,7 +2434,9 @@ class _MessageRow extends StatelessWidget {
   }
 
   Future<void> _showActions(BuildContext context) async {
-    if (message.isDeleted || message.isCallLog) return;
+    if (message.isDeleted || message.isCallLog || message.isMediaTtlNotice) {
+      return;
+    }
 
     final state = context.read<AppState>();
     final meId = state.me?.id;
@@ -2355,120 +2446,137 @@ class _MessageRow extends StatelessWidget {
     final canEdit = message.canEdit(meId);
     final canShowInfo =
         mine && !savedMessages && !message.pending && message.id > 0;
-    final hasAttachActions = messageHasAttachmentActions(message);
+    final keptOnPhone = state.media.kept.contains(message.id);
+    final hasAttachActions = messageHasAttachmentActions(
+      message,
+      keptOnPhone: keptOnPhone,
+    );
     // Delete for everyone is the sender's (or a group admin's) call; delete for
     // me is always available so anyone can clear their own view.
 
     final action = await showModalBottomSheet<String>(
       context: context,
       showDragHandle: true,
-      builder: (sheetContext) => SafeArea(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            // WhatsApp-style quick reaction row at the top of the sheet.
-            Padding(
-              padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
-              child: ReactionBar(
-                myEmoji: _myReaction,
-                onPick: (emoji) => Navigator.pop(sheetContext, 'react:$emoji'),
-                onMore: () => Navigator.pop(sheetContext, 'react:more'),
-              ),
-            ),
-            const Divider(height: 1),
-            if (message.expiresAt != null)
-              ListTile(
-                key: const Key('message-expiry-row'),
-                leading: const Icon(Icons.timer_outlined),
-                title: Text(
-                  formatDisappearsAt(sheetContext, message.expiresAt!),
-                ),
-                subtitle: const Text('Then it is gone for everyone here'),
-              ),
-            if (hasAttachActions) ...[
-              ListTile(
-                leading: const Icon(Icons.open_in_new_rounded),
-                title: const Text('Open'),
-                onTap: () => Navigator.pop(sheetContext, 'attach:open'),
-              ),
-              ListTile(
-                leading: const Icon(Icons.download_rounded),
-                title: const Text('Save to phone'),
-                subtitle: const Text('Choose where to keep this file'),
-                onTap: () => Navigator.pop(sheetContext, 'attach:save'),
-              ),
-              ListTile(
-                leading: const Icon(Icons.share_outlined),
-                title: const Text('Share'),
-                onTap: () => Navigator.pop(sheetContext, 'attach:share'),
-              ),
-              const Divider(height: 1),
-            ],
-            if (onReply != null)
-              ListTile(
-                leading: const Icon(Icons.reply_rounded),
-                title: const Text('Reply'),
-                onTap: () => Navigator.pop(sheetContext, 'reply'),
-              ),
-            if (canShowInfo)
-              ListTile(
-                leading: const Icon(Icons.info_outline_rounded),
-                title: const Text('Info'),
-                subtitle: const Text('Read and delivery details'),
-                onTap: () => Navigator.pop(sheetContext, 'info'),
-              ),
-            if (canCopy)
-              ListTile(
-                leading: const Icon(Icons.copy_rounded),
-                title: const Text('Copy text'),
-                onTap: () => Navigator.pop(sheetContext, 'copy'),
-              ),
-            if (canEdit)
-              ListTile(
-                leading: const Icon(Icons.edit_outlined),
-                title: const Text('Edit'),
-                onTap: () => Navigator.pop(sheetContext, 'edit'),
-              ),
-            ListTile(
-              leading: Icon(
-                state.isMessagePinned(conversationId, message.id)
-                    ? Icons.push_pin_rounded
-                    : Icons.push_pin_outlined,
-              ),
-              title: Text(
-                state.isMessagePinned(conversationId, message.id)
-                    ? 'Unpin'
-                    : 'Pin',
-              ),
-              onTap: () => Navigator.pop(
-                sheetContext,
-                state.isMessagePinned(conversationId, message.id)
-                    ? 'unpin'
-                    : 'pin',
-              ),
-            ),
-            ListTile(
-              leading: Icon(
-                state.isMessageStarred(message.id)
-                    ? Icons.star_rounded
-                    : Icons.star_outline_rounded,
-              ),
-              title: Text(
-                state.isMessageStarred(message.id) ? 'Unstar' : 'Star',
-              ),
-              onTap: () => Navigator.pop(
-                sheetContext,
-                state.isMessageStarred(message.id) ? 'unstar' : 'star',
-              ),
-            ),
-            ListTile(
-              leading: const Icon(Icons.delete_outline_rounded),
-              title: const Text('Delete'),
-              onTap: () => Navigator.pop(sheetContext, 'delete'),
-            ),
-            const SizedBox(height: 8),
-          ],
+      isScrollControlled: true,
+      builder: (sheetContext) => ScrollableActionSheet(
+        // Keep quick reactions visible while the longer media actions scroll.
+        // Media can add Open/Save/Share/retention and otherwise push Star off-screen.
+        header: Padding(
+          padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
+          child: ReactionBar(
+            myEmoji: _myReaction,
+            onPick: (emoji) => Navigator.pop(sheetContext, 'react:$emoji'),
+            onMore: () => Navigator.pop(sheetContext, 'react:more'),
+          ),
         ),
+        children: [
+          if (message.expiresAt != null)
+            ListTile(
+              key: const Key('message-expiry-row'),
+              leading: const Icon(Icons.timer_outlined),
+              title: Text(formatDisappearsAt(sheetContext, message.expiresAt!)),
+              subtitle: const Text('Then it is gone for everyone here'),
+            ),
+          if (hasAttachActions) ...[
+            ListTile(
+              leading: const Icon(Icons.open_in_new_rounded),
+              title: const Text('Open'),
+              onTap: () => Navigator.pop(sheetContext, 'attach:open'),
+            ),
+            ListTile(
+              leading: const Icon(Icons.download_rounded),
+              title: const Text('Save to phone'),
+              subtitle: const Text('Choose where to keep this file'),
+              onTap: () => Navigator.pop(sheetContext, 'attach:save'),
+            ),
+            ListTile(
+              leading: const Icon(Icons.share_outlined),
+              title: const Text('Share'),
+              onTap: () => Navigator.pop(sheetContext, 'attach:share'),
+            ),
+            if (message.isMediaType && !message.mediaGone)
+              ListTile(
+                leading: Icon(
+                  message.retainedByMe
+                      ? Icons.cloud_done_rounded
+                      : Icons.cloud_outlined,
+                ),
+                title: Text(
+                  message.retainedByMe
+                      ? 'Stop keeping on this server'
+                      : 'Keep on this server',
+                ),
+                subtitle: const Text(
+                  'Keeps the file after the timer if anyone still wants it',
+                ),
+                onTap: () => Navigator.pop(
+                  sheetContext,
+                  message.retainedByMe ? 'drop_retain' : 'retain',
+                ),
+              ),
+            const Divider(height: 1),
+          ],
+          if (onReply != null)
+            ListTile(
+              leading: const Icon(Icons.reply_rounded),
+              title: const Text('Reply'),
+              onTap: () => Navigator.pop(sheetContext, 'reply'),
+            ),
+          if (canShowInfo)
+            ListTile(
+              leading: const Icon(Icons.info_outline_rounded),
+              title: const Text('Info'),
+              subtitle: const Text('Read and delivery details'),
+              onTap: () => Navigator.pop(sheetContext, 'info'),
+            ),
+          if (canCopy)
+            ListTile(
+              leading: const Icon(Icons.copy_rounded),
+              title: const Text('Copy text'),
+              onTap: () => Navigator.pop(sheetContext, 'copy'),
+            ),
+          if (canEdit)
+            ListTile(
+              leading: const Icon(Icons.edit_outlined),
+              title: const Text('Edit'),
+              onTap: () => Navigator.pop(sheetContext, 'edit'),
+            ),
+          ListTile(
+            leading: Icon(
+              state.isMessagePinned(conversationId, message.id)
+                  ? Icons.push_pin_rounded
+                  : Icons.push_pin_outlined,
+            ),
+            title: Text(
+              state.isMessagePinned(conversationId, message.id)
+                  ? 'Unpin'
+                  : 'Pin',
+            ),
+            onTap: () => Navigator.pop(
+              sheetContext,
+              state.isMessagePinned(conversationId, message.id)
+                  ? 'unpin'
+                  : 'pin',
+            ),
+          ),
+          ListTile(
+            leading: Icon(
+              state.isMessageStarred(message.id)
+                  ? Icons.star_rounded
+                  : Icons.star_outline_rounded,
+            ),
+            title: Text(state.isMessageStarred(message.id) ? 'Unstar' : 'Star'),
+            onTap: () => Navigator.pop(
+              sheetContext,
+              state.isMessageStarred(message.id) ? 'unstar' : 'star',
+            ),
+          ),
+          ListTile(
+            leading: const Icon(Icons.delete_outline_rounded),
+            title: const Text('Delete'),
+            onTap: () => Navigator.pop(sheetContext, 'delete'),
+          ),
+        ],
       ),
     );
 
@@ -2500,6 +2608,26 @@ class _MessageRow extends StatelessWidget {
     switch (action) {
       case 'reply':
         onReply?.call();
+      case 'retain':
+        try {
+          await context.read<AppState>().retainMedia(message);
+        } catch (e) {
+          if (context.mounted) {
+            ScaffoldMessenger.of(
+              context,
+            ).showSnackBar(SnackBar(content: Text(friendlyMessage(e))));
+          }
+        }
+      case 'drop_retain':
+        try {
+          await context.read<AppState>().dropMediaRetain(message);
+        } catch (e) {
+          if (context.mounted) {
+            ScaffoldMessenger.of(
+              context,
+            ).showSnackBar(SnackBar(content: Text(friendlyMessage(e))));
+          }
+        }
       case 'info':
         final conversation = state.conversationById(conversationId);
         if (conversation != null && context.mounted) {
@@ -2719,11 +2847,19 @@ class _MessageRow extends StatelessWidget {
     if (message.isCallLog) {
       return _CallLogTile(message: message);
     }
+    if (message.isMediaTtlNotice) {
+      return _MediaTtlNoticeTile(message: message);
+    }
     // Photos, videos, and drawings use edge-to-edge tiles; doodles stay bubble-free.
+    final keptOnPhone = state.media.kept.contains(message.id);
     final isMediaTile =
         (message.type == 'image' || message.type == 'video') &&
-        !message.isDeleted;
-    final isDoodleTile = message.type == 'doodle' && !message.isDeleted;
+        !message.isDeleted &&
+        (!message.mediaGone || keptOnPhone);
+    final isDoodleTile =
+        message.type == 'doodle' &&
+        !message.isDeleted &&
+        (!message.mediaGone || keptOnPhone);
     final isEdgeTile = isMediaTile || isDoodleTile;
     final metaColor = isEdgeTile ? Colors.white : scheme.outline;
     final starred = state.isMessageStarred(message.id);
@@ -2751,7 +2887,13 @@ class _MessageRow extends StatelessWidget {
             label: formatDisappearsAt(context, message.expiresAt!),
             color: metaColor,
           ),
-        if (starred || pinned || disappearing) const SizedBox(width: 3),
+        if (message.isMediaType && !message.mediaGone)
+          _MediaFooterChip(message: message, color: metaColor),
+        if (starred ||
+            pinned ||
+            disappearing ||
+            (message.isMediaType && !message.mediaGone))
+          const SizedBox(width: 3),
         Text(
           formatClockTime(context, message.createdAt),
           style: Theme.of(
@@ -2781,7 +2923,8 @@ class _MessageRow extends StatelessWidget {
         emojiWithoutBubble(emojiCount) &&
         quote == null &&
         !showSenderName;
-    final openActions = message.isDeleted || message.isCallLog
+    final openActions =
+        message.isDeleted || message.isCallLog || message.isMediaTtlNotice
         ? null
         : () => _showActions(context);
 
@@ -2916,6 +3059,73 @@ class _MessageRow extends StatelessWidget {
   }
 }
 
+class _MediaFooterChip extends StatefulWidget {
+  const _MediaFooterChip({required this.message, required this.color});
+
+  final ChatMessage message;
+  final Color color;
+
+  @override
+  State<_MediaFooterChip> createState() => _MediaFooterChipState();
+}
+
+class _MediaFooterChipState extends State<_MediaFooterChip> {
+  Timer? _tick;
+
+  @override
+  void initState() {
+    super.initState();
+    if (widget.message.retainers.isEmpty &&
+        widget.message.mediaExpiresAt != null) {
+      _tick = Timer.periodic(const Duration(seconds: 30), (_) {
+        if (mounted) setState(() {});
+      });
+    }
+  }
+
+  @override
+  void dispose() {
+    _tick?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final retained = widget.message.retainers.isNotEmpty;
+    final icon = retained ? Icons.cloud_done_outlined : Icons.timer_outlined;
+    final label = retained
+        ? 'kept'
+        : (widget.message.mediaExpiresAt == null
+              ? ''
+              : compactRemainingLabel(widget.message.mediaExpiresAt!));
+    if (label.isEmpty) return const SizedBox.shrink();
+    return Semantics(
+      label: retained
+          ? 'Kept on the server'
+          : 'Deletes from the server in $label',
+      child: Padding(
+        padding: const EdgeInsets.only(right: 3),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(icon, size: 12, color: widget.color),
+            const SizedBox(width: 2),
+            Text(
+              label,
+              style: TextStyle(
+                fontSize: 10,
+                height: 1,
+                color: widget.color,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
 class _MessageStateIcon extends StatelessWidget {
   const _MessageStateIcon({
     required this.icon,
@@ -2998,6 +3208,76 @@ class _CallLogTile extends StatelessWidget {
   }
 }
 
+class _MediaTtlNoticeTile extends StatelessWidget {
+  const _MediaTtlNoticeTile({required this.message});
+
+  final ChatMessage message;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final state = context.watch<AppState>();
+    final conv = state.conversationById(message.conversationId);
+    var who = 'Someone';
+    if (conv != null) {
+      for (final member in conv.members) {
+        if (member.userId == message.senderId) {
+          who = state.nameForMember(member);
+          break;
+        }
+      }
+    }
+    var fromDays = '?';
+    var toDays = '?';
+    DateTime? when;
+    try {
+      final raw = jsonDecode(message.body ?? '{}');
+      if (raw is Map<String, dynamic>) {
+        fromDays = '${raw['from_days'] ?? raw['from_days'] ?? '?'}';
+        toDays = '${raw['to_days'] ?? raw['to_days'] ?? '?'}';
+        when = tryParseServerTime(raw['at'] as String?);
+      }
+    } catch (_) {}
+    final whenLabel = when == null ? null : formatMomentWithDay(context, when);
+    final label = formatMediaTtlNotice(
+      who: who,
+      fromDays: fromDays,
+      toDays: toDays,
+      whenLabel: whenLabel,
+    );
+    return Center(
+      child: Container(
+        margin: const EdgeInsets.symmetric(vertical: 6),
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
+        decoration: BoxDecoration(
+          color: scheme.surfaceContainerHighest,
+          borderRadius: BorderRadius.circular(14),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              Icons.hourglass_bottom_outlined,
+              size: 16,
+              color: scheme.onSurfaceVariant,
+            ),
+            const SizedBox(width: 6),
+            Flexible(
+              child: Text(
+                label,
+                style: TextStyle(
+                  fontSize: 12.5,
+                  color: scheme.onSurfaceVariant,
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
 class _MessageContent extends StatelessWidget {
   const _MessageContent({
     required this.message,
@@ -3036,41 +3316,86 @@ class _MessageContent extends StatelessWidget {
       );
     }
 
+    final state = context.watch<AppState>();
+    final keptOnPhone = state.media.kept.contains(message.id);
+    if (message.mediaGone && !keptOnPhone) {
+      final scheme = Theme.of(context).colorScheme;
+      return Text(
+        removedFromServerLabel(message.mediaTtlDays),
+        style: TextStyle(
+          height: 1.35,
+          fontSize: 15,
+          fontStyle: FontStyle.italic,
+          color: scheme.onSurfaceVariant,
+        ),
+      );
+    }
+
+    final caption = mediaStatusCaption(
+      message,
+      meId: state.me?.id,
+      keptOnPhone: keptOnPhone,
+    );
+
+    Widget wrap(Widget child) {
+      if (caption == null || caption.isEmpty) return child;
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          child,
+          Padding(
+            padding: const EdgeInsets.only(top: 4),
+            child: Text(caption, style: Theme.of(context).textTheme.bodySmall),
+          ),
+        ],
+      );
+    }
+
     switch (message.type) {
       case 'image':
-        return ImageAttachment(
-          message: message,
-          maxWidth: maxWidth,
-          footer: footer,
-          onLongPress: onLongPress,
+        return wrap(
+          ImageAttachment(
+            message: message,
+            maxWidth: maxWidth,
+            footer: footer,
+            onLongPress: onLongPress,
+          ),
         );
       case 'video':
-        return VideoAttachment(
-          message: message,
-          maxWidth: maxWidth,
-          footer: footer,
-          onLongPress: onLongPress,
+        return wrap(
+          VideoAttachment(
+            message: message,
+            maxWidth: maxWidth,
+            footer: footer,
+            onLongPress: onLongPress,
+          ),
         );
       case 'doodle':
-        return DoodleAttachment(
-          message: message,
-          maxWidth: maxWidth,
-          footer: footer,
-          onLongPress: onLongPress,
+        return wrap(
+          DoodleAttachment(
+            message: message,
+            maxWidth: maxWidth,
+            footer: footer,
+            onLongPress: onLongPress,
+          ),
         );
       case 'voice':
-        return VoiceAttachment(
-          message: message,
-          accent: mine
-              ? AppColors.brandDeep
-              : Theme.of(context).colorScheme.primary,
-          onLongPress: onLongPress,
+        return wrap(
+          VoiceAttachment(
+            message: message,
+            accent: mine
+                ? AppColors.brandDeep
+                : Theme.of(context).colorScheme.primary,
+            onLongPress: onLongPress,
+          ),
         );
       case 'file':
-        return FileAttachment(
-          message: message,
-          maxWidth: maxWidth,
-          onLongPress: onLongPress,
+        return wrap(
+          FileAttachment(
+            message: message,
+            maxWidth: maxWidth,
+            onLongPress: onLongPress,
+          ),
         );
       case 'list':
         if (isE2eCipherText(message.body)) return const _SealedBody();
@@ -3476,6 +3801,42 @@ class _ShareOption extends StatelessWidget {
 
 /// Thin banner for sends that are stuck, never for sends that are simply on
 /// their way — a healthy message is already reported by the clock on its bubble.
+/// A quiet line above an open composer: the chat works, delivery is just
+/// waiting on the other person's first sign-in.
+class _PendingDeliveryNote extends StatelessWidget {
+  const _PendingDeliveryNote({required this.text});
+
+  final String text;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final scheme = theme.colorScheme;
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 0, 16, 6),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(
+            Icons.schedule_rounded,
+            size: 14,
+            color: scheme.onSurfaceVariant,
+          ),
+          const SizedBox(width: 6),
+          Expanded(
+            child: Text(
+              text,
+              style: theme.textTheme.labelSmall?.copyWith(
+                color: scheme.onSurfaceVariant,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 class _OutboxBar extends StatelessWidget {
   const _OutboxBar({
     required this.count,
@@ -3542,6 +3903,8 @@ class _UploadProgressBar extends StatelessWidget {
     required this.bytesSent,
     required this.bytesTotal,
     this.waiting = false,
+    this.onStop,
+    this.stopping = false,
   });
 
   final int done;
@@ -3549,6 +3912,8 @@ class _UploadProgressBar extends StatelessWidget {
   final int bytesSent;
   final int bytesTotal;
   final bool waiting;
+  final VoidCallback? onStop;
+  final bool stopping;
 
   @override
   Widget build(BuildContext context) {
@@ -3585,6 +3950,14 @@ class _UploadProgressBar extends StatelessWidget {
             Expanded(
               child: Text(label, style: Theme.of(context).textTheme.bodyMedium),
             ),
+            // A big attachment takes minutes. Choosing the wrong video should
+            // not mean waiting them out, so the way back is next to the bar.
+            if (onStop != null)
+              TextButton(
+                key: const Key('upload-stop'),
+                onPressed: stopping ? null : onStop,
+                child: Text(stopping ? 'Stopping…' : 'Stop'),
+              ),
           ],
         ),
       ),
@@ -3606,6 +3979,7 @@ class _Composer extends StatelessWidget {
     required this.onStartRecording,
     required this.onStopRecording,
     required this.onCancelRecording,
+    this.ttlHint,
   });
 
   final TextEditingController controller;
@@ -3618,6 +3992,7 @@ class _Composer extends StatelessWidget {
   final VoidCallback onStartRecording;
   final VoidCallback onStopRecording;
   final VoidCallback onCancelRecording;
+  final String? ttlHint;
 
   @override
   Widget build(BuildContext context) {
@@ -3634,88 +4009,115 @@ class _Composer extends StatelessWidget {
       ),
       child: SafeArea(
         top: false,
-        child: Padding(
-          padding: const EdgeInsets.fromLTRB(8, 8, 8, 8),
-          child: recording
-              ? _RecordingBar(
-                  elapsed: recordedFor,
-                  onCancel: onCancelRecording,
-                  onSend: onStopRecording,
-                )
-              : Row(
-                  crossAxisAlignment: CrossAxisAlignment.end,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            if (ttlHint != null && ttlHint!.isNotEmpty)
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 6, 16, 0),
+                child: Row(
                   children: [
-                    IconButton(
-                      onPressed: onAttach,
-                      tooltip: 'Share a photo or file',
-                      icon: Icon(
-                        Icons.add_circle_outline_rounded,
-                        color: scheme.primary,
-                        size: 26,
-                      ),
-                    ),
-                    Expanded(
-                      child: TextField(
-                        controller: controller,
-                        focusNode: focusNode,
-                        minLines: 1,
-                        maxLines: 5,
-                        // Kept under the server's 8000-char body cap with room
-                        // for a DM's ciphertext, which base64 expands ~1.4x.
-                        maxLength: 4000,
-                        buildCounter:
-                            (
-                              _, {
-                              required currentLength,
-                              required isFocused,
-                              maxLength,
-                            }) => null,
-                        textCapitalization: TextCapitalization.sentences,
-                        keyboardType: TextInputType.multiline,
-                        textInputAction: TextInputAction.newline,
-                        decoration: const InputDecoration(
-                          hintText: 'Message',
-                          contentPadding: EdgeInsets.symmetric(
-                            horizontal: 16,
-                            vertical: 11,
-                          ),
-                          border: OutlineInputBorder(
-                            borderRadius: BorderRadius.all(
-                              Radius.circular(AppRadius.pill),
-                            ),
-                            borderSide: BorderSide.none,
-                          ),
-                          enabledBorder: OutlineInputBorder(
-                            borderRadius: BorderRadius.all(
-                              Radius.circular(AppRadius.pill),
-                            ),
-                            borderSide: BorderSide.none,
-                          ),
-                          focusedBorder: OutlineInputBorder(
-                            borderRadius: BorderRadius.all(
-                              Radius.circular(AppRadius.pill),
-                            ),
-                            borderSide: BorderSide.none,
-                          ),
-                        ),
-                        onChanged: onChanged,
-                      ),
+                    Icon(
+                      Icons.timer_outlined,
+                      size: 14,
+                      color: scheme.onSurfaceVariant,
                     ),
                     const SizedBox(width: 6),
-                    ValueListenableBuilder<TextEditingValue>(
-                      valueListenable: controller,
-                      builder: (context, value, _) {
-                        final hasText = value.text.trim().isNotEmpty;
-                        return _PrimaryComposerButton(
-                          icon: hasText
-                              ? Icons.send_rounded
-                              : Icons.mic_rounded,
-                          onPressed: hasText ? onSend : onStartRecording,
-                        );
-                      },
+                    Expanded(
+                      child: Text(
+                        ttlHint!,
+                        style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                          color: scheme.onSurfaceVariant,
+                        ),
+                      ),
                     ),
                   ],
                 ),
+              ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(8, 8, 8, 8),
+              child: recording
+                  ? _RecordingBar(
+                      elapsed: recordedFor,
+                      onCancel: onCancelRecording,
+                      onSend: onStopRecording,
+                    )
+                  : Row(
+                      crossAxisAlignment: CrossAxisAlignment.end,
+                      children: [
+                        IconButton(
+                          onPressed: onAttach,
+                          tooltip: 'Share a photo or file',
+                          icon: Icon(
+                            Icons.add_circle_outline_rounded,
+                            color: scheme.primary,
+                            size: 26,
+                          ),
+                        ),
+                        Expanded(
+                          child: TextField(
+                            controller: controller,
+                            focusNode: focusNode,
+                            minLines: 1,
+                            maxLines: 5,
+                            // Kept under the server's 8000-char body cap with room
+                            // for a DM's ciphertext, which base64 expands ~1.4x.
+                            maxLength: 4000,
+                            buildCounter:
+                                (
+                                  _, {
+                                  required currentLength,
+                                  required isFocused,
+                                  maxLength,
+                                }) => null,
+                            textCapitalization: TextCapitalization.sentences,
+                            keyboardType: TextInputType.multiline,
+                            textInputAction: TextInputAction.newline,
+                            decoration: const InputDecoration(
+                              hintText: 'Message',
+                              contentPadding: EdgeInsets.symmetric(
+                                horizontal: 16,
+                                vertical: 11,
+                              ),
+                              border: OutlineInputBorder(
+                                borderRadius: BorderRadius.all(
+                                  Radius.circular(AppRadius.pill),
+                                ),
+                                borderSide: BorderSide.none,
+                              ),
+                              enabledBorder: OutlineInputBorder(
+                                borderRadius: BorderRadius.all(
+                                  Radius.circular(AppRadius.pill),
+                                ),
+                                borderSide: BorderSide.none,
+                              ),
+                              focusedBorder: OutlineInputBorder(
+                                borderRadius: BorderRadius.all(
+                                  Radius.circular(AppRadius.pill),
+                                ),
+                                borderSide: BorderSide.none,
+                              ),
+                            ),
+                            onChanged: onChanged,
+                          ),
+                        ),
+                        const SizedBox(width: 6),
+                        ValueListenableBuilder<TextEditingValue>(
+                          valueListenable: controller,
+                          builder: (context, value, _) {
+                            final hasText = value.text.trim().isNotEmpty;
+                            return _PrimaryComposerButton(
+                              icon: hasText
+                                  ? Icons.send_rounded
+                                  : Icons.mic_rounded,
+                              onPressed: hasText ? onSend : onStartRecording,
+                            );
+                          },
+                        ),
+                      ],
+                    ),
+            ),
+          ],
         ),
       ),
     );

@@ -25,6 +25,7 @@ class CallLogInfo {
       outcome == 'rejected' ||
       outcome == 'busy' ||
       outcome == 'cancelled' ||
+      outcome == 'failed' ||
       outcome == 'unreachable';
 }
 
@@ -41,6 +42,7 @@ String normalizeCallOutcome(String raw) {
     case 'rejected':
     case 'busy':
     case 'cancelled':
+    case 'failed':
     case 'unreachable':
       return raw;
     default:
@@ -94,6 +96,8 @@ String _outcomeHeadline(CallLogInfo info) {
       return info.isVideo ? 'Busy · video call' : 'Busy · voice call';
     case 'cancelled':
       return info.isVideo ? 'Cancelled video call' : 'Cancelled voice call';
+    case 'failed':
+      return info.isVideo ? 'Video call failed' : 'Voice call failed';
     case 'unreachable':
       return info.isVideo
           ? 'Unavailable · video call'

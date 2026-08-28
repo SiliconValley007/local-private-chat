@@ -85,6 +85,22 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("conversations", "disappear_after_seconds", "INTEGER"),
     ("conversations", "anniversary_on", "TEXT"),
     ("users", "token_version", "INTEGER NOT NULL DEFAULT 0"),
+    ("users", "media_ttl_days", "INTEGER"),
+    ("messages", "media_expires_at", "DATETIME"),
+    ("messages", "media_ttl_days", "INTEGER"),
+    ("messages", "media_gone_at", "DATETIME"),
+    ("messages", "media_gone_reason", "TEXT"),
+    ("conversation_members", "hidden_at", "DATETIME"),
+    ("users", "tailscale_login", "TEXT"),
+    ("users", "tailscale_user_id", "TEXT"),
+    ("users", "tailscale_node_id", "TEXT"),
+    ("users", "tailscale_device", "TEXT"),
+    ("users", "tailscale_bound_at", "DATETIME"),
+    ("users", "suspended_at", "DATETIME"),
+    ("users", "suspension_reason", "TEXT"),
+    ("conversations", "media_ttl_days", "INTEGER"),
+    ("conversations", "media_ttl_set_by", "INTEGER"),
+    ("conversations", "media_ttl_set_at", "DATETIME"),
 )
 
 

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.orm import Session
 
@@ -17,6 +17,7 @@ SESSION_EXPIRED = "Your session has expired. Please sign in again."
 
 
 def get_current_user(
+    request: Request,
     credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
     db: Session = Depends(get_db),
 ) -> User:
@@ -48,4 +49,6 @@ def get_current_user(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=SESSION_EXPIRED,
         )
-    return user
+    from app.tailscale_membership import enforce_authenticated_user
+
+    return enforce_authenticated_user(db, user, request)

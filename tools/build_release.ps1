@@ -98,6 +98,8 @@ if (-not $SkipServer) {
     New-Item -ItemType Directory -Force -Path $stage | Out-Null
     try {
         Copy-Item $built (Join-Path $stage "LocalChatServer.exe") -Force
+        Copy-Item (Join-Path $server "tailscale-oauth.env.example") `
+            (Join-Path $stage "tailscale-oauth.env.example") -Force
         @"
 LOCAL CHAT SERVER - START HERE
 ================================
@@ -117,6 +119,17 @@ port, run this once and approve it:
 
 That allows TCP 8000 from Tailscale (100.64.0.0/10) and your local network
 only - never the public internet.
+
+Tailscale membership (so removed users cannot keep receiving chat/push):
+  Copy tailscale-oauth.env.example to tailscale-oauth.env in this same folder.
+  Fill in client id, client secret, and tailnet (a hyphen - is fine).
+  Fully quit the EXE and start it again. Do not put secrets in this ZIP.
+  If sign-in then says membership cannot be verified, the server could not
+  reach Tailscale. This prints the exact reason:
+
+    LocalChatServer.exe tailscale-check
+
+  The admin account can always sign in, even while that check fails.
 
 Do not run the EXE while it is still inside the ZIP. The server keeps data,
 media and its secret beside the EXE so they survive updates.
@@ -144,14 +157,18 @@ if (-not $SkipUpdateZip) {
     New-Item -ItemType Directory -Force -Path $stage | Out-Null
     try {
         Copy-Item (Join-Path $server "app") $stage -Recurse -Force
-        Copy-Item (Join-Path $server "tests") $stage -Recurse -Force
+        # Tests are kept out of the published tree, so a clone has no tests/.
+        $tests = Join-Path $server "tests"
+        if (Test-Path $tests) { Copy-Item $tests $stage -Recurse -Force }
         # Every top-level module the server imports has to be here. Shipping
         # run.py without one of them leaves the operator with a server that dies
-        # on ModuleNotFoundError; tests/test_unit_update_pack.py enforces the list.
-        foreach ($f in @("run.py", "reset_password.py", "set_admin.py", "firewall.py",
+        # on ModuleNotFoundError.
+        foreach ($f in @("run.py", "reset_password.py", "set_admin.py",
+                         "tailscale_check.py", "firewall.py",
                          "requirements.txt",
                          "requirements-termux.txt", "requirements-dev.txt",
-                         "start_termux.sh", "start.bat")) {
+                         "start_termux.sh", "start.bat",
+                         "tailscale-oauth.env.example")) {
             Copy-Item (Join-Path $server $f) $stage -Force
         }
         Get-ChildItem $stage -Recurse -Force -Directory |

@@ -33,6 +33,7 @@ class CallSession extends ChangeNotifier {
     required this.outgoing,
     required this.peerName,
     this.peerUserId,
+    this.restored = false,
   });
 
   final int conversationId;
@@ -41,6 +42,7 @@ class CallSession extends ChangeNotifier {
   final bool outgoing;
   String peerName;
   final int? peerUserId;
+  final bool restored;
 
   CallPhase phase = CallPhase.idle;
   String? error;
@@ -59,6 +61,12 @@ class CallSession extends ChangeNotifier {
   final RTCVideoRenderer remoteRenderer = RTCVideoRenderer();
   bool _renderersReady = false;
   Timer? _qualityTimer;
+  Timer? _mediaGraceTimer;
+  DateTime? _mediaGraceStartedAt;
+  Future<void> _remoteTrackQueue = Future.value();
+  RTCIceConnectionState? _iceState;
+  RTCPeerConnectionState? _peerState;
+  int iceAddFailures = 0;
 
   MediaStream? get localStream => _local;
   MediaStream? get remoteStream => _remote;
@@ -91,6 +99,49 @@ class CallSession extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Some Android WebRTC builds emit audio/video [RTCTrackEvent]s without
+  /// `streams`. Keep one aggregate stream: replacing it for each event makes
+  /// whichever track arrives last win, so video-first/audio-last becomes a
+  /// connected call with a black remote view.
+  Future<void> _handleRemoteTrack(RTCTrackEvent event) async {
+    try {
+      var stream = _remote;
+      if (stream == null) {
+        stream = event.streams.isNotEmpty
+            ? event.streams.first
+            : await createLocalMediaStream('remote-$callId');
+        await _attachRemote(stream);
+      } else if (event.streams.isNotEmpty) {
+        final richer = event.streams.first;
+        final currentIds = stream.getTracks().map((track) => track.id).toSet();
+        final richerIds = richer.getTracks().map((track) => track.id).toSet();
+        // Some builds first emit an empty-stream event, then a populated stream
+        // containing both media tracks. Adopt it only when it is a true
+        // superset, so replacing can never discard the earlier audio/video.
+        if (richerIds.length > currentIds.length &&
+            richerIds.containsAll(currentIds)) {
+          stream = richer;
+          await _attachRemote(stream);
+        }
+      }
+      final alreadyAttached = stream.getTracks().any(
+        (track) => track.id == event.track.id,
+      );
+      if (!alreadyAttached) await stream.addTrack(event.track);
+      // Reassigning is harmless and makes Android renderers notice a track
+      // added to a synthetic stream after srcObject was first attached.
+      remoteRenderer.srcObject = stream;
+      notifyListeners();
+    } catch (e) {
+      debugPrint('Call remote track attach failed: ${e.runtimeType}');
+      if (event.track.kind == 'video') {
+        error =
+            'Remote video could not be displayed. End the call and try again.';
+        notifyListeners();
+      }
+    }
+  }
+
   Future<RTCPeerConnection> createPeer({
     required void Function(RTCIceCandidate c) onIce,
   }) async {
@@ -104,30 +155,102 @@ class CallSession extends ChangeNotifier {
       if (c.candidate != null) onIce(c);
     };
     pc.onTrack = (event) {
-      if (event.streams.isNotEmpty) {
-        unawaited(_attachRemote(event.streams.first));
-      }
+      _remoteTrackQueue = _remoteTrackQueue
+          .then((_) => _handleRemoteTrack(event))
+          .catchError((Object error, StackTrace stack) {
+            debugPrint('Call remote track queue failed: ${error.runtimeType}');
+          });
+    };
+    pc.onIceConnectionState = (state) {
+      _iceState = state;
+      _applyMediaLinkState();
     };
     pc.onConnectionState = (state) {
-      if (state == RTCPeerConnectionState.RTCPeerConnectionStateConnected) {
-        phase = CallPhase.active;
-        connectedAt ??= DateTime.now();
-        error = null;
-        networkQuality = CallNetworkQuality.unknown;
-        _startQualitySampling();
-        notifyListeners();
-      } else if (state == RTCPeerConnectionState.RTCPeerConnectionStateFailed ||
-          state == RTCPeerConnectionState.RTCPeerConnectionStateDisconnected) {
-        if (phase == CallPhase.active || phase == CallPhase.connecting) {
-          networkQuality = CallNetworkQuality.reconnecting;
-          error =
-              'Call media failed to connect. Check Tailscale is direct (not relay-only).';
-          notifyListeners();
-        }
-      }
+      _peerState = state;
+      _applyMediaLinkState();
     };
     _pc = pc;
     return pc;
+  }
+
+  void _applyMediaLinkState({bool graceExpired = false}) {
+    if (phase == CallPhase.ended || phase == CallPhase.idle) return;
+
+    final ice = parseCallMediaIceWire(_iceState?.name);
+    final peer = parseCallMediaPeerWire(_peerState?.name);
+    final link = deriveCallMediaLinkState(ice: ice, peer: peer);
+
+    if (link == CallMediaLinkState.connected) {
+      _mediaGraceTimer?.cancel();
+      _mediaGraceTimer = null;
+      _mediaGraceStartedAt = null;
+      phase = CallPhase.active;
+      connectedAt ??= DateTime.now();
+      error = null;
+      networkQuality = CallNetworkQuality.unknown;
+      _startQualitySampling();
+      notifyListeners();
+      return;
+    }
+
+    if (shouldStartMediaReconnectGrace(phase: phase, ice: ice, peer: peer)) {
+      networkQuality = CallNetworkQuality.reconnecting;
+      error = null;
+      _armMediaReconnectGrace();
+      notifyListeners();
+      return;
+    }
+
+    if (link == CallMediaLinkState.reconnecting &&
+        (phase == CallPhase.connecting || phase == CallPhase.active)) {
+      networkQuality = CallNetworkQuality.reconnecting;
+      error = null;
+      notifyListeners();
+      return;
+    }
+
+    if (shouldReportMediaConnectFailure(
+      phase: phase,
+      ice: ice,
+      peer: peer,
+      graceExpired: graceExpired,
+    )) {
+      _mediaGraceTimer?.cancel();
+      _mediaGraceTimer = null;
+      _mediaGraceStartedAt = null;
+      networkQuality = CallNetworkQuality.reconnecting;
+      error = callMediaFailedMessage(iceAddFailures: iceAddFailures);
+      notifyListeners();
+    }
+  }
+
+  void _armMediaReconnectGrace() {
+    _mediaGraceTimer?.cancel();
+    _mediaGraceStartedAt = DateTime.now();
+    _mediaGraceTimer = Timer(callMediaReconnectGrace, () {
+      _mediaGraceStartedAt = null;
+      if (phase != CallPhase.connecting && phase != CallPhase.active) return;
+      _applyMediaLinkState(graceExpired: true);
+    });
+  }
+
+  Duration get mediaReconnectGraceRemaining {
+    if (_mediaGraceTimer?.isActive != true || _mediaGraceStartedAt == null) {
+      return Duration.zero;
+    }
+    final elapsed = DateTime.now().difference(_mediaGraceStartedAt!);
+    final remaining = callMediaReconnectGrace - elapsed;
+    return remaining.isNegative ? Duration.zero : remaining;
+  }
+
+  /// Clears grace/media state when the peer connection is torn down.
+  void _resetMediaLinkTracking() {
+    _mediaGraceTimer?.cancel();
+    _mediaGraceTimer = null;
+    _mediaGraceStartedAt = null;
+    _iceState = null;
+    _peerState = null;
+    iceAddFailures = 0;
   }
 
   void _startQualitySampling() {
@@ -188,15 +311,23 @@ class CallSession extends ChangeNotifier {
     return num.tryParse('$value');
   }
 
-  Future<MediaStream> openLocalMedia({required bool video}) async {
-    final stream = await navigator.mediaDevices.getUserMedia({
-      'audio': true,
-      'video': video
-          ? {'facingMode': 'user', 'width': 640, 'height': 480}
-          : false,
-    });
-    await _attachLocal(stream);
-    return stream;
+  Future<MediaStream> openLocalMedia({
+    required bool video,
+    Future<void> Function(bool active)? onExpectReturn,
+  }) async {
+    await onExpectReturn?.call(true);
+    try {
+      final stream = await navigator.mediaDevices.getUserMedia({
+        'audio': true,
+        'video': video
+            ? {'facingMode': 'user', 'width': 640, 'height': 480}
+            : false,
+      });
+      await _attachLocal(stream);
+      return stream;
+    } finally {
+      await onExpectReturn?.call(false);
+    }
   }
 
   Future<void> addLocalTracks(RTCPeerConnection pc) async {
@@ -226,6 +357,7 @@ class CallSession extends ChangeNotifier {
   Future<void> disposeMedia() async {
     _qualityTimer?.cancel();
     _qualityTimer = null;
+    _resetMediaLinkTracking();
     try {
       await _pc?.close();
     } catch (_) {}
@@ -249,19 +381,30 @@ class CallSession extends ChangeNotifier {
 
 /// Owns at most one [CallSession] and bridges WebSocket call.* signaling.
 class CallService extends ChangeNotifier {
-  CallService(this.api, this.realtime);
+  CallService(
+    this.api,
+    this.realtime, {
+    this.onCallTunnelHold,
+    this.onCallExpectReturn,
+  });
 
   final ApiClient api;
   final RealtimeService realtime;
+  final Future<void> Function(bool active)? onCallTunnelHold;
+  final Future<void> Function(bool active)? onCallExpectReturn;
 
   CallSession? active;
   final _uuid = const Uuid();
   final List<RTCIceCandidate> _pendingRemoteIce = [];
   bool _remoteDescSet = false;
+  bool _remoteDescApplying = false;
+  bool _localTracksAdded = false;
   bool _bound = false;
   Map<String, dynamic>? _pendingOffer;
   Timer? _outgoingTimeout;
+  Timer? _mediaConnectTimeout;
   bool _ringingAckSent = false;
+  Future<void> _eventQueue = Future.value();
   CallSession? _boundSession;
   VoidCallback? _sessionListener;
 
@@ -317,15 +460,21 @@ class CallService extends ChangeNotifier {
     _resetCallState();
     notifyListeners();
     _bindSession(session);
+    await _syncCallTunnelHold(session);
     await _syncCallAudio(session);
     _armOutgoingTimeout(session);
 
+    var inviteSent = false;
     try {
-      await session.openLocalMedia(video: media == 'video');
+      await session.openLocalMedia(
+        video: media == 'video',
+        onExpectReturn: onCallExpectReturn,
+      );
       await CallAudioController.instance.prepareInCallAudio();
       session.audioRoute = CallAudioController.instance.selectedRoute;
       final pc = await session.createPeer(onIce: (c) => _sendIce(session, c));
       await session.addLocalTracks(pc);
+      _localTracksAdded = true;
 
       realtime.sendCallSignal({
         'type': 'call.invite',
@@ -333,6 +482,7 @@ class CallService extends ChangeNotifier {
         'call_id': callId,
         'media': media,
       });
+      inviteSent = true;
 
       final offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
@@ -346,7 +496,11 @@ class CallService extends ChangeNotifier {
       notifyListeners();
     } catch (e) {
       session.error = 'Could not start call: $e';
-      await _hangUp(local: true, skipSignal: true);
+      if (inviteSent) {
+        await _failCall(session, reason: 'caller_setup_failed');
+      } else {
+        await _hangUp(local: true, skipSignal: true);
+      }
       rethrow;
     }
     return session;
@@ -354,6 +508,20 @@ class CallService extends ChangeNotifier {
 
   /// Restores an incoming call from push/local persistence or server pending list.
   Future<bool> restorePendingIncoming(PendingCall pending) async {
+    // Recovery, notification taps, and WebSocket frames all mutate [active].
+    // Put them through one queue so a delayed local restore cannot overwrite a
+    // newer live invite (or resurrect a call after its terminal frame).
+    final operation = _eventQueue.then((_) => _restorePendingIncoming(pending));
+    _eventQueue = operation.then<void>((_) {}).catchError((
+      Object error,
+      StackTrace stack,
+    ) {
+      debugPrint('Call recovery failed: ${error.runtimeType}');
+    });
+    return operation;
+  }
+
+  Future<bool> _restorePendingIncoming(PendingCall pending) async {
     if (active != null) return false;
     if (pending.callId.isEmpty || pending.conversationId <= 0) return false;
     final name = _incomingPeerName(pending);
@@ -364,15 +532,18 @@ class CallService extends ChangeNotifier {
       outgoing: false,
       peerName: name,
       peerUserId: pending.callerId > 0 ? pending.callerId : null,
+      restored: true,
     )..phase = CallPhase.incoming;
     active = session;
     _resetCallState();
     _bindSession(session);
     notifyListeners();
+    await _syncCallTunnelHold(session);
     await _syncCallAudio(session);
     await _ackRinging(session);
+    if (active != session || session.phase != CallPhase.incoming) return false;
     onIncoming?.call(session);
-    await _fetchServerPendingOffer(session);
+    unawaited(_fetchServerPendingOffer(session));
     return true;
   }
 
@@ -409,19 +580,21 @@ class CallService extends ChangeNotifier {
     try {
       session.phase = CallPhase.connecting;
       notifyListeners();
+      await _syncCallTunnelHold(session);
       await _syncCallAudio(session);
-      await session.openLocalMedia(video: session.isVideo);
+      await session.openLocalMedia(
+        video: session.isVideo,
+        onExpectReturn: onCallExpectReturn,
+      );
       await CallAudioController.instance.prepareInCallAudio();
       session.audioRoute = CallAudioController.instance.selectedRoute;
       final pc = await session.createPeer(onIce: (c) => _sendIce(session, c));
       await session.addLocalTracks(pc);
-      final pending = _pendingOffer;
-      if (pending != null) {
-        await _applyRemoteOffer(session, pc, pending);
-      }
+      _localTracksAdded = true;
+      await _maybeApplyStoredOffer(session);
     } catch (e) {
       session.error = 'Could not accept call: $e';
-      await rejectIncoming();
+      await _failCall(session, reason: 'accept_failed');
     }
   }
 
@@ -453,42 +626,91 @@ class CallService extends ChangeNotifier {
     });
   }
 
+  Future<void> _maybeApplyStoredOffer(CallSession session) async {
+    if (!calleeShouldApplyStoredOffer(
+      localTracksAdded: _localTracksAdded,
+      remoteDescSet: _remoteDescSet,
+      remoteDescApplying: _remoteDescApplying,
+      pendingOffer: _pendingOffer,
+    )) {
+      return;
+    }
+    final pc = session._pc;
+    if (pc == null) return;
+    await _applyRemoteOffer(session, pc, _pendingOffer!);
+  }
+
   Future<void> _applyRemoteOffer(
     CallSession session,
     RTCPeerConnection pc,
     Map<String, dynamic> offer,
   ) async {
+    if (!calleeMayApplyRemoteOffer(
+      localTracksAdded: _localTracksAdded,
+      remoteDescSet: _remoteDescSet,
+      remoteDescApplying: _remoteDescApplying,
+      isOutgoing: session.outgoing,
+    )) {
+      return;
+    }
     final sdp = offer['sdp'] as String?;
     final type = offer['sdp_type'] as String? ?? 'offer';
     if (sdp == null) return;
-    await pc.setRemoteDescription(RTCSessionDescription(sdp, type));
-    _remoteDescSet = true;
-    await _flushIce(pc);
-    final answer = await pc.createAnswer();
-    await pc.setLocalDescription(answer);
-    realtime.sendCallSignal({
-      'type': 'call.answer',
-      'conversation_id': session.conversationId,
-      'call_id': session.callId,
-      'sdp': answer.sdp,
-      'sdp_type': answer.type,
-    });
-    _pendingOffer = null;
+    _remoteDescApplying = true;
+    try {
+      await pc.setRemoteDescription(RTCSessionDescription(sdp, type));
+      _remoteDescSet = true;
+      await _flushIce(pc);
+      final answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      _cancelOutgoingTimeout();
+      _armMediaConnectTimeout(session);
+      realtime.sendCallSignal({
+        'type': 'call.answer',
+        'conversation_id': session.conversationId,
+        'call_id': session.callId,
+        'sdp': answer.sdp,
+        'sdp_type': answer.type,
+      });
+      _pendingOffer = null;
+    } finally {
+      _remoteDescApplying = false;
+    }
   }
 
   Future<void> _flushIce(RTCPeerConnection pc) async {
     for (final c in _pendingRemoteIce) {
-      try {
-        await pc.addCandidate(c);
-      } catch (_) {}
+      await _addRemoteIce(pc, c);
     }
     _pendingRemoteIce.clear();
+  }
+
+  Future<void> _addRemoteIce(RTCPeerConnection pc, RTCIceCandidate ice) async {
+    try {
+      await pc.addCandidate(ice);
+    } catch (e) {
+      final session = active;
+      if (session != null) {
+        session.iceAddFailures++;
+      }
+      debugPrint(
+        'Call ICE add #${session?.iceAddFailures ?? 0}: '
+        '${iceAddFailureDiagnostic(e, hadRemoteDesc: _remoteDescSet)}',
+      );
+    }
   }
 
   void _onEvent(Map<String, dynamic> event) {
     final type = event['type'] as String?;
     if (type == null || !type.startsWith('call.')) return;
-    unawaited(_handleCallEvent(type, event));
+    // WebSocket callbacks can overlap at every await. Process signaling in wire
+    // order so an invite cannot finish presenting after a terminal event has
+    // already cleared the same session.
+    _eventQueue = _eventQueue
+        .then((_) => _handleCallEvent(type, event))
+        .catchError((Object error, StackTrace stack) {
+          debugPrint('Call event handling failed: ${error.runtimeType}');
+        });
   }
 
   Future<void> _handleCallEvent(String type, Map<String, dynamic> event) async {
@@ -500,6 +722,15 @@ class CallService extends ChangeNotifier {
       case 'call.invite':
         if (active != null) {
           if (active!.callId == callId) return;
+          final current = active!;
+          if (current.restored && current.phase == CallPhase.incoming) {
+            final stillPending = await _serverHasPendingCall(current.callId);
+            if (stillPending == false && active == current) {
+              await _hangUp(local: false, skipSignal: true);
+            }
+          }
+        }
+        if (active != null) {
           realtime.sendCallSignal({
             'type': 'call.busy',
             'conversation_id': conversationId,
@@ -528,9 +759,12 @@ class CallService extends ChangeNotifier {
         _resetCallState();
         _bindSession(session);
         notifyListeners();
+        await _syncCallTunnelHold(session);
         await _syncCallAudio(session);
         await _ackRinging(session);
+        if (active != session || session.phase != CallPhase.incoming) return;
         onIncoming?.call(session);
+        unawaited(_fetchServerPendingOffer(session));
         break;
 
       case 'call.delivery':
@@ -560,10 +794,8 @@ class CallService extends ChangeNotifier {
         }
         if (session.outgoing) return;
         _pendingOffer = event;
-        if (session.phase == CallPhase.connecting ||
-            session.phase == CallPhase.active) {
-          final pc = session._pc;
-          if (pc != null) await _applyRemoteOffer(session, pc, event);
+        if (callOfferEventShouldStoreOnly(isOutgoing: session.outgoing)) {
+          await _maybeApplyStoredOffer(session);
         }
         break;
 
@@ -577,6 +809,7 @@ class CallService extends ChangeNotifier {
         session.phase = next;
         session.calleeAckedRinging = true;
         session.error = null;
+        await _syncCallTunnelHold(session);
         await _syncCallAudio(session);
         notifyListeners();
         break;
@@ -587,14 +820,29 @@ class CallService extends ChangeNotifier {
         if (session == null || pc == null || session.callId != callId) return;
         final sdp = event['sdp'] as String?;
         if (sdp == null) return;
-        await pc.setRemoteDescription(
-          RTCSessionDescription(sdp, event['sdp_type'] as String? ?? 'answer'),
-        );
-        _remoteDescSet = true;
-        await _flushIce(pc);
+        if (!_remoteDescSet && !_remoteDescApplying) {
+          _remoteDescApplying = true;
+          try {
+            await pc.setRemoteDescription(
+              RTCSessionDescription(
+                sdp,
+                event['sdp_type'] as String? ?? 'answer',
+              ),
+            );
+            _remoteDescSet = true;
+            await _flushIce(pc);
+          } finally {
+            _remoteDescApplying = false;
+          }
+        }
+        if (shouldCancelOutgoingTimeoutOnAnswer(type)) {
+          _cancelOutgoingTimeout();
+        }
+        _armMediaConnectTimeout(session);
         final next = callerPhaseAfterEvent(session.phase, type);
         if (next != null) {
           session.phase = next;
+          await _syncCallTunnelHold(session);
           await _syncCallAudio(session);
           notifyListeners();
         }
@@ -603,20 +851,18 @@ class CallService extends ChangeNotifier {
       case 'call.ice':
         final session = active;
         if (session == null || session.callId != callId) return;
-        final candidate = event['candidate'] as String?;
-        if (candidate == null) return;
+        final parsed = parseCallIceEvent(event);
+        if (parsed == null) return;
         final ice = RTCIceCandidate(
-          candidate,
-          event['sdpMid'] as String?,
-          event['sdpMLineIndex'] as int?,
+          parsed['candidate'] as String,
+          parsed['sdpMid'] as String?,
+          parsed['sdpMLineIndex'] as int?,
         );
         final pc = session._pc;
         if (pc == null || !_remoteDescSet) {
           _pendingRemoteIce.add(ice);
         } else {
-          try {
-            await pc.addCandidate(ice);
-          } catch (_) {}
+          await _addRemoteIce(pc, ice);
         }
         break;
 
@@ -624,6 +870,7 @@ class CallService extends ChangeNotifier {
       case 'call.busy':
       case 'call.cancel':
       case 'call.timeout':
+      case 'call.failed':
         final session = active;
         if (session == null) return;
         if (session.callId != callId && callId.isNotEmpty) return;
@@ -678,6 +925,7 @@ class CallService extends ChangeNotifier {
       final pending = await api.fetchPendingCalls();
       for (final row in pending) {
         if (row['call_id'] != session.callId) continue;
+        if (active != session || session.phase == CallPhase.ended) return;
         final sdp = row['offer_sdp'] as String?;
         if (sdp == null) return;
         _pendingOffer = {
@@ -687,20 +935,44 @@ class CallService extends ChangeNotifier {
           'sdp': sdp,
           'sdp_type': row['offer_sdp_type'] as String? ?? 'offer',
         };
+        await _maybeApplyStoredOffer(session);
         return;
       }
     } catch (_) {}
   }
 
-  void _armOutgoingTimeout(CallSession session) {
+  Future<bool?> _serverHasPendingCall(String callId) async {
+    try {
+      final pending = await api.fetchPendingCalls();
+      return pending.any((row) => row['call_id'] == callId);
+    } catch (_) {
+      // A live call must not be discarded just because a reconciliation request
+      // failed. Keeping it and replying busy is the safe fallback.
+      return null;
+    }
+  }
+
+  void _cancelOutgoingTimeout() {
     _outgoingTimeout?.cancel();
+    _outgoingTimeout = null;
+  }
+
+  void _cancelMediaConnectTimeout() {
+    _mediaConnectTimeout?.cancel();
+    _mediaConnectTimeout = null;
+  }
+
+  void _armOutgoingTimeout(CallSession session) {
+    _cancelOutgoingTimeout();
     final timeout = session.deliveryState == null
         ? callTotalTimeout
         : outgoingTimeoutForDelivery(session.deliveryState);
     _outgoingTimeout = Timer(timeout, () async {
       if (active?.callId != session.callId) return;
-      if (session.phase == CallPhase.active ||
-          session.phase == CallPhase.ended) {
+      if (!outgoingTimeoutMayFire(
+        phase: session.phase,
+        remoteAnswered: _remoteDescSet,
+      )) {
         return;
       }
       session.error ??= session.deliveryState == CallDeliveryState.unreachable
@@ -708,11 +980,61 @@ class CallService extends ChangeNotifier {
           : noAnswerCallMessage(session.peerName);
       await _hangUp(local: true, skipSignal: true);
       realtime.sendCallSignal({
-        'type': 'call.cancel',
+        'type': 'call.timeout',
         'conversation_id': session.conversationId,
         'call_id': session.callId,
       });
     });
+  }
+
+  void _armMediaConnectTimeout(CallSession session) {
+    if (!shouldArmMediaConnectTimeout(
+      phase: session.phase,
+      remoteDescSet: _remoteDescSet,
+    )) {
+      return;
+    }
+    _cancelMediaConnectTimeout();
+    _mediaConnectTimeout = Timer(
+      callMediaConnectTimeout,
+      () => unawaited(_finishMediaConnectTimeout(session)),
+    );
+  }
+
+  Future<void> _finishMediaConnectTimeout(CallSession session) async {
+    if (active?.callId != session.callId) return;
+    if (session.phase == CallPhase.active || session.phase == CallPhase.ended) {
+      return;
+    }
+    if (session.phase != CallPhase.connecting) return;
+
+    // A transient ICE disconnect owns its own 12-second grace. Do not let the
+    // shorter post-answer deadline cut through that grace and falsely end a
+    // call that is still recovering.
+    final graceRemaining = session.mediaReconnectGraceRemaining;
+    if (graceRemaining > Duration.zero) {
+      _mediaConnectTimeout = Timer(
+        graceRemaining,
+        () => unawaited(_finishMediaConnectTimeout(session)),
+      );
+      return;
+    }
+
+    session.error ??= callMediaFailedMessage(
+      iceAddFailures: session.iceAddFailures,
+    );
+    await _failCall(session, reason: 'media_connect_failed');
+  }
+
+  Future<void> _failCall(CallSession session, {required String reason}) async {
+    if (active != session) return;
+    realtime.sendCallSignal({
+      'type': 'call.failed',
+      'conversation_id': session.conversationId,
+      'call_id': session.callId,
+      'reason': reason,
+    });
+    await _hangUp(local: true, skipSignal: true);
   }
 
   Future<void> setAudioRoute(CallAudioRoute route) async {
@@ -751,8 +1073,17 @@ class CallService extends ChangeNotifier {
   }
 
   void _onSessionChanged(CallSession session) {
+    if (session.phase == CallPhase.active) {
+      _cancelMediaConnectTimeout();
+    }
     notifyListeners();
     unawaited(_syncCallAudio(session));
+    unawaited(_syncCallTunnelHold(session));
+  }
+
+  Future<void> _syncCallTunnelHold(CallSession session) async {
+    final hold = callPhaseNeedsTunnelHold(session.phase);
+    await onCallTunnelHold?.call(hold);
   }
 
   Future<void> _syncCallAudio(CallSession session) async {
@@ -800,8 +1131,8 @@ class CallService extends ChangeNotifier {
   Future<void> _hangUp({required bool local, required bool skipSignal}) async {
     final session = active;
     if (session == null) return;
-    _outgoingTimeout?.cancel();
-    _outgoingTimeout = null;
+    _cancelOutgoingTimeout();
+    _cancelMediaConnectTimeout();
     if (local && !skipSignal) {
       final signalType = session.outgoing && outgoingShouldCancel(session.phase)
           ? 'call.cancel'
@@ -813,6 +1144,7 @@ class CallService extends ChangeNotifier {
       });
     }
     session.phase = CallPhase.ended;
+    await _syncCallTunnelHold(session);
     await PendingCallStore.instance.clear();
     onIncomingEnded?.call(session.callId);
     await _syncCallAudio(session);
@@ -828,13 +1160,17 @@ class CallService extends ChangeNotifier {
     _pendingRemoteIce.clear();
     _pendingOffer = null;
     _remoteDescSet = false;
+    _remoteDescApplying = false;
+    _localTracksAdded = false;
     _ringingAckSent = false;
+    _cancelMediaConnectTimeout();
   }
 
   @override
   void dispose() {
     unbind();
-    _outgoingTimeout?.cancel();
+    _cancelOutgoingTimeout();
+    _cancelMediaConnectTimeout();
     unawaited(CallAudioController.instance.stopAll());
     unawaited(active?.disposeMedia() ?? Future.value());
     super.dispose();

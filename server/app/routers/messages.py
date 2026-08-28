@@ -434,3 +434,43 @@ async def mark_delivered(
             events.event_receipt("delivered", message_id, message.conversation_id, current.id, now),
         )
     return {"ok": True}
+
+
+@router.put("/api/messages/{message_id}/retain", response_model=MessageOut)
+async def retain_message_media(
+    message_id: int,
+    db: Session = Depends(get_db),
+    current: User = Depends(get_current_user),
+) -> MessageOut:
+    """Keep this attachment on the server after its timer."""
+    from app.media_retention import retain_media
+
+    message = load_message(db, message_id)
+    if message is None:
+        raise HTTPException(status_code=404, detail="That message is no longer available.")
+    require_membership(db, message.conversation_id, current.id)
+    try:
+        await retain_media(db, message, current)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    message = load_message(db, message_id)
+    assert message is not None
+    return message_out(message, current.id)
+
+
+@router.delete("/api/messages/{message_id}/retain", response_model=MessageOut)
+async def drop_message_media_retain(
+    message_id: int,
+    db: Session = Depends(get_db),
+    current: User = Depends(get_current_user),
+) -> MessageOut:
+    from app.media_retention import drop_retain
+
+    message = load_message(db, message_id)
+    if message is None:
+        raise HTTPException(status_code=404, detail="That message is no longer available.")
+    require_membership(db, message.conversation_id, current.id)
+    await drop_retain(db, message, current)
+    message = load_message(db, message_id)
+    assert message is not None
+    return message_out(message, current.id)

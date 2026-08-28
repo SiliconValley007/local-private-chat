@@ -39,6 +39,34 @@ class User(Base):
     #: Bumped to invalidate every outstanding JWT for this account. Logout is
     #: otherwise local-only; without this a stolen token lives until expiry.
     token_version: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    #: Days until this person's new attachments leave the server. Null means
+    #: use the server default (30 unless an admin changed it). Used as the
+    #: default when this person starts a new chat; the chat's own timer is
+    #: what everyone in that chat actually shares.
+    media_ttl_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    #: Tailscale login that owns the device this account signs in from.
+    #:
+    #: Not unique: one Tailscale account commonly owns every phone in a
+    #: household, so several Local Chat accounts legitimately share a login.
+    #: Membership follows :attr:`tailscale_node_id`, the device itself.
+    tailscale_login: Mapped[str | None] = mapped_column(
+        String(120), nullable=True, index=True
+    )
+    tailscale_user_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    #: Stable Tailscale node id of the device this account is bound to.
+    tailscale_node_id: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, index=True
+    )
+    #: The device's name, only so the activity log can say which phone it was.
+    tailscale_device: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    tailscale_bound_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    #: Set when the bound Tailscale identity leaves the tailnet. History stays.
+    suspended_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    suspension_reason: Mapped[str | None] = mapped_column(String(40), nullable=True)
 
     memberships: Mapped[list[ConversationMember]] = relationship(back_populates="user")
     messages: Mapped[list[Message]] = relationship(back_populates="sender")
@@ -61,6 +89,13 @@ class Conversation(Base):
     )
     disappear_after_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
     anniversary_on: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    #: Shared attachment timer for this chat. Null means use the server default
+    #: (or the creator's preference, copied in when the chat is created).
+    media_ttl_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    media_ttl_set_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    media_ttl_set_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     members: Mapped[list[ConversationMember]] = relationship(
         back_populates="conversation", cascade="all, delete-orphan"
@@ -79,6 +114,11 @@ class ConversationMember(Base):
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
     role: Mapped[str] = mapped_column(String(16), default="member")  # member | admin
     joined_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    #: When set, this chat is gone from this person's inbox until they start it
+    #: again (and only if they are not blocked).
+    hidden_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     conversation: Mapped[Conversation] = relationship(back_populates="members")
     user: Mapped[User] = relationship(back_populates="memberships")
@@ -142,6 +182,19 @@ class Message(Base):
     expires_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    #: When the attachment itself is due to leave the server. Independent of
+    #: conversation disappearing timers, which remove the whole message.
+    media_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    #: Snapshot of the timer shown on the bubble ("after 30 days").
+    media_ttl_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    #: When the file was actually unlinked (expired with no retain claims, or
+    #: deleted for everyone).
+    media_gone_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    media_gone_reason: Mapped[str | None] = mapped_column(String(16), nullable=True)
 
     conversation: Mapped[Conversation] = relationship(back_populates="messages")
     sender: Mapped[User] = relationship(back_populates="messages")
@@ -159,6 +212,42 @@ class Message(Base):
     reactions: Mapped[list[MessageReaction]] = relationship(
         back_populates="message", cascade="all, delete-orphan"
     )
+
+
+class MediaRetain(Base):
+    """A person asked to keep this attachment on the server past its timer."""
+
+    __tablename__ = "media_retains"
+    __table_args__ = (
+        UniqueConstraint("message_id", "user_id", name="uq_media_retain_msg_user"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    message_id: Mapped[int] = mapped_column(ForeignKey("messages.id"), nullable=False, index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    message: Mapped[Message] = relationship()
+    user: Mapped[User] = relationship()
+
+
+class UserBlock(Base):
+    """No further contact between two accounts on this server.
+
+    One row per unordered pair. Either person may lift it. Messaging and new
+    DMs are refused in both directions while it stands.
+    """
+
+    __tablename__ = "user_blocks"
+    __table_args__ = (
+        UniqueConstraint("user_low_id", "user_high_id", name="uq_user_block_pair"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_low_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
+    user_high_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
+    blocked_by: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class MessageHide(Base):

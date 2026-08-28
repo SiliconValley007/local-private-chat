@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:file_picker/file_picker.dart';
@@ -23,15 +24,101 @@ class DownloadCancelled implements Exception {
   String toString() => 'Download cancelled';
 }
 
+/// Durable map of message id → kept file. Survives cache eviction and expiry.
+class LocalMediaIndex {
+  LocalMediaIndex({Directory? directory}) : _injected = directory;
+
+  final Directory? _injected;
+  Directory? _dir;
+  final Map<int, String> _paths = {};
+  bool _loaded = false;
+
+  bool contains(int messageId) => _paths.containsKey(messageId);
+
+  Future<Directory> directory() async {
+    final existing = _dir;
+    if (existing != null) return existing;
+    final injected = _injected;
+    if (injected != null) {
+      if (!await injected.exists()) {
+        await injected.create(recursive: true);
+      }
+      _dir = injected;
+      return injected;
+    }
+    final base = await getApplicationSupportDirectory();
+    final dir = Directory('${base.path}/kept_media');
+    if (!await dir.exists()) await dir.create(recursive: true);
+    _dir = dir;
+    return dir;
+  }
+
+  Future<void> load() async {
+    if (_loaded) return;
+    try {
+      final dir = await directory();
+      final file = File('${dir.path}/index.json');
+      if (await file.exists()) {
+        final raw = jsonDecode(await file.readAsString());
+        if (raw is Map) {
+          raw.forEach((key, value) {
+            final id = int.tryParse('$key');
+            if (id != null && value is String) _paths[id] = value;
+          });
+        }
+      }
+    } catch (_) {
+      // A corrupt index is treated as empty; the next save rewrites it.
+    }
+    _loaded = true;
+  }
+
+  Future<void> remember(int messageId, File source) async {
+    await load();
+    final dir = await directory();
+    final ext = source.path.contains('.')
+        ? source.path.substring(source.path.lastIndexOf('.'))
+        : '';
+    final dest = File('${dir.path}/$messageId$ext');
+    await source.copy(dest.path);
+    _paths[messageId] = dest.path;
+    await _persist();
+  }
+
+  Future<File?> lookup(int messageId) async {
+    await load();
+    final path = _paths[messageId];
+    if (path == null) return null;
+    final file = File(path);
+    if (!await file.exists()) {
+      _paths.remove(messageId);
+      await _persist();
+      return null;
+    }
+    return file;
+  }
+
+  Future<void> _persist() async {
+    final dir = await directory();
+    final file = File('${dir.path}/index.json');
+    await file.writeAsString(
+      jsonEncode({for (final e in _paths.entries) '${e.key}': e.value}),
+    );
+  }
+}
+
 /// Downloads chat attachments once, keeps them on the phone, and hands them to
 /// the gallery/file apps when asked.
 ///
 /// Attachments live behind an authenticated endpoint, so nothing can be fetched
 /// by a plain URL; every request here carries the session token.
 class MediaStore {
-  MediaStore(this._api);
+  MediaStore(this._api, {LocalMediaIndex? kept}) : kept = kept ?? LocalMediaIndex() {
+    unawaited(this.kept.load());
+  }
 
   final ApiClient _api;
+  final LocalMediaIndex kept;
 
   /// Downloads already running, keyed by message id, so a rebuild storm can't
   /// start the same download several times.
@@ -67,7 +154,9 @@ class MediaStore {
   /// The already-downloaded file, or null when it still has to be fetched.
   Future<File?> cached(ChatMessage msg) async {
     final file = await _target(msg);
-    if (!await file.exists()) return null;
+    if (!await file.exists()) {
+      return kept.lookup(msg.id);
+    }
     final expected = msg.mediaSize;
     if (expected != null && expected > 0 && await file.length() != expected) {
       return null; // Partial or stale download; fetch it again.
@@ -103,6 +192,8 @@ class MediaStore {
   ) async {
     final existing = await cached(msg);
     if (existing != null) return existing;
+    final keptFile = await kept.lookup(msg.id);
+    if (keptFile != null) return keptFile;
 
     final client = http.Client();
     _clients[msg.id] = client;
@@ -114,6 +205,8 @@ class MediaStore {
           .timeout(const Duration(seconds: 30));
 
       if (response.statusCode == 404) {
+        final fallback = await kept.lookup(msg.id);
+        if (fallback != null) return fallback;
         throw ApiException(
           'This attachment is no longer on the server.',
           statusCode: 404,
@@ -204,8 +297,12 @@ class MediaStore {
     return freed;
   }
 
-  /// Removes local copies belonging to one server message.
+  /// Removes local cache copies belonging to one server message.
+  ///
+  /// Files the user saved to the phone (the keep index) are left alone.
   Future<void> evict(int messageId) async {
+    await kept.load();
+    if (kept.contains(messageId)) return;
     _inFlight.remove(messageId);
     try {
       final dir = await _dir();
@@ -250,7 +347,9 @@ class MediaStore {
       fileName: _safeName(msg),
       bytes: bytes,
     );
-    return path == null ? SaveOutcome.cancelled : SaveOutcome.saved;
+    if (path == null) return SaveOutcome.cancelled;
+    await kept.remember(msg.id, file);
+    return SaveOutcome.saved;
   }
 
   Future<void> share(ChatMessage msg) async {

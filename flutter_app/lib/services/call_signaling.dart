@@ -39,6 +39,12 @@ const callRingingWaitTimeout = Duration(seconds: 45);
 /// Terminate quickly when the server says the callee is unreachable.
 const callUnreachableTimeout = Duration(seconds: 8);
 
+/// After SDP answer, how long to wait for ICE/media before surfacing failure.
+///
+/// Kept short (18s) so "Connecting…" does not linger, but still above typical
+/// Tailscale direct-path setup; ring/no-answer timers stop once answer arrives.
+const callMediaConnectTimeout = Duration(seconds: 18);
+
 /// Parses server `call.delivery` state strings.
 CallDeliveryState? parseCallDeliveryState(String? raw) {
   return switch (raw) {
@@ -124,6 +130,7 @@ CallPhase? callerPhaseAfterEvent(CallPhase current, String eventType) {
     case 'call.busy':
     case 'call.cancel':
     case 'call.timeout':
+    case 'call.failed':
     case 'call.end':
       if (current != CallPhase.ended && current != CallPhase.idle) {
         return CallPhase.ended;
@@ -147,6 +154,7 @@ String callerLogOutcome(String eventType, {required bool wasRinging}) {
     'call.reject' => 'rejected',
     'call.cancel' => 'missed',
     'call.timeout' => wasRinging ? 'missed' : 'missed',
+    'call.failed' => 'failed',
     'call.end' => 'answered',
     _ => wasRinging ? 'missed' : 'missed',
   };
@@ -155,6 +163,60 @@ String callerLogOutcome(String eventType, {required bool wasRinging}) {
 /// Whether an outgoing call should send `call.cancel` instead of `call.end`.
 bool outgoingShouldCancel(CallPhase phase) =>
     phase == CallPhase.outgoing || phase == CallPhase.ringing;
+
+/// Ring/no-answer timers must stop once the callee answers; media has its own window.
+bool shouldCancelOutgoingTimeoutOnAnswer(String eventType) =>
+    eventType == 'call.answer';
+
+/// Whether the outgoing ring timer may still end the call.
+bool outgoingTimeoutMayFire({
+  required CallPhase phase,
+  required bool remoteAnswered,
+}) {
+  if (phase == CallPhase.active || phase == CallPhase.ended) return false;
+  if (remoteAnswered) return false;
+  return true;
+}
+
+/// Arm a post-answer media connect watchdog once remote SDP is in place.
+bool shouldArmMediaConnectTimeout({
+  required CallPhase phase,
+  required bool remoteDescSet,
+}) {
+  return phase == CallPhase.connecting && remoteDescSet;
+}
+
+/// Callee applies the remote offer exactly once after local setup is complete.
+bool calleeMayApplyRemoteOffer({
+  required bool localTracksAdded,
+  required bool remoteDescSet,
+  required bool remoteDescApplying,
+  required bool isOutgoing,
+}) {
+  if (isOutgoing) return false;
+  if (!localTracksAdded) return false;
+  if (remoteDescSet || remoteDescApplying) return false;
+  return true;
+}
+
+/// `call.offer` events for the callee are stored, never applied inline.
+bool callOfferEventShouldStoreOnly({required bool isOutgoing}) => !isOutgoing;
+
+/// Whether accept/recovery should try applying a stored offer after setup.
+bool calleeShouldApplyStoredOffer({
+  required bool localTracksAdded,
+  required bool remoteDescSet,
+  required bool remoteDescApplying,
+  required Map<String, dynamic>? pendingOffer,
+}) {
+  return pendingOffer != null &&
+      calleeMayApplyRemoteOffer(
+        localTracksAdded: localTracksAdded,
+        remoteDescSet: remoteDescSet,
+        remoteDescApplying: remoteDescApplying,
+        isOutgoing: false,
+      );
+}
 
 /// In-call audio output routes exposed to the user.
 enum CallAudioRoute { earpiece, speaker, bluetooth }
@@ -224,3 +286,173 @@ bool shouldStopCallAlerts(CallPhase phase) =>
     phase == CallPhase.active ||
     phase == CallPhase.ended ||
     phase == CallPhase.idle;
+
+/// ICE/peer link quality for in-call media (pure, string wire values).
+enum CallMediaLinkState {
+  idle,
+  gathering,
+  checking,
+  connected,
+  reconnecting,
+  failed,
+}
+
+/// How long a transient ICE `disconnected` may last before we treat it as dead.
+const callMediaReconnectGrace = Duration(seconds: 12);
+
+/// Parses `sdpMLineIndex` from JSON numbers or numeric strings.
+int? parseIceMLineIndex(dynamic raw) {
+  if (raw == null) return null;
+  if (raw is int) return raw;
+  if (raw is num) return raw.toInt();
+  if (raw is String) return int.tryParse(raw.trim());
+  return null;
+}
+
+/// Normalizes a `call.ice` event into candidate fields, or null when unusable.
+Map<String, dynamic>? parseCallIceEvent(Map<String, dynamic> event) {
+  final candidate = event['candidate'];
+  if (candidate is! String || candidate.isEmpty) return null;
+  return {
+    'candidate': candidate,
+    'sdpMid': event['sdpMid'] as String?,
+    'sdpMLineIndex': parseIceMLineIndex(event['sdpMLineIndex']),
+  };
+}
+
+/// Safe diagnostic when [RTCPeerConnection.addCandidate] fails — no SDP/secrets.
+String iceAddFailureDiagnostic(Object error, {required bool hadRemoteDesc}) =>
+    'ICE add failed (remoteDesc=$hadRemoteDesc, ${error.runtimeType})';
+
+/// Phases where the app-owned Tailscale tunnel must stay up in background.
+bool callPhaseNeedsTunnelHold(CallPhase phase) =>
+    phase == CallPhase.outgoing ||
+    phase == CallPhase.ringing ||
+    phase == CallPhase.incoming ||
+    phase == CallPhase.connecting ||
+    phase == CallPhase.active;
+
+/// User-facing media failure copy; includes ICE apply count when relevant.
+String callMediaFailedMessage({required int iceAddFailures}) {
+  if (iceAddFailures > 0) {
+    return 'Call media failed to connect. ICE candidates could not be '
+        'applied ($iceAddFailures). Check Tailscale is direct on both phones.';
+  }
+  return 'Call media failed to connect. Check Tailscale is direct '
+      '(not relay-only).';
+}
+
+CallMediaIceWire? parseCallMediaIceWire(String? raw) {
+  if (raw == null || raw.isEmpty) return null;
+  final tail = raw.contains('.') ? raw.split('.').last : raw;
+  return switch (tail) {
+    'new' || 'RTCIceConnectionStateNew' => CallMediaIceWire.new_,
+    'checking' || 'RTCIceConnectionStateChecking' => CallMediaIceWire.checking,
+    'connected' ||
+    'RTCIceConnectionStateConnected' => CallMediaIceWire.connected,
+    'completed' ||
+    'RTCIceConnectionStateCompleted' => CallMediaIceWire.completed,
+    'failed' || 'RTCIceConnectionStateFailed' => CallMediaIceWire.failed,
+    'disconnected' ||
+    'RTCIceConnectionStateDisconnected' => CallMediaIceWire.disconnected,
+    'closed' || 'RTCIceConnectionStateClosed' => CallMediaIceWire.closed,
+    _ => null,
+  };
+}
+
+CallMediaPeerWire? parseCallMediaPeerWire(String? raw) {
+  if (raw == null || raw.isEmpty) return null;
+  final tail = raw.contains('.') ? raw.split('.').last : raw;
+  return switch (tail) {
+    'new' || 'RTCPeerConnectionStateNew' => CallMediaPeerWire.new_,
+    'connecting' ||
+    'RTCPeerConnectionStateConnecting' => CallMediaPeerWire.connecting,
+    'connected' ||
+    'RTCPeerConnectionStateConnected' => CallMediaPeerWire.connected,
+    'disconnected' ||
+    'RTCPeerConnectionStateDisconnected' => CallMediaPeerWire.disconnected,
+    'failed' || 'RTCPeerConnectionStateFailed' => CallMediaPeerWire.failed,
+    'closed' || 'RTCPeerConnectionStateClosed' => CallMediaPeerWire.closed,
+    _ => null,
+  };
+}
+
+/// Maps ICE + peer states to a single link state for UI/policy.
+CallMediaLinkState deriveCallMediaLinkState({
+  CallMediaIceWire? ice,
+  CallMediaPeerWire? peer,
+}) {
+  if (ice == CallMediaIceWire.connected ||
+      ice == CallMediaIceWire.completed ||
+      peer == CallMediaPeerWire.connected) {
+    return CallMediaLinkState.connected;
+  }
+  if (ice == CallMediaIceWire.failed || peer == CallMediaPeerWire.failed) {
+    return CallMediaLinkState.failed;
+  }
+  if (ice == CallMediaIceWire.disconnected ||
+      peer == CallMediaPeerWire.disconnected) {
+    return CallMediaLinkState.reconnecting;
+  }
+  if (ice == CallMediaIceWire.checking ||
+      peer == CallMediaPeerWire.connecting) {
+    return CallMediaLinkState.checking;
+  }
+  if (ice == CallMediaIceWire.new_) {
+    return CallMediaLinkState.gathering;
+  }
+  return CallMediaLinkState.idle;
+}
+
+/// Whether a transient ICE disconnect should start the reconnect grace window.
+bool shouldStartMediaReconnectGrace({
+  required CallPhase phase,
+  required CallMediaIceWire? ice,
+  required CallMediaPeerWire? peer,
+}) {
+  if (phase != CallPhase.connecting && phase != CallPhase.active) return false;
+  if (ice != CallMediaIceWire.disconnected) return false;
+  if (peer == CallMediaPeerWire.connected) return false;
+  return true;
+}
+
+/// Whether media should surface a terminal failure to the user.
+bool shouldReportMediaConnectFailure({
+  required CallPhase phase,
+  required CallMediaIceWire? ice,
+  required CallMediaPeerWire? peer,
+  required bool graceExpired,
+}) {
+  if (phase != CallPhase.connecting && phase != CallPhase.active) return false;
+  if (ice == CallMediaIceWire.failed || peer == CallMediaPeerWire.failed) {
+    return true;
+  }
+  if (!graceExpired) return false;
+  if (ice == CallMediaIceWire.disconnected &&
+      peer != CallMediaPeerWire.connected) {
+    return true;
+  }
+  return false;
+}
+
+/// ICE connection state wire values (WebRTC enum tails).
+enum CallMediaIceWire {
+  new_,
+  gathering,
+  checking,
+  connected,
+  completed,
+  failed,
+  disconnected,
+  closed,
+}
+
+/// Peer connection state wire values (WebRTC enum tails).
+enum CallMediaPeerWire {
+  new_,
+  connecting,
+  connected,
+  disconnected,
+  failed,
+  closed,
+}

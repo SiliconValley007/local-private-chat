@@ -14,6 +14,7 @@ import '../widgets/avatar.dart';
 import '../widgets/avatar_viewer.dart';
 import '../widgets/receipt_ticks.dart';
 import '../widgets/rename_dialog.dart';
+import '../widgets/sever_dialogs.dart';
 import '../widgets/error_banner.dart';
 import '../widgets/loading_placeholders.dart';
 import 'calls_screen.dart';
@@ -177,6 +178,20 @@ class _InboxScreenState extends State<InboxScreen> {
                 title: const Text('Rename'),
                 onTap: () => Navigator.pop(sheetContext, 'rename'),
               ),
+            ListTile(
+              leading: const Icon(Icons.delete_outline_rounded),
+              title: const Text('Delete chat'),
+              onTap: () => Navigator.pop(sheetContext, 'delete'),
+            ),
+            if (conv.type == 'dm')
+              ListTile(
+                leading: Icon(
+                  Icons.person_off_outlined,
+                  color: Theme.of(sheetContext).colorScheme.error,
+                ),
+                title: const Text('Remove contact'),
+                onTap: () => Navigator.pop(sheetContext, 'remove'),
+              ),
             const SizedBox(height: 8),
           ],
         ),
@@ -190,7 +205,35 @@ class _InboxScreenState extends State<InboxScreen> {
         await state.toggleMute(conv.id);
       case 'rename':
         await _rename(conv);
+      case 'delete':
+        await _deleteChat(conv);
+      case 'remove':
+        await _removeContact(conv);
     }
+  }
+
+  Future<void> _deleteChat(Conversation conv) async {
+    final scope = await showDeleteChatDialog(
+      context,
+      isDm: conv.type == 'dm',
+    );
+    if (scope == null || !mounted) return;
+    await context.read<AppState>().deleteConversation(
+      conv.id,
+      scope: scope,
+    );
+  }
+
+  Future<void> _removeContact(Conversation conv) async {
+    final peer = conv.peer;
+    if (peer == null) return;
+    final alsoDelete = await showRemoveContactDialog(context);
+    if (alsoDelete == null || !mounted) return;
+    await context.read<AppState>().blockContact(
+      peer.id,
+      conversationId: conv.id,
+      alsoDeleteChat: alsoDelete,
+    );
   }
 
   Future<void> _onMenuSelected(String value) async {
@@ -426,6 +469,7 @@ class _InboxScreenState extends State<InboxScreen> {
                     state.clearError();
                     state.refreshInbox();
                   },
+                  onDismiss: state.clearError,
                 ),
               ),
             if (state.showReconnecting)
@@ -696,6 +740,7 @@ class _ConversationTile extends StatelessWidget {
                         if (!previewIsTyping &&
                             fromMe &&
                             conversation.lastMessage?.isCallLog != true &&
+                            conversation.lastMessage?.isMediaTtlNotice != true &&
                             receiptLevel != null) ...[
                           ReceiptTicks(level: receiptLevel!, size: 13),
                           const SizedBox(width: 4),

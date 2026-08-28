@@ -86,6 +86,11 @@ class UserOut(BaseModel):
     has_avatar: bool = False
     avatar_version: int | None = None
     mood: str | None = None
+    on_tailnet: bool = True
+    #: On the tailnet as far as anyone knows, but has not opened the app here
+    #: yet, so the server has not matched them to a device.
+    tailnet_pending: bool = False
+    suspended: bool = False
 
     model_config = {"from_attributes": True}
 
@@ -146,6 +151,20 @@ class ConversationOut(BaseModel):
     disappear_after_seconds: int | None = None
     anniversary_on: str | None = None
     streak_days: int = 0
+    #: Kept for older clients. Authorized offline peers are never labelled
+    #: unreachable; last-seen belongs in the chat header, not the inbox.
+    unreachable: bool = False
+    #: Direct chat: contact was removed; no further messages.
+    removed: bool = False
+    #: Direct chat: peer is not an active, bound tailnet member.
+    not_on_tailnet: bool = False
+    #: Direct chat: an external share of the server device was revoked.
+    server_access_revoked: bool = False
+    #: Direct chat: peer has never connected over the tailnet, so nothing is
+    #: known about them yet. Unreachable, but not absent.
+    tailnet_pending: bool = False
+    #: Shared attachment expiry for this chat, in days.
+    media_ttl_days: int | None = None
 
 
 class SendMessageRequest(BaseModel):
@@ -189,6 +208,12 @@ class ReactionAggOut(BaseModel):
     user_ids: list[int] = Field(default_factory=list)
 
 
+class MediaRetainerOut(BaseModel):
+    user_id: int
+    username: str
+    display_name: str
+
+
 class MessageOut(BaseModel):
     id: int
     conversation_id: int
@@ -208,6 +233,13 @@ class MessageOut(BaseModel):
     edited_at: UtcDatetime | None = None
     deleted_at: UtcDatetime | None = None
     expires_at: UtcDatetime | None = None
+    media_expires_at: UtcDatetime | None = None
+    media_ttl_days: int | None = None
+    media_gone_at: UtcDatetime | None = None
+    media_gone_reason: str | None = None
+    media_available: bool = True
+    retained_by_me: bool = False
+    retainers: list[MediaRetainerOut] = Field(default_factory=list)
     reply_to: QuotedMessage | None = None
     receipts: list[ReceiptOut] = Field(default_factory=list)
     reactions: list[ReactionAggOut] = Field(default_factory=list)
@@ -243,6 +275,10 @@ class DisappearingRequest(BaseModel):
         if v is not None and v not in _DISAPPEARING_ALLOWED:
             raise ValueError("Invalid disappearing timer.")
         return v
+
+
+class MediaTtlDaysRequest(BaseModel):
+    days: int = Field(ge=1, le=365)
 
 
 class WallpaperDimRequest(BaseModel):
@@ -321,6 +357,33 @@ class OwnedMediaOut(BaseModel):
     created_at: UtcDatetime
 
 
+class StartUploadRequest(BaseModel):
+    """Opens a resumable upload: what is coming, and how big it is."""
+
+    type: str
+    filename: str = Field(min_length=1, max_length=255)
+    size: int = Field(ge=0)
+    mime: str | None = None
+    duration_ms: int | None = None
+
+
+class UploadSessionOut(BaseModel):
+    """How much of an upload the server holds, and how to send the rest."""
+
+    upload_id: str
+    offset: int
+    size: int
+    chunk_bytes: int
+    complete: bool
+
+
+class CancelUploadOut(BaseModel):
+    """Result of abandoning a part-sent attachment."""
+
+    cancelled: bool
+    reclaimed_bytes: int
+
+
 class DeleteOwnedMediaRequest(BaseModel):
     message_ids: list[int] = Field(min_length=1, max_length=500)
 
@@ -328,6 +391,36 @@ class DeleteOwnedMediaRequest(BaseModel):
 class DeleteOwnedMediaOut(BaseModel):
     deleted: int
     reclaimed_bytes: int
+
+
+class MediaPolicyOut(BaseModel):
+    default_days: int
+    min_days: int
+    max_days: int
+    my_days: int | None = None
+
+
+class MediaTtlRequest(BaseModel):
+    days: int | None = None
+
+
+class DeleteConversationOut(BaseModel):
+    deleted: bool
+    scope: str
+
+
+class BlockOut(BaseModel):
+    blocked: bool
+    user_id: int
+
+
+class TailnetAccountOut(BaseModel):
+    user_id: int
+    username: str
+    display_name: str
+    login: str | None = None
+    shared: bool = False
+    suspended: bool = False
 
 
 class AdminStatusOut(BaseModel):
@@ -347,6 +440,19 @@ class AdminStatusOut(BaseModel):
     this_device_trusted: bool = False
     #: Admin account with no pin yet — the app should offer "Trust this phone".
     needs_device_trust: bool = False
+    #: The tailnet gate, so the admin can see it in the app instead of having to
+    #: read the server's console. Only filled in for the admin.
+    tailnet_configured: bool = False
+    #: False while the membership snapshot is missing or stale: nobody has left
+    #: the tailnet, the server simply cannot check right now.
+    tailnet_verified: bool = True
+    tailnet_reason: str | None = None
+    tailnet_devices: list[str] = Field(default_factory=list)
+    tailnet_shared_logins: list[str] = Field(default_factory=list)
+    tailnet_shares_verified: bool = False
+    tailnet_shares_reason: str | None = None
+    tailnet_accounts: list[TailnetAccountOut] = Field(default_factory=list)
+    tailnet_checked_at: datetime | None = None
 
 
 class SetAdminRequest(BaseModel):
@@ -357,6 +463,11 @@ class SetAdminDeviceRequest(BaseModel):
     """Trust the caller's device, or clear the pin so any admin install works."""
 
     clear: bool = False
+
+
+class TailscaleBindRequest(BaseModel):
+    user_id: int
+    login: str = Field(min_length=1, max_length=120)
 
 
 class OnlineUserOut(BaseModel):

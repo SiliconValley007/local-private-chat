@@ -1,5 +1,6 @@
 # --- Secrets (never commit) ---
 server/jwt_secret.txt
+server/tailscale-oauth.env
 server/firebase-service-account.json
 **/firebase-service-account*.json
 !**/firebase-service-account.json.example
@@ -66,16 +67,18 @@ releases/*
 # --- Local investigation dumps (never source) ---
 .package-audit/
 .video-analysis/
-
-# --- Stray build / run logs ---
-*.log
-gradle_out.txt
+.tmp_*/
+.tmp_*
 
 # --- Tests (kept locally, never published) ---
 flutter_app/test/
 flutter_app/android/app/src/test/
 server/tests/
 tools/live_smoke.py
+
+# --- Stray build / run logs ---
+*.log
+gradle_out.txt
 
 # --- Coverage / tooling ---
 **/coverage/

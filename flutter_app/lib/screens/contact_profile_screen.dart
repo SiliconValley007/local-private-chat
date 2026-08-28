@@ -3,6 +3,7 @@ import 'package:provider/provider.dart';
 
 import '../app_state.dart';
 import '../chat_navigation.dart';
+import '../disconnect_copy.dart';
 import '../models.dart';
 import '../screens/shared_media_screen.dart';
 import '../theme.dart';
@@ -10,6 +11,7 @@ import '../time_format.dart';
 import '../widgets/avatar.dart';
 import '../widgets/avatar_viewer.dart';
 import '../widgets/rename_dialog.dart';
+import '../widgets/sever_dialogs.dart';
 
 /// WhatsApp-style contact profile opened from a DM chat header.
 class ContactProfileScreen extends StatelessWidget {
@@ -34,9 +36,17 @@ class ContactProfileScreen extends StatelessWidget {
     final title = state.titleFor(conv);
     final online = state.isUserOnline(peer);
     final seen = state.lastSeenFor(peer);
-    final presence = online
-        ? 'online'
-        : (seen == null ? '' : formatLastSeen(context, seen));
+    final disconnect = disconnectSubtitle(
+      removed: conv.removed,
+      unreachable: state.unreachableFor(conv),
+      notOnTailnet: conv.notOnTailnet,
+      serverAccessRevoked: conv.serverAccessRevoked,
+      tailnetPending: conv.tailnetPending,
+    );
+    final presence = disconnect ??
+        (online
+            ? 'online'
+            : (seen == null ? '' : formatLastSeen(context, seen)));
     final mood = peer.mood?.trim();
     final scheme = Theme.of(context).colorScheme;
 
@@ -192,6 +202,35 @@ class ContactProfileScreen extends StatelessWidget {
             icon: Icons.videocam_rounded,
             title: 'Video call',
             onTap: () => Navigator.pop(context, 'video'),
+          ),
+          _ActionTile(
+            icon: Icons.delete_outline_rounded,
+            title: 'Delete chat',
+            subtitle: tailscaleUnchangedNote,
+            onTap: () async {
+              final scope = await showDeleteChatDialog(context, isDm: true);
+              if (scope == null || !context.mounted) return;
+              await context.read<AppState>().deleteConversation(
+                conv.id,
+                scope: scope,
+              );
+              if (context.mounted) Navigator.pop(context);
+            },
+          ),
+          _ActionTile(
+            icon: Icons.person_off_outlined,
+            title: 'Remove contact',
+            subtitle: tailscaleUnchangedNote,
+            onTap: () async {
+              final alsoDelete = await showRemoveContactDialog(context);
+              if (alsoDelete == null || !context.mounted) return;
+              await context.read<AppState>().blockContact(
+                peer.id,
+                conversationId: conv.id,
+                alsoDeleteChat: alsoDelete,
+              );
+              if (context.mounted) Navigator.pop(context);
+            },
           ),
         ],
       ),

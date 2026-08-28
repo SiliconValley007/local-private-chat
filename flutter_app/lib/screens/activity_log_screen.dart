@@ -296,12 +296,15 @@ class _ActivityLogScreenState extends State<ActivityLogScreen> {
         const SizedBox(height: 10),
         SingleChildScrollView(
           scrollDirection: Axis.horizontal,
+          clipBehavior: Clip.none,
+          padding: const EdgeInsets.symmetric(horizontal: 2),
           child: Row(
             children: [
               for (final category in auditCategories)
                 Padding(
                   padding: const EdgeInsets.only(right: 8),
                   child: FilterChip(
+                    key: Key('activity-log-filter-${category.id}'),
                     label: Text(category.label),
                     selected: _category == category.id,
                     onSelected: (_) => _pickCategory(category.id),
@@ -433,6 +436,9 @@ class _Stat extends StatelessWidget {
   }
 }
 
+/// Chosen from the share list instead of a login, to ask for one by hand.
+const String _typedLoginSentinel = '\u0000type';
+
 /// Who holds the admin role, and the one control that changes it.
 class _AdminSetupCard extends StatefulWidget {
   const _AdminSetupCard({required this.status, required this.onChanged});
@@ -512,6 +518,34 @@ class _AdminSetupCardState extends State<_AdminSetupCard> {
                 ),
               ),
             ],
+            if (status.tailnetLine != null) ...[
+              const SizedBox(height: 8),
+              Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Icon(
+                    status.tailnetVerified
+                        ? Icons.verified_user_outlined
+                        : Icons.cloud_off_rounded,
+                    size: 16,
+                    color: status.tailnetVerified
+                        ? scheme.onSurfaceVariant
+                        : scheme.error,
+                  ),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: Text(
+                      status.tailnetLine!,
+                      style: theme.textTheme.labelMedium?.copyWith(
+                        color: status.tailnetVerified
+                            ? scheme.onSurfaceVariant
+                            : scheme.error,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ],
             if (status.canClaim && !status.lockedByServer) ...[
               const SizedBox(height: 12),
               Align(
@@ -557,6 +591,30 @@ class _AdminSetupCardState extends State<_AdminSetupCard> {
                   onPressed: _saving ? null : _forceLogoutPicker,
                   icon: const Icon(Icons.logout_rounded, size: 18),
                   label: const Text('Sign someone out'),
+                ),
+              ),
+            ],
+            if (status.isAdmin && status.tailnetConfigured) ...[
+              const SizedBox(height: 8),
+              Align(
+                alignment: Alignment.centerLeft,
+                child: FilledButton.tonalIcon(
+                  key: const Key('activity-log-map-shared-user'),
+                  onPressed: _saving ? null : _mapSharedUser,
+                  icon: const Icon(Icons.device_hub_rounded, size: 18),
+                  label: const Text('Map shared-server user'),
+                ),
+              ),
+              const SizedBox(height: 4),
+              Text(
+                status.tailnetSharesVerified
+                    ? '${status.tailnetSharedLogins.length} accepted server-device share(s) found. Mapping is optional: when they open Local Chat over the share, the server names them automatically. Use this only to attach a share to an account before they connect.'
+                    : 'Accepted server-device shares could not be listed, so nobody is named automatically. You can still map a share by typing the login. ${status.tailnetSharesReason ?? ''}'
+                          .trim(),
+                style: theme.textTheme.labelSmall?.copyWith(
+                  color: status.tailnetSharesVerified
+                      ? scheme.onSurfaceVariant
+                      : scheme.error,
                 ),
               ),
             ],
@@ -669,6 +727,175 @@ class _AdminSetupCardState extends State<_AdminSetupCard> {
     }
   }
 
+  Future<String?> _askForLogin() async {
+    final controller = TextEditingController();
+    final typed = await showDialog<String>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Tailscale login'),
+        content: TextField(
+          key: const Key('activity-log-shared-login-field'),
+          controller: controller,
+          autofocus: true,
+          keyboardType: TextInputType.emailAddress,
+          decoration: const InputDecoration(hintText: 'name@example.com'),
+          onSubmitted: (value) => Navigator.pop(dialogContext, value.trim()),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () =>
+                Navigator.pop(dialogContext, controller.text.trim()),
+            child: const Text('Use this login'),
+          ),
+        ],
+      ),
+    );
+    controller.dispose();
+    return typed;
+  }
+
+  Future<void> _mapSharedUser() async {
+    final status = widget.status;
+    final messenger = ScaffoldMessenger.of(context);
+    if (status.tailnetSharesVerified && status.tailnetSharedLogins.isEmpty) {
+      messenger.showSnackBar(
+        const SnackBar(
+          content: Text(
+            'No accepted shares found. Share the server device in Tailscale and ask the recipient to accept it first.',
+          ),
+        ),
+      );
+      return;
+    }
+    if (status.tailnetAccounts.isEmpty) {
+      messenger.showSnackBar(
+        const SnackBar(content: Text('No Local Chat accounts are available.')),
+      );
+      return;
+    }
+
+    final account = await showModalBottomSheet<TailnetAccount>(
+      context: context,
+      showDragHandle: true,
+      builder: (sheetContext) => SafeArea(
+        child: ListView(
+          shrinkWrap: true,
+          children: [
+            const ListTile(
+              title: Text('Choose the Local Chat account'),
+              subtitle: Text(
+                'This grants access only while their Tailscale share of the server remains accepted.',
+              ),
+            ),
+            for (final row in status.tailnetAccounts)
+              ListTile(
+                leading: Icon(
+                  row.shared
+                      ? Icons.device_hub_rounded
+                      : Icons.person_outline_rounded,
+                ),
+                title: Text(row.displayName),
+                subtitle: Text(
+                  '@${row.username}'
+                  '${row.login == null ? '' : ' · ${row.login}'}'
+                  '${row.suspended ? ' · suspended' : ''}',
+                ),
+                onTap: () => Navigator.pop(sheetContext, row),
+              ),
+          ],
+        ),
+      ),
+    );
+    if (account == null || !mounted) return;
+
+    final login = await showModalBottomSheet<String>(
+      context: context,
+      showDragHandle: true,
+      builder: (sheetContext) => SafeArea(
+        child: ListView(
+          shrinkWrap: true,
+          children: [
+            ListTile(
+              title: Text('Who is @${account.username}?'),
+              subtitle: Text(
+                status.tailnetSharesVerified
+                    ? 'Choose the Tailscale user who accepted the share of this server device.'
+                    : 'The accepted shares cannot be listed right now, so type the Tailscale login yourself. ${status.tailnetSharesReason ?? ''}'
+                          .trim(),
+              ),
+            ),
+            for (final value in status.tailnetSharedLogins)
+              ListTile(
+                leading: const Icon(Icons.vpn_key_outlined),
+                title: Text(value),
+                onTap: () => Navigator.pop(sheetContext, value),
+              ),
+            ListTile(
+              key: const Key('activity-log-type-shared-login'),
+              leading: const Icon(Icons.keyboard_alt_outlined),
+              title: const Text('Type the Tailscale login'),
+              subtitle: const Text('The email they use to sign in to Tailscale'),
+              onTap: () => Navigator.pop(sheetContext, _typedLoginSentinel),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (login == null || !mounted) return;
+    final chosen = login == _typedLoginSentinel ? await _askForLogin() : login;
+    if (chosen == null || chosen.isEmpty || !mounted) return;
+
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: Text('Map @${account.username}?'),
+        content: Text(
+          'Allow ${account.displayName} to use Local Chat as $chosen while that '
+          'accepted Tailscale share exists?\n\nIf you revoke the share in '
+          'Tailscale, the next server poll suspends this account and clears its '
+          'sessions and notification tokens.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: const Text('Map account'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+
+    setState(() => _saving = true);
+    try {
+      await context.read<AppState>().api.bindTailnetAccount(
+        userId: account.userId,
+        login: chosen,
+      );
+      if (!mounted) return;
+      messenger.showSnackBar(
+        SnackBar(
+          content: Text(
+            '@${account.username} is now mapped to the accepted share for $chosen.',
+          ),
+        ),
+      );
+      await widget.onChanged();
+    } catch (error) {
+      if (!mounted) return;
+      messenger.showSnackBar(SnackBar(content: Text(friendlyMessage(error))));
+    } finally {
+      if (mounted) setState(() => _saving = false);
+    }
+  }
+
   Future<void> _promptForUsername() async {
     final status = widget.status;
     final controller = TextEditingController(
@@ -760,15 +987,21 @@ class _AuditRowState extends State<_AuditRow> {
   String? _before;
   String? _after;
   bool _expanded = false;
-  bool _opened = false;
   bool _opening = false;
   bool _primed = false;
+  bool _triedWithKey = false;
   bool _showTechnical = false;
 
   AuditEntry get entry => widget.entry;
 
-  bool get _hasSealedText =>
-      isE2eCipherText(entry.beforeText) || isE2eCipherText(entry.afterText);
+  /// A side that is sealed and has not been opened yet.
+  ///
+  /// Tracked per side rather than per entry. An edit carries two versions, and
+  /// treating the entry as done because one of them opened left the other one
+  /// reading "not readable on this device" for good.
+  bool get _stillSealed =>
+      (isE2eCipherText(entry.beforeText) && _before == null) ||
+      (isE2eCipherText(entry.afterText) && _after == null);
 
   /// Tries to open the sealed text with this phone's own key.
   ///
@@ -778,24 +1011,34 @@ class _AuditRowState extends State<_AuditRow> {
   /// key for that chat. Latching on one failed attempt was what left an entry
   /// reading "not readable on this device" until the screen was reopened.
   Future<void> _openSealedText({bool prepare = false}) async {
-    if (_opened || _opening || !_hasSealedText) return;
+    if (_opening || !_stillSealed) return;
     _opening = true;
     final state = context.read<AppState>();
     try {
-      final before = await state.revealSealedAuditText(
-        entry.conversationId,
-        entry.beforeText,
-        prepare: prepare,
-      );
-      final after = await state.revealSealedAuditText(
-        entry.conversationId,
-        entry.afterText,
-      );
-      if (!mounted || (before == null && after == null)) return;
+      if (prepare) await state.prepareSealedReveal(entry.conversationId);
+      // Once a try has run with the key in hand, a side that is still sealed is
+      // sealed for good — it was written for a device that no longer exists —
+      // so the retry in [build] stops instead of spinning on every frame.
+      if (state.canRevealSealedChat(entry.conversationId)) _triedWithKey = true;
+      final before =
+          _before ??
+          await state.revealSealedAuditText(
+            entry.conversationId,
+            entry.beforeText,
+          );
+      final after =
+          _after ??
+          await state.revealSealedAuditText(
+            entry.conversationId,
+            entry.afterText,
+          );
+      if (!mounted) return;
+      // Drawn again even when nothing opened: what the reader is told about a
+      // side that stayed sealed depends on this try having happened, and
+      // leaving the frame alone was what pinned an entry at "Opening…".
       setState(() {
-        _before = before;
-        _after = after;
-        _opened = true;
+        _before = before ?? _before;
+        _after = after ?? _after;
       });
     } finally {
       _opening = false;
@@ -810,7 +1053,20 @@ class _AuditRowState extends State<_AuditRow> {
     targetName: state.usernameForUserId(entry.targetUserId),
     revealedBefore: _before,
     revealedAfter: _after,
+    sealedReason: _sealedReason(state),
   );
+
+  /// What to tell the reader about a side that has not opened.
+  AuditSealedReason _sealedReason(AppState state) {
+    if (_opening) return AuditSealedReason.opening;
+    final reason = state.sealedChatReason(entry.conversationId);
+    // The key is here but no try has run with it yet, so the text is not being
+    // refused — it is still on its way.
+    if (reason == AuditSealedReason.keyGone && !_triedWithKey) {
+      return AuditSealedReason.opening;
+    }
+    return reason;
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -821,9 +1077,9 @@ class _AuditRowState extends State<_AuditRow> {
     // other phone finally replying to a key swap — so an entry left sealed asks
     // again as soon as this account can read that chat.
     if (_expanded &&
-        !_opened &&
         !_opening &&
-        _hasSealedText &&
+        _stillSealed &&
+        !_triedWithKey &&
         state.canRevealSealedChat(entry.conversationId)) {
       unawaited(_openSealedText());
     }
@@ -846,6 +1102,8 @@ class _AuditRowState extends State<_AuditRow> {
         child: ExpansionTile(
           tilePadding: const EdgeInsets.symmetric(horizontal: 14),
           childrenPadding: const EdgeInsets.fromLTRB(14, 0, 14, 12),
+          expandedAlignment: Alignment.topLeft,
+          expandedCrossAxisAlignment: CrossAxisAlignment.stretch,
           onExpansionChanged: (open) {
             _expanded = open;
             if (!open) return;
@@ -887,7 +1145,10 @@ class _AuditRowState extends State<_AuditRow> {
               for (final row in facts) AuditFactLine(row: row),
             ],
             const SizedBox(height: 2),
-            Row(
+            Wrap(
+              alignment: WrapAlignment.spaceBetween,
+              crossAxisAlignment: WrapCrossAlignment.center,
+              spacing: 8,
               children: [
                 TextButton.icon(
                   onPressed: () =>
@@ -904,7 +1165,6 @@ class _AuditRowState extends State<_AuditRow> {
                         : 'Technical details',
                   ),
                 ),
-                const Spacer(),
                 TextButton.icon(
                   onPressed: () => _copy(naming),
                   icon: const Icon(Icons.copy_all_rounded, size: 16),

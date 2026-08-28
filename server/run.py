@@ -330,6 +330,12 @@ def _dispatch(args: list[str]) -> int:
         from set_admin import main as set_admin_main  # pylint: disable=import-outside-toplevel
 
         return set_admin_main(args[1:])
+    if args and args[0] == "tailscale-check":
+        from tailscale_check import (  # pylint: disable=import-outside-toplevel
+            main as tailscale_check_main,
+        )
+
+        return tailscale_check_main(args[1:])
     if args and args[0] == "allow-firewall":
         if os.name != "nt":
             print("Nothing to do: this host has no Windows Firewall.")

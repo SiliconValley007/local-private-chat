@@ -13,7 +13,6 @@ class TailscaleIdleExitReceiver : BroadcastReceiver() {
         if (intent?.action != TailscaleIdleExit.ACTION) return
         TailscaleIdleExit.onAlarm(
             context,
-            AppForeground.isForeground(context),
             AppForeground.callStillActive(),
             AppForeground.transferStillActive(),
         )

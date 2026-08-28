@@ -48,6 +48,15 @@ class AdminStatus {
     this.adminDevicePinned = false,
     this.thisDeviceTrusted = false,
     this.needsDeviceTrust = false,
+    this.tailnetConfigured = false,
+    this.tailnetVerified = true,
+    this.tailnetReason,
+    this.tailnetDevices = const [],
+    this.tailnetSharedLogins = const [],
+    this.tailnetSharesVerified = false,
+    this.tailnetSharesReason,
+    this.tailnetAccounts = const [],
+    this.tailnetCheckedAt,
   });
 
   factory AdminStatus.fromJson(Map<String, dynamic> json) => AdminStatus(
@@ -59,6 +68,28 @@ class AdminStatus {
     adminDevicePinned: json['admin_device_pinned'] == true,
     thisDeviceTrusted: json['this_device_trusted'] == true,
     needsDeviceTrust: json['needs_device_trust'] == true,
+    tailnetConfigured: json['tailnet_configured'] == true,
+    tailnetVerified: json['tailnet_verified'] != false,
+    tailnetReason: json['tailnet_reason'] as String?,
+    tailnetDevices: [
+      for (final name in (json['tailnet_devices'] as List<Object?>? ?? const []))
+        if (name is String && name.isNotEmpty) name,
+    ],
+    tailnetSharedLogins: [
+      for (final login
+          in (json['tailnet_shared_logins'] as List<Object?>? ?? const []))
+        if (login is String && login.isNotEmpty) login,
+    ],
+    tailnetSharesVerified: json['tailnet_shares_verified'] == true,
+    tailnetSharesReason: json['tailnet_shares_reason'] as String?,
+    tailnetAccounts: [
+      for (final row
+          in (json['tailnet_accounts'] as List<Object?>? ?? const []))
+        if (row is Map<String, dynamic>) TailnetAccount.fromJson(row),
+    ],
+    tailnetCheckedAt: DateTime.tryParse(
+      (json['tailnet_checked_at'] as String?) ?? '',
+    ),
   );
 
   final String myUsername;
@@ -82,7 +113,35 @@ class AdminStatus {
   /// Admin with no pin yet — offer "Trust this phone".
   final bool needsDeviceTrust;
 
+  /// The server is enforcing Tailscale membership.
+  final bool tailnetConfigured;
+
+  /// The server has a fresh membership answer. When false, nobody has left the
+  /// tailnet — the server cannot check, which pauses messaging for everyone.
+  final bool tailnetVerified;
+  final String? tailnetReason;
+  final List<String> tailnetDevices;
+  final List<String> tailnetSharedLogins;
+  final bool tailnetSharesVerified;
+  final String? tailnetSharesReason;
+  final List<TailnetAccount> tailnetAccounts;
+  final DateTime? tailnetCheckedAt;
+
   bool get unclaimed => adminUsername == null || adminUsername!.isEmpty;
+
+  /// One line for the admin: is the gate open, and if not, why.
+  String? get tailnetLine {
+    if (!isAdmin || !tailnetConfigured) return null;
+    if (!tailnetVerified) {
+      final why = tailnetReason;
+      return why == null || why.isEmpty
+          ? 'Tailnet membership is not verified, so messaging is paused.'
+          : 'Tailnet membership is not verified, so messaging is paused: $why';
+    }
+    final count = tailnetDevices.length;
+    return 'Tailnet membership verified: '
+        '$count ${count == 1 ? 'device' : 'devices'} on this tailnet.';
+  }
 
   /// May this phone actually fetch the activity log right now?
   bool get canReadLog {
@@ -90,6 +149,33 @@ class AdminStatus {
     if (!adminDevicePinned) return true;
     return thisDeviceTrusted;
   }
+}
+
+class TailnetAccount {
+  const TailnetAccount({
+    required this.userId,
+    required this.username,
+    required this.displayName,
+    this.login,
+    this.shared = false,
+    this.suspended = false,
+  });
+
+  factory TailnetAccount.fromJson(Map<String, dynamic> json) => TailnetAccount(
+    userId: json['user_id'] as int,
+    username: json['username'] as String,
+    displayName: json['display_name'] as String,
+    login: json['login'] as String?,
+    shared: json['shared'] == true,
+    suspended: json['suspended'] == true,
+  );
+
+  final int userId;
+  final String username;
+  final String displayName;
+  final String? login;
+  final bool shared;
+  final bool suspended;
 }
 
 /// Header counts for the log screen.
@@ -189,6 +275,7 @@ class AuditNaming {
     this.targetName,
     this.revealedBefore,
     this.revealedAfter,
+    this.sealedReason = AuditSealedReason.otherChat,
   });
 
   /// The account reading the log, so its own actions read as "You".
@@ -214,6 +301,32 @@ class AuditNaming {
 
   /// [AuditEntry.afterText] after this device opened it with its own key.
   final String? revealedAfter;
+
+  /// Why text this phone could not open is sealed, so the log can say which of
+  /// the very different reasons applies instead of one flat refusal.
+  final AuditSealedReason sealedReason;
+}
+
+/// Why a sealed side of an entry is not being shown.
+///
+/// The reader is a party to their own chats and holds those keys, so text they
+/// sent or received should open here. When it does not, the reason decides
+/// whether they should wait, do something, or accept that it is gone — and a
+/// single "not readable" message for all three reads like a broken log.
+enum AuditSealedReason {
+  /// This phone is opening it right now.
+  opening,
+
+  /// This phone is in that chat but has not swapped keys with the other side in
+  /// this run, so the text is readable once that chat is opened.
+  needsChatVisit,
+
+  /// Not this account's chat. Sealed for everyone here, by design.
+  otherChat,
+
+  /// This account's chat, key in hand, and it still will not open: it was
+  /// sealed by an install of the app that no longer exists.
+  keyGone,
 }
 
 /// How a moment is written for this reader, injected so the wording can be
@@ -253,7 +366,19 @@ String auditActionLabel(String action) {
     'conversation.wallpaper_cleared': 'Wallpaper cleared',
     'conversation.wallpaper_dimmed': 'Wallpaper dimming changed',
     'conversation.disappearing_set': 'Disappearing messages changed',
+    'conversation.media_ttl_set': 'Attachment expiry changed',
     'conversation.anniversary_set': 'Anniversary changed',
+    'settings.media_ttl': 'Server attachment expiry changed',
+    'tailscale.bound': 'Tailscale identity bound',
+    'tailscale.restored': 'Tailscale identity restored',
+    'tailscale.suspended': 'Account suspended (left tailnet)',
+    'tailscale.unbound': 'Tailscale identity unbound',
+    'tailscale.bind_conflict': 'Tailscale identity already bound',
+    'tailscale.snapshot_refreshed': 'Tailnet membership refreshed',
+    'tailscale.push_blocked': 'Notification blocked (not on tailnet)',
+    'message.media_expired': 'Attachment expired on the server',
+    'media.retained': 'Attachment kept on the server',
+    'media.retain_dropped': 'Attachment no longer kept on the server',
     'admin.designated': 'Admin changed',
     'admin.device_trusted': 'Admin device trusted',
     'admin.device_cleared': 'Admin device pin cleared',
@@ -340,6 +465,27 @@ String auditSentence(
     'conversation.wallpaper_dimmed' =>
       '$who dimmed the wallpaper$where to ${_dimLabel(after)}',
     'conversation.disappearing_set' => _disappearingSentence(who, where, after),
+    'conversation.media_ttl_set' =>
+      '$who changed attachment expiry$where from ${entry.beforeText ?? "?"} days to ${after ?? "?"} days',
+    'settings.media_ttl' =>
+      '$who set the server attachment expiry to ${after ?? "?"} days',
+    'tailscale.bound' =>
+      '$who bound a Local Chat account to Tailscale ${after ?? "an identity"}',
+    'tailscale.restored' =>
+      '$who was restored on Tailscale ${after ?? "an identity"}',
+    'tailscale.suspended' =>
+      '$who was suspended because they left the tailnet; history was kept',
+    'tailscale.unbound' => '$who unbound a Tailscale identity',
+    'tailscale.snapshot_refreshed' =>
+      'The server refreshed the tailnet membership snapshot',
+    'tailscale.push_blocked' =>
+      'A notification for ${_personLabel(id: entry.targetUserId, username: naming.targetName, naming: naming)} '
+          'was blocked and their push tokens cleared: they are not on this tailnet',
+    'message.media_expired' =>
+      'An attachment$where left the server when its timer ran out',
+    'media.retained' => '$who kept an attachment$where on the server',
+    'media.retain_dropped' =>
+      '$who stopped keeping an attachment$where on the server',
     'conversation.anniversary_set' =>
       after == null || after.isEmpty
           ? '$who cleared the anniversary$where'
@@ -545,10 +691,45 @@ class AuditTextBlock {
 const String _openedHere =
     'Opened on this phone with your own key. The server only ever stored it '
     'encrypted.';
-const String _stillSealed =
-    'Encrypted by the phone that sent it. This device holds no key for that '
-    'chat, so nobody here — server or admin — can open it.';
 const String _sealedValue = 'Not readable on this device';
+
+/// What a side this phone has not opened should read, and why.
+///
+/// A reader is one of the two parties to their own chats, so their own text is
+/// expected to open. The wording exists to tell the cases apart: still working
+/// on it, one chat visit away, somebody else's chat, or gone for good.
+({String value, String note}) _sealedWording(AuditNaming naming) {
+  switch (naming.sealedReason) {
+    case AuditSealedReason.opening:
+      return (
+        value: 'Opening…',
+        note: "Unsealing it here with this phone's own key.",
+      );
+    case AuditSealedReason.needsChatVisit:
+      final peer = naming.peerName?.trim() ?? '';
+      final who = peer.isEmpty ? 'that chat' : '@$peer';
+      return (
+        value: 'Not readable yet',
+        note:
+            'This phone has not swapped keys with $who since it started. Open '
+            'that chat once and this text reads plainly here.',
+      );
+    case AuditSealedReason.otherChat:
+      return (
+        value: _sealedValue,
+        note:
+            'Encrypted by the phone that sent it. Only the phones in that chat '
+            'hold the key — not this one, not the server, not the admin.',
+      );
+    case AuditSealedReason.keyGone:
+      return (
+        value: _sealedValue,
+        note:
+            'Encrypted for an install of the app that is gone — reinstalled, or '
+            'its keys were reset — so this text opens nowhere now.',
+      );
+  }
+}
 
 /// The before/after boxes for an entry, or nothing when it changed no text.
 ///
@@ -569,6 +750,7 @@ List<AuditTextBlock> auditTextBlocks(
           before,
           naming.revealedBefore,
           type: _messageType(entry),
+          naming: naming,
           isBefore: true,
         ),
         _messageBlock(
@@ -576,6 +758,7 @@ List<AuditTextBlock> auditTextBlocks(
           after,
           naming.revealedAfter,
           type: _messageType(entry),
+          naming: naming,
         ),
       ];
     case 'message.deleted':
@@ -587,6 +770,7 @@ List<AuditTextBlock> auditTextBlocks(
           before,
           naming.revealedBefore,
           type: _messageType(entry),
+          naming: naming,
           isBefore: true,
         ),
       ];
@@ -617,6 +801,7 @@ List<AuditTextBlock> auditTextBlocks(
             before,
             naming.revealedBefore,
             type: _messageType(entry),
+            naming: naming,
             isBefore: true,
           ),
         if (after != null && after.isNotEmpty)
@@ -625,6 +810,7 @@ List<AuditTextBlock> auditTextBlocks(
             after,
             naming.revealedAfter,
             type: _messageType(entry),
+            naming: naming,
           ),
       ];
   }
@@ -662,6 +848,7 @@ AuditTextBlock _messageBlock(
   String? revealed, {
   String? type,
   bool isBefore = false,
+  AuditNaming naming = const AuditNaming(),
 }) {
   final opened = revealed?.trim();
   if (opened != null && opened.isNotEmpty) {
@@ -681,10 +868,11 @@ AuditTextBlock _messageBlock(
     );
   }
   if (isE2eCipherText(raw)) {
+    final sealed = _sealedWording(naming);
     return AuditTextBlock(
       label: label,
-      value: _sealedValue,
-      note: _stillSealed,
+      value: sealed.value,
+      note: sealed.note,
       isBefore: isBefore,
       sealed: true,
     );

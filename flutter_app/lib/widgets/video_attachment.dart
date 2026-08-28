@@ -232,6 +232,20 @@ class _VideoViewerScreenState extends State<VideoViewerScreen> {
   DateTime? _saveStartedAt;
   bool _showSlowHint = false;
   double _drag = 0;
+  bool _chromeHidden = false;
+
+  void _toggleChrome() {
+    setState(() => _chromeHidden = !_chromeHidden);
+    applyMediaViewerSystemBars(hidden: _chromeHidden);
+  }
+
+  void _togglePlayback() {
+    final controller = _controller;
+    if (controller == null) return;
+    setState(() {
+      controller.value.isPlaying ? controller.pause() : controller.play();
+    });
+  }
 
   @override
   void initState() {
@@ -255,6 +269,7 @@ class _VideoViewerScreenState extends State<VideoViewerScreen> {
         await controller.dispose();
         return;
       }
+      controller.addListener(_onVideoTick);
       setState(() => _controller = controller);
       await controller.setLooping(false);
       await controller.play();
@@ -263,8 +278,14 @@ class _VideoViewerScreenState extends State<VideoViewerScreen> {
     }
   }
 
+  void _onVideoTick() {
+    if (mounted) setState(() {});
+  }
+
   @override
   void dispose() {
+    if (_chromeHidden) applyMediaViewerSystemBars(hidden: false);
+    _controller?.removeListener(_onVideoTick);
     _controller?.dispose();
     super.dispose();
   }
@@ -358,40 +379,11 @@ class _VideoViewerScreenState extends State<VideoViewerScreen> {
   Widget build(BuildContext context) {
     final controller = _controller;
     final opacity = (1.0 - (_drag.abs() / 280)).clamp(0.35, 1.0);
+    final chromeShown = !_chromeHidden;
+    final caption = readableBody(widget.message.body)?.trim() ?? '';
 
     return Scaffold(
       backgroundColor: Colors.black.withValues(alpha: opacity),
-      appBar: AppBar(
-        backgroundColor: Colors.black,
-        foregroundColor: Colors.white,
-        surfaceTintColor: Colors.black,
-        title: Text(
-          widget.message.mediaName ?? 'Video',
-          style: const TextStyle(fontSize: 15, color: Colors.white),
-          overflow: TextOverflow.ellipsis,
-        ),
-        actions: [
-          if (widget.onShowInChat != null)
-            IconButton(
-              tooltip: 'Show in chat',
-              onPressed: widget.onShowInChat,
-              icon: const Icon(Icons.chat_bubble_outline_rounded),
-            ),
-          if (_saveProgress != null)
-            _DownloadingAction(progress: _saveProgress!, onCancel: _cancelSave)
-          else
-            IconButton(
-              tooltip: 'Save to phone',
-              onPressed: _save,
-              icon: const Icon(Icons.download_rounded),
-            ),
-          IconButton(
-            tooltip: 'Share',
-            onPressed: _share,
-            icon: const Icon(Icons.share_outlined),
-          ),
-        ],
-      ),
       body: GestureDetector(
         onVerticalDragUpdate: (d) => setState(() => _drag += d.delta.dy),
         onVerticalDragEnd: (d) {
@@ -404,84 +396,154 @@ class _VideoViewerScreenState extends State<VideoViewerScreen> {
         },
         child: Transform.translate(
           offset: Offset(0, _drag),
-          child: Column(
+          child: Stack(
+            fit: StackFit.expand,
             children: [
-              if (_showSlowHint)
-                const Material(
-                  color: Color(0xCC000000),
-                  child: Padding(
-                    padding: EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                    child: Text(
-                      'This download is crawling — Tailscale may be on a relay. '
-                      'Same Wi‑Fi or a direct tunnel is much faster.',
-                      style: TextStyle(color: Colors.white70, fontSize: 12),
-                    ),
-                  ),
-                ),
-              Expanded(
-                child: Center(
-                  child: _failure != null
-                      ? Padding(
-                          padding: const EdgeInsets.all(24),
-                          child: Text(
-                            _failure!,
-                            style: const TextStyle(color: Colors.white70),
-                            textAlign: TextAlign.center,
-                          ),
-                        )
-                      : controller == null
-                      ? const CircularProgressIndicator(color: Colors.white)
-                      : Column(
-                          mainAxisAlignment: MainAxisAlignment.center,
+              Center(
+                child: _failure != null
+                    ? Padding(
+                        padding: const EdgeInsets.all(24),
+                        child: Text(
+                          _failure!,
+                          style: const TextStyle(color: Colors.white70),
+                          textAlign: TextAlign.center,
+                        ),
+                      )
+                    : controller == null
+                    ? const CircularProgressIndicator(color: Colors.white)
+                    : AspectRatio(
+                        aspectRatio: controller.value.aspectRatio == 0
+                            ? 16 / 9
+                            : controller.value.aspectRatio,
+                        child: Hero(
+                          tag: 'media-hero-${widget.message.id}',
+                          child: VideoPlayer(controller),
+                        ),
+                      ),
+              ),
+              MediaViewerChromeToggle(onTap: _toggleChrome),
+              MediaViewerChrome(
+                shown: chromeShown,
+                child: SafeArea(
+                  child: Stack(
+                    children: [
+                      Align(
+                        alignment: Alignment.topCenter,
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
                           children: [
-                            AspectRatio(
-                              aspectRatio: controller.value.aspectRatio == 0
-                                  ? 16 / 9
-                                  : controller.value.aspectRatio,
-                              child: GestureDetector(
-                                onTap: () => setState(() {
-                                  controller.value.isPlaying
-                                      ? controller.pause()
-                                      : controller.play();
-                                }),
-                                child: Stack(
-                                  alignment: Alignment.center,
-                                  children: [
-                                    Hero(
-                                      tag: 'media-hero-${widget.message.id}',
-                                      child: VideoPlayer(controller),
+                            MediaViewerTopBar(
+                              title: widget.message.mediaName ?? 'Video',
+                              onShowInChat: widget.onShowInChat,
+                              onSave: _saveProgress == null ? _save : null,
+                              onShare: _share,
+                              saveAction: _saveProgress == null
+                                  ? null
+                                  : _DownloadingAction(
+                                      progress: _saveProgress!,
+                                      onCancel: _cancelSave,
                                     ),
-                                    if (!controller.value.isPlaying)
-                                      Container(
-                                        width: 62,
-                                        height: 62,
-                                        decoration: BoxDecoration(
-                                          color: Colors.black.withValues(
-                                            alpha: 0.45,
-                                          ),
-                                          shape: BoxShape.circle,
-                                        ),
-                                        child: const Icon(
-                                          Icons.play_arrow_rounded,
-                                          color: Colors.white,
-                                          size: 40,
+                            ),
+                            if (_showSlowHint)
+                              const Material(
+                                color: Color(0xCC000000),
+                                child: Padding(
+                                  padding: EdgeInsets.symmetric(
+                                    horizontal: 16,
+                                    vertical: 8,
+                                  ),
+                                  child: Text(
+                                    'This download is crawling — Tailscale may be on a relay. '
+                                    'Same Wi‑Fi or a direct tunnel is much faster.',
+                                    style: TextStyle(
+                                      color: Colors.white70,
+                                      fontSize: 12,
+                                    ),
+                                  ),
+                                ),
+                              ),
+                          ],
+                        ),
+                      ),
+                      if (controller != null && !controller.value.isPlaying)
+                        Center(
+                          child: Material(
+                            color: Colors.black.withValues(alpha: 0.45),
+                            shape: const CircleBorder(),
+                            clipBehavior: Clip.antiAlias,
+                            child: IconButton(
+                              tooltip: 'Play',
+                              onPressed: _togglePlayback,
+                              icon: const Icon(
+                                Icons.play_arrow_rounded,
+                                color: Colors.white,
+                                size: 40,
+                              ),
+                              iconSize: 40,
+                              padding: const EdgeInsets.all(11),
+                            ),
+                          ),
+                        ),
+                      Align(
+                        alignment: Alignment.bottomCenter,
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            if (controller != null)
+                              ColoredBox(
+                                color: Colors.black,
+                                child: Row(
+                                  children: [
+                                    IconButton(
+                                      tooltip: controller.value.isPlaying
+                                          ? 'Pause'
+                                          : 'Play',
+                                      onPressed: _togglePlayback,
+                                      icon: Icon(
+                                        controller.value.isPlaying
+                                            ? Icons.pause_rounded
+                                            : Icons.play_arrow_rounded,
+                                      ),
+                                      color: Colors.white,
+                                    ),
+                                    Expanded(
+                                      child: VideoProgressIndicator(
+                                        controller,
+                                        allowScrubbing: true,
+                                        padding: const EdgeInsets.only(
+                                          right: 16,
+                                          top: 12,
+                                          bottom: 12,
                                         ),
                                       ),
+                                    ),
                                   ],
                                 ),
                               ),
-                            ),
-                            const SizedBox(height: 6),
-                            VideoProgressIndicator(
-                              controller,
-                              allowScrubbing: true,
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: 16,
-                                vertical: 12,
+                            if (caption.isNotEmpty)
+                              ColoredBox(
+                                color: Colors.black,
+                                child: Padding(
+                                  padding: const EdgeInsets.fromLTRB(
+                                    20,
+                                    0,
+                                    20,
+                                    24,
+                                  ),
+                                  child: Text(
+                                    caption,
+                                    style: const TextStyle(
+                                      color: Colors.white,
+                                      height: 1.4,
+                                    ),
+                                  ),
+                                ),
                               ),
-                            ),
                           ],
                         ),
+                      ),
+                    ],
+                  ),
                 ),
               ),
             ],
